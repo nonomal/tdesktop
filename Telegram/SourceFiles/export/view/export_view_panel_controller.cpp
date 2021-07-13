@@ -153,11 +153,15 @@ PanelController::~PanelController() {
 	if (_saveSettingsTimer.isActive()) {
 		saveSettings();
 	}
-	_panel->destroyLayer();
+	if (_panel) {
+		_panel->destroyLayer();
+	}
 }
 
 void PanelController::activatePanel() {
-	_panel->showAndActivate();
+	if (_panel) {
+		_panel->showAndActivate();
+	}
 }
 
 void PanelController::createPanel() {
@@ -298,6 +302,11 @@ void PanelController::showProgress() {
 		rpl::single(
 			ContentFromState(_settings.get(), ProcessingState())
 		) | rpl::then(progressState()));
+
+	progress->skipFileClicks(
+	) | rpl::start_with_next([=](uint64 randomId) {
+		_process->skipFile(randomId);
+	}, progress->lifetime());
 
 	progress->cancelClicks(
 	) | rpl::start_with_next([=] {

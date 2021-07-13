@@ -701,9 +701,11 @@ bool HistoryItem::suggestReport() const {
 }
 
 bool HistoryItem::suggestBanReport() const {
-	auto channel = history()->peer->asChannel();
-	auto fromUser = from()->asUser();
-	if (!channel || !fromUser || !channel->canRestrictUser(fromUser)) {
+	const auto channel = history()->peer->asChannel();
+	const auto fromUser = from()->asUser();
+	if (!channel
+		|| !fromUser
+		|| !channel->canRestrictParticipant(fromUser)) {
 		return false;
 	}
 	return !isPost() && !out();
@@ -876,7 +878,7 @@ bool HistoryItem::unread() const {
 				return false;
 			}
 			if (const auto user = history()->peer->asUser()) {
-				if (user->isBot()) {
+				if (user->isBot() && !user->isSupport()) {
 					return false;
 				}
 			} else if (const auto channel = history()->peer->asChannel()) {

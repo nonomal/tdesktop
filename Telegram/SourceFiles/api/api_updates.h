@@ -38,9 +38,10 @@ public:
 
 	[[nodiscard]] int32 pts() const;
 
-	void updateOnline();
+	void updateOnline(crl::time lastNonIdleTime = 0);
 	[[nodiscard]] bool isIdle() const;
-	void checkIdleFinish();
+	[[nodiscard]] rpl::producer<bool> isIdleValue() const;
+	void checkIdleFinish(crl::time lastNonIdleTime = 0);
 	bool lastWasOnline() const;
 	crl::time lastSetOnline() const;
 	bool isQuitPrevent();
@@ -66,6 +67,12 @@ private:
 		AfterFail,
 	};
 
+	enum class SkipUpdatePolicy {
+		SkipNone,
+		SkipMessageIds,
+		SkipExceptGroupCallParticipants,
+	};
+
 	struct ActiveChatTracker {
 		PeerData *peer = nullptr;
 		rpl::lifetime lifetime;
@@ -80,7 +87,7 @@ private:
 		MsgRange range,
 		const MTPupdates_ChannelDifference &result);
 
-	void updateOnline(bool gotOtherOffline);
+	void updateOnline(crl::time lastNonIdleTime, bool gotOtherOffline);
 	void sendPing();
 	void getDifferenceByPts();
 	void getDifferenceAfterFail();
@@ -113,11 +120,13 @@ private:
 	void mtpNewSessionCreated();
 	void feedUpdateVector(
 		const MTPVector<MTPUpdate> &updates,
-		bool skipMessageIds = false);
+		SkipUpdatePolicy policy = SkipUpdatePolicy::SkipNone);
 	// Doesn't call sendHistoryChangeNotifications itself.
 	void feedMessageIds(const MTPVector<MTPUpdate> &updates);
 	// Doesn't call sendHistoryChangeNotifications itself.
 	void feedUpdate(const MTPUpdate &update);
+
+	void applyGroupCallParticipantUpdates(const MTPUpdates &updates);
 
 	bool whenGetDiffChanged(
 		ChannelData *channel,
@@ -177,7 +186,7 @@ private:
 	base::Timer _idleFinishTimer;
 	crl::time _lastSetOnline = 0;
 	bool _lastWasOnline = false;
-	bool _isIdle = false;
+	rpl::variable<bool> _isIdle = false;
 
 	rpl::lifetime _lifetime;
 
