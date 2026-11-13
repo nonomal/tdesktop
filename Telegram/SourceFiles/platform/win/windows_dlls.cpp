@@ -8,117 +8,94 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/win/windows_dlls.h"
 
 #include "base/platform/win/base_windows_safe_library.h"
+#include "ui/gl/gl_detection.h"
 
 #include <VersionHelpers.h>
 #include <QtCore/QSysInfo>
 
+#define LOAD_SYMBOL(lib, name) ::base::Platform::LoadMethod(lib, #name, name)
+
+#ifdef DESKTOP_APP_USE_ANGLE
+bool DirectXResolveCompiler();
+#endif // DESKTOP_APP_USE_ANGLE
+
 namespace Platform {
 namespace Dlls {
+namespace {
 
-using base::Platform::SafeLoadLibrary;
-using base::Platform::LoadMethod;
+struct SafeIniter {
+	SafeIniter();
+};
 
-void init() {
-	static bool inited = false;
-	if (inited) return;
-	inited = true;
+SafeIniter::SafeIniter() {
+	base::Platform::InitDynamicLibraries();
 
-	// Remove the current directory from the DLL search order.
-	::SetDllDirectory(L"");
+	const auto LibShell32 = LoadLibrary(L"shell32.dll");
+	LOAD_SYMBOL(LibShell32, SHAssocEnumHandlers);
+	LOAD_SYMBOL(LibShell32, SHCreateItemFromParsingName);
+	LOAD_SYMBOL(LibShell32, SHOpenWithDialog);
+	LOAD_SYMBOL(LibShell32, OpenAs_RunDLL);
+	LOAD_SYMBOL(LibShell32, SHQueryUserNotificationState);
+	LOAD_SYMBOL(LibShell32, SHChangeNotify);
 
-	const auto list = {
-		u"dbghelp.dll"_q,
-		u"dbgcore.dll"_q,
-		u"propsys.dll"_q,
-		u"winsta.dll"_q,
-		u"textinputframework.dll"_q,
-		u"uxtheme.dll"_q,
-		u"igdumdim32.dll"_q,
-		u"amdhdl32.dll"_q,
-		u"wtsapi32.dll"_q,
-		u"propsys.dll"_q,
-		u"combase.dll"_q,
-		u"dwmapi.dll"_q,
-		u"rstrtmgr.dll"_q,
-		u"psapi.dll"_q,
-		u"user32.dll"_q,
-	};
-	for (const auto &lib : list) {
-		SafeLoadLibrary(lib);
-	}
-}
-
-f_SetWindowTheme SetWindowTheme;
-//f_RefreshImmersiveColorPolicyState RefreshImmersiveColorPolicyState;
-//f_AllowDarkModeForApp AllowDarkModeForApp;
-//f_SetPreferredAppMode SetPreferredAppMode;
-//f_AllowDarkModeForWindow AllowDarkModeForWindow;
-//f_FlushMenuThemes FlushMenuThemes;
-f_OpenAs_RunDLL OpenAs_RunDLL;
-f_SHOpenWithDialog SHOpenWithDialog;
-f_SHAssocEnumHandlers SHAssocEnumHandlers;
-f_SHCreateItemFromParsingName SHCreateItemFromParsingName;
-f_WTSRegisterSessionNotification WTSRegisterSessionNotification;
-f_WTSUnRegisterSessionNotification WTSUnRegisterSessionNotification;
-f_SHQueryUserNotificationState SHQueryUserNotificationState;
-f_SHChangeNotify SHChangeNotify;
-f_SetCurrentProcessExplicitAppUserModelID SetCurrentProcessExplicitAppUserModelID;
-f_PropVariantToString PropVariantToString;
-f_PSStringFromPropertyKey PSStringFromPropertyKey;
-f_DwmIsCompositionEnabled DwmIsCompositionEnabled;
-f_DwmSetWindowAttribute DwmSetWindowAttribute;
-f_GetProcessMemoryInfo GetProcessMemoryInfo;
-f_SetWindowCompositionAttribute SetWindowCompositionAttribute;
-
-void start() {
-	init();
-
-	const auto LibShell32 = SafeLoadLibrary(u"shell32.dll"_q);
-	LoadMethod(LibShell32, "SHAssocEnumHandlers", SHAssocEnumHandlers);
-	LoadMethod(LibShell32, "SHCreateItemFromParsingName", SHCreateItemFromParsingName);
-	LoadMethod(LibShell32, "SHOpenWithDialog", SHOpenWithDialog);
-	LoadMethod(LibShell32, "OpenAs_RunDLLW", OpenAs_RunDLL);
-	LoadMethod(LibShell32, "SHQueryUserNotificationState", SHQueryUserNotificationState);
-	LoadMethod(LibShell32, "SHChangeNotify", SHChangeNotify);
-	LoadMethod(LibShell32, "SetCurrentProcessExplicitAppUserModelID", SetCurrentProcessExplicitAppUserModelID);
-
-	const auto LibUxTheme = SafeLoadLibrary(u"uxtheme.dll"_q);
-	LoadMethod(LibUxTheme, "SetWindowTheme", SetWindowTheme);
 	//if (IsWindows10OrGreater()) {
 	//	static const auto kSystemVersion = QOperatingSystemVersion::current();
 	//	static const auto kMinor = kSystemVersion.minorVersion();
 	//	static const auto kBuild = kSystemVersion.microVersion();
 	//	if (kMinor > 0 || (kMinor == 0 && kBuild >= 17763)) {
+	//		const auto LibUxTheme = LoadLibrary(L"uxtheme.dll");
 	//		if (kBuild < 18362) {
-	//			LoadMethod(LibUxTheme, "AllowDarkModeForApp", AllowDarkModeForApp, 135);
+	//			LOAD_SYMBOL(LibUxTheme, AllowDarkModeForApp, 135);
 	//		} else {
-	//			LoadMethod(LibUxTheme, "SetPreferredAppMode", SetPreferredAppMode, 135);
+	//			LOAD_SYMBOL(LibUxTheme, SetPreferredAppMode, 135);
 	//		}
-	//		LoadMethod(LibUxTheme, "AllowDarkModeForWindow", AllowDarkModeForWindow, 133);
-	//		LoadMethod(LibUxTheme, "RefreshImmersiveColorPolicyState", RefreshImmersiveColorPolicyState, 104);
-	//		LoadMethod(LibUxTheme, "FlushMenuThemes", FlushMenuThemes, 136);
+	//		LOAD_SYMBOL(LibUxTheme, AllowDarkModeForWindow, 133);
+	//		LOAD_SYMBOL(LibUxTheme, RefreshImmersiveColorPolicyState, 104);
+	//		LOAD_SYMBOL(LibUxTheme, FlushMenuThemes, 136);
 	//	}
 	//}
 
-	if (IsWindowsVistaOrGreater()) {
-		const auto LibWtsApi32 = SafeLoadLibrary(u"wtsapi32.dll"_q);
-		LoadMethod(LibWtsApi32, "WTSRegisterSessionNotification", WTSRegisterSessionNotification);
-		LoadMethod(LibWtsApi32, "WTSUnRegisterSessionNotification", WTSUnRegisterSessionNotification);
+	const auto LibPropSys = LoadLibrary(L"propsys.dll");
+	LOAD_SYMBOL(LibPropSys, PSStringFromPropertyKey);
 
-		const auto LibPropSys = SafeLoadLibrary(u"propsys.dll"_q);
-		LoadMethod(LibPropSys, "PropVariantToString", PropVariantToString);
-		LoadMethod(LibPropSys, "PSStringFromPropertyKey", PSStringFromPropertyKey);
+	const auto LibPsApi = LoadLibrary(L"psapi.dll");
+	LOAD_SYMBOL(LibPsApi, GetProcessMemoryInfo);
 
-		const auto LibDwmApi = SafeLoadLibrary(u"dwmapi.dll"_q);
-		LoadMethod(LibDwmApi, "DwmIsCompositionEnabled", DwmIsCompositionEnabled);
-		LoadMethod(LibDwmApi, "DwmSetWindowAttribute", DwmSetWindowAttribute);
+	const auto LibUser32 = LoadLibrary(L"user32.dll");
+	LOAD_SYMBOL(LibUser32, SetWindowCompositionAttribute);
+
+	const auto LibShCore = LoadLibrary(L"Shcore.dll");
+	LOAD_SYMBOL(LibShCore, GetDpiForMonitor);
+}
+
+SafeIniter kSafeIniter;
+
+} // namespace
+
+void CheckLoadedModules() {
+#ifdef DESKTOP_APP_USE_ANGLE
+	if (DirectXResolveCompiler()) {
+		auto LibD3DCompiler = HMODULE();
+		if (GetModuleHandleEx(0, L"d3dcompiler_47.dll", &LibD3DCompiler)) {
+			constexpr auto kMaxPathLong = 32767;
+			auto path = std::array<WCHAR, kMaxPathLong + 1>{ 0 };
+			const auto length = GetModuleFileName(
+				LibD3DCompiler,
+				path.data(),
+				kMaxPathLong);
+			if (length > 0 && length < kMaxPathLong) {
+				LOG(("Using DirectX compiler '%1'."
+					).arg(QString::fromWCharArray(path.data())));
+			} else {
+				LOG(("Error: Could not resolve DirectX compiler path."));
+			}
+		} else {
+			LOG(("Error: Could not resolve DirectX compiler module."));
+		}
+	} else {
+		LOG(("Error: Could not resolve DirectX compiler library."));
 	}
-
-	const auto LibPsApi = SafeLoadLibrary(u"psapi.dll"_q);
-	LoadMethod(LibPsApi, "GetProcessMemoryInfo", GetProcessMemoryInfo);
-
-	const auto LibUser32 = SafeLoadLibrary(u"user32.dll"_q);
-	LoadMethod(LibUser32, "SetWindowCompositionAttribute", SetWindowCompositionAttribute);
+#endif // DESKTOP_APP_USE_ANGLE
 }
 
 } // namespace Dlls

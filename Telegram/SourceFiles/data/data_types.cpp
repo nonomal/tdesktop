@@ -7,12 +7,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/data_types.h"
 
-#include "data/data_document.h"
-#include "data/data_session.h"
-#include "ui/widgets/input_fields.h"
+#include "media/media_common.h"
+#include "ui/widgets/fields/input_field.h"
 #include "storage/cache/storage_cache_types.h"
 #include "base/openssl_help.h"
-#include "main/main_session.h"
+
+#include <QtCore/QtEndian>
 
 namespace Data {
 namespace {
@@ -21,12 +21,10 @@ constexpr auto kDocumentCacheTag = 0x0000000000000100ULL;
 constexpr auto kDocumentCacheMask = 0x00000000000000FFULL;
 constexpr auto kDocumentThumbCacheTag = 0x0000000000000200ULL;
 constexpr auto kDocumentThumbCacheMask = 0x00000000000000FFULL;
+constexpr auto kAudioAlbumThumbCacheTag = 0x0000000000000300ULL;
 constexpr auto kWebDocumentCacheTag = 0x0000020000000000ULL;
-constexpr auto kWebDocumentCacheMask = 0x000000FFFFFFFFFFULL;
 constexpr auto kUrlCacheTag = 0x0000030000000000ULL;
-constexpr auto kUrlCacheMask = 0x000000FFFFFFFFFFULL;
 constexpr auto kGeoPointCacheTag = 0x0000040000000000ULL;
-constexpr auto kGeoPointCacheMask = 0x000000FFFFFFFFFFULL;
 
 } // namespace
 
@@ -53,8 +51,8 @@ Storage::Cache::Key WebDocumentCacheKey(const WebFileLocation &location) {
 	const auto bytes = bytes::make_span(hash);
 	const auto bytes1 = bytes.subspan(0, sizeof(uint32));
 	const auto bytes2 = bytes.subspan(sizeof(uint32), sizeof(uint64));
-	const auto part1 = *reinterpret_cast<const uint32*>(bytes1.data());
-	const auto part2 = *reinterpret_cast<const uint64*>(bytes2.data());
+	const auto part1 = qFromUnaligned<uint32>(bytes1.data());
+	const auto part2 = qFromUnaligned<uint64>(bytes2.data());
 	return Storage::Cache::Key{
 		Data::kWebDocumentCacheTag | (dcId << 32) | part1,
 		part2
@@ -70,9 +68,9 @@ Storage::Cache::Key UrlCacheKey(const QString &location) {
 	const auto bytes3 = bytes.subspan(
 		sizeof(uint32) + sizeof(uint64),
 		sizeof(uint16));
-	const auto part1 = *reinterpret_cast<const uint32*>(bytes1.data());
-	const auto part2 = *reinterpret_cast<const uint64*>(bytes2.data());
-	const auto part3 = *reinterpret_cast<const uint16*>(bytes3.data());
+	const auto part1 = qFromUnaligned<uint32>(bytes1.data());
+	const auto part2 = qFromUnaligned<uint64>(bytes2.data());
+	const auto part3 = qFromUnaligned<uint16>(bytes3.data());
 	return Storage::Cache::Key{
 		Data::kUrlCacheTag | (uint64(part3) << 32) | part1,
 		part2
@@ -86,43 +84,28 @@ Storage::Cache::Key GeoPointCacheKey(const GeoPointLocation &location) {
 		| (uint32(location.height) & 0xFFFFU);
 	return Storage::Cache::Key{
 		Data::kGeoPointCacheTag | (uint64(zoomscale) << 32) | widthheight,
-		(uint64(std::round(std::abs(location.lat + 360.) * 1000000)) << 32)
-		| uint64(std::round(std::abs(location.lon + 360.) * 1000000))
+		(uint64(base::SafeRound(
+			std::abs(location.lat + 360.) * 1000000)) << 32)
+		| uint64(base::SafeRound(std::abs(location.lon + 360.) * 1000000))
+	};
+}
+
+Storage::Cache::Key AudioAlbumThumbCacheKey(
+		const AudioAlbumThumbLocation &location) {
+	return Storage::Cache::Key{
+		Data::kAudioAlbumThumbCacheTag,
+		location.documentId,
 	};
 }
 
 } // namespace Data
-
-uint32 AudioMsgId::CreateExternalPlayId() {
-	static auto Result = uint32(0);
-	return ++Result ? Result : ++Result;
-}
-
-AudioMsgId AudioMsgId::ForVideo() {
-	auto result = AudioMsgId();
-	result._externalPlayId = CreateExternalPlayId();
-	result._type = Type::Video;
-	return result;
-}
-
-void AudioMsgId::setTypeFromAudio() {
-	if (_audio->isVoiceMessage() || _audio->isVideoMessage()) {
-		_type = Type::Voice;
-	} else if (_audio->isVideoFile()) {
-		_type = Type::Video;
-	} else if (_audio->isAudioFile()) {
-		_type = Type::Song;
-	} else {
-		_type = Type::Unknown;
-	}
-}
 
 void MessageCursor::fillFrom(not_null<const Ui::InputField*> field) {
 	const auto cursor = field->textCursor();
 	position = cursor.position();
 	anchor = cursor.anchor();
 	const auto top = field->scrollTop().current();
-	scroll = (top != field->scrollTopMax()) ? top : QFIXED_MAX;
+	scroll = (top != field->scrollTopMax()) ? top : Ui::kQFixedMax;
 }
 
 void MessageCursor::applyTo(not_null<Ui::InputField*> field) {
@@ -133,25 +116,11 @@ void MessageCursor::applyTo(not_null<Ui::InputField*> field) {
 	field->scrollTo(scroll);
 }
 
-HistoryItem *FileClickHandler::getActionItem() const {
-	return _session->data().message(context());
-}
-
 PeerId PeerFromMessage(const MTPmessage &message) {
-	return message.match([](const MTPDmessageEmpty &) {
-		return PeerId(0);
+	return message.match([](const MTPDmessageEmpty &data) {
+		return data.vpeer_id() ? peerFromMTP(*data.vpeer_id()) : PeerId(0);
 	}, [](const auto &data) {
 		return peerFromMTP(data.vpeer_id());
-	});
-}
-
-MTPDmessage::Flags FlagsFromMessage(const MTPmessage &message) {
-	return message.match([](const MTPDmessageEmpty &) {
-		return MTPDmessage::Flags(0);
-	}, [](const MTPDmessage &data) {
-		return data.vflags().v;
-	}, [](const MTPDmessageService &data) {
-		return mtpCastFlags(data.vflags().v);
 	});
 }
 
@@ -169,11 +138,21 @@ TimeId DateFromMessage(const MTPmessage &message) {
 	});
 }
 
+BusinessShortcutId BusinessShortcutIdFromMessage(
+		const MTPmessage &message) {
+	return message.match([](const MTPDmessage &data) {
+		return data.vquick_reply_shortcut_id().value_or_empty();
+	}, [](const auto &) {
+		return BusinessShortcutId();
+	});
+}
+
 bool GoodStickerDimensions(int width, int height) {
 	// Show all .webp (except very large ones) as stickers,
 	// allow to open them in media viewer to see details.
-	constexpr auto kLargetsStickerSide = 2560;
-	return (width > 0)
-		&& (height > 0)
-		&& (width * height <= kLargetsStickerSide * kLargetsStickerSide);
+	constexpr auto kLargestStickerSide = 2560;
+	return ::Media::ValidFrameSize(
+		width,
+		height,
+		kLargestStickerSide * kLargestStickerSide);
 }

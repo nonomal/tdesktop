@@ -7,37 +7,38 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "base/timer.h"
 #include "base/weak_ptr.h"
-#include "ui/rp_widget.h"
-#include "ui/effects/animations.h"
 #include "media/player/media_player_float.h"
 #include "mtproto/sender.h"
-#include "data/data_pts_waiter.h"
 
-struct HistoryMessageMarkupButton;
-class MainWindow;
-class ConfirmBox;
 class HistoryWidget;
 class StackItem;
-struct FileLoadResult;
-class History;
 class Image;
 
-namespace MTP {
-class Error;
-} // namespace MTP
+namespace Bot {
+struct SendCommandRequest;
+} // namespace Bot
 
-namespace Api {
-struct SendAction;
-} // namespace Api
+namespace ChatHelpers {
+struct FileChosen;
+} // namespace ChatHelpers
+
+namespace SendMenu {
+struct Details;
+} // namespace SendMenu
 
 namespace Main {
 class Session;
 } // namespace Main
 
 namespace Data {
+class Thread;
 class WallPaper;
+struct ForwardDraft;
+struct DrawToReplyRequest;
+class Forum;
+class SavedMessages;
+struct ReportInput;
 } // namespace Data
 
 namespace Dialogs {
@@ -50,7 +51,6 @@ class Widget;
 namespace Media {
 namespace Player {
 class Widget;
-class VolumeWidget;
 class Panel;
 struct TrackState;
 } // namespace Player
@@ -65,10 +65,9 @@ struct Content;
 } // namespace Export
 
 namespace Ui {
+class ChatTheme;
 class ResizeArea;
 class PlainShadow;
-class DropdownMenu;
-enum class ReportReason;
 template <typename Widget>
 class SlideWrap;
 } // namespace Ui
@@ -79,12 +78,14 @@ template <typename Inner>
 class TopBarWrapWidget;
 class SectionMemento;
 class SectionWidget;
-class AbstractSectionWidget;
+class SlideAnimation;
 class ConnectionState;
 struct SectionSlideParams;
 struct SectionShow;
 enum class Column;
 class HistoryHider;
+struct SeparateId;
+struct SavedChat;
 } // namespace Window
 
 namespace Calls {
@@ -97,18 +98,12 @@ namespace Core {
 class Changelogs;
 } // namespace Core
 
-namespace InlineBots {
-namespace Layout {
-class ItemBase;
-} // namespace Layout
-} // namespace InlineBots
+extern const char kForceComposeSearchOneColumn[];
+extern const char kOptionUseNewChatView[];
 
-class MainWidget
+class MainWidget final
 	: public Ui::RpWidget
-	, private Media::Player::FloatDelegate
-	, private base::Subscriber {
-	Q_OBJECT
-
+	, private Media::Player::FloatDelegate {
 public:
 	using SectionShow = Window::SectionShow;
 
@@ -119,79 +114,76 @@ public:
 
 	[[nodiscard]] Main::Session &session() const;
 	[[nodiscard]] not_null<Window::SessionController*> controller() const;
-
+	[[nodiscard]] Window::SeparateId windowId() const;
+	[[nodiscard]] bool isPrimary() const;
 	[[nodiscard]] bool isMainSectionShown() const;
-	[[nodiscard]] bool isThirdSectionShown() const;
+
+	[[nodiscard]] Dialogs::RowDescriptor resolveChatNext(
+		Dialogs::RowDescriptor from) const;
+	[[nodiscard]] Dialogs::RowDescriptor resolveChatPrevious(
+		Dialogs::RowDescriptor from) const;
 
 	void returnTabbedSelector();
 
-	void showAnimated(const QPixmap &bgAnimCache, bool back = false);
+	void showAnimated(QPixmap oldContentCache, bool back = false);
 
 	void activate();
+	void handleStartFiles(QStringList paths);
 
 	void windowShown();
 
 	void dialogsToUp();
-	void checkHistoryActivation();
+	void checkActivation();
 
-	PeerData *peer();
+	[[nodiscard]] PeerData *peer() const;
+	[[nodiscard]] Ui::ChatTheme *customChatTheme() const;
 
 	int backgroundFromY() const;
 	void showSection(
 		std::shared_ptr<Window::SectionMemento> memento,
 		const SectionShow &params);
 	void updateColumnLayout();
+	void columnsRestored();
 	bool stackIsEmpty() const;
-	void showBackFromStack(
-		const SectionShow &params);
+	[[nodiscard]] std::vector<Window::SavedChat> chatStackForSave() const;
+	bool showBackFromStack(const SectionShow &params);
 	void orderWidgets();
-	QRect historyRect() const;
 	QPixmap grabForShowAnimation(const Window::SectionSlideParams &params);
 	void checkMainSectionToLayer();
 
-	bool sendExistingDocument(not_null<DocumentData*> sticker);
+	[[nodiscard]] SendMenu::Details sendMenuDetails() const;
+	bool processChosenSticker(ChatHelpers::FileChosen &&chosen);
 
-	bool isActive() const;
-	[[nodiscard]] bool doWeMarkAsRead() const;
+	[[nodiscard]] bool animatingShow() const;
 
-	void saveFieldToHistoryLocalDraft();
+	void showDragForwardInfo();
+	void hideDragForwardInfo();
 
-	int32 dlgsWidth() const;
-
-	void showForwardLayer(MessageIdsList &&items);
-	void showSendPathsLayer();
-	void cancelUploadLayer(not_null<HistoryItem*> item);
-	void shareUrlLayer(const QString &url, const QString &text);
-	void inlineSwitchLayer(const QString &botAndQuery);
-	void hiderLayer(base::unique_qptr<Window::HistoryHider> h);
-	bool setForwardDraft(PeerId peer, MessageIdsList &&items);
+	bool setForwardDraft(
+		not_null<Data::Thread*> thread,
+		Data::ForwardDraft &&draft);
+	bool sendPaths(
+		not_null<Data::Thread*> thread,
+		const QStringList &paths);
 	bool shareUrl(
-		PeerId peerId,
+		not_null<Data::Thread*> thread,
 		const QString &url,
-		const QString &text);
-	void replyToItem(not_null<HistoryItem*> item);
-	bool inlineSwitchChosen(PeerId peerId, const QString &botAndQuery);
-	bool sendPaths(PeerId peerId);
-	void onFilesOrForwardDrop(const PeerId &peer, const QMimeData *data);
-	bool selectingPeer() const;
+		const QString &text) const;
+	bool filesOrForwardDrop(
+		not_null<Data::Thread*> thread,
+		not_null<const QMimeData*> data,
+		bool forumResolved = false);
+	void textDrop(
+		not_null<Data::Thread*> thread,
+		not_null<const QMimeData*> data);
 
-	void deletePhotoLayer(PhotoData *photo);
+	void sendBotCommand(Bot::SendCommandRequest request);
+	void hideSingleUseKeyboard(FullMsgId replyToId);
 
-	// While HistoryInner is not HistoryView::ListWidget.
-	crl::time highlightStartTime(not_null<const HistoryItem*> item) const;
-
-	void sendBotCommand(
-		not_null<PeerData*> peer,
-		UserData *bot,
-		const QString &cmd,
-		MsgId replyTo);
-	void hideSingleUseKeyboard(PeerData *peer, MsgId replyTo);
-	bool insertBotCommand(const QString &cmd);
-
-	void searchMessages(const QString &query, Dialogs::Key inChat);
-
-	QPixmap cachedBackground(const QRect &forRect, int &x, int &y);
-	void updateScrollColors();
+	void searchMessages(
+		const QString &query,
+		Dialogs::Key inChat,
+		PeerData *searchFrom = nullptr);
 
 	void setChatBackground(
 		const Data::WallPaper &background,
@@ -201,36 +193,34 @@ public:
 	void checkChatBackground();
 	Image *newBackgroundThumb();
 
-	// Does offerPeer or showPeerHistory.
-	void choosePeer(PeerId peerId, MsgId showAtMsgId);
-	void clearBotStartToken(PeerData *peer);
-
-	void ctrlEnterSubmitUpdated();
 	void setInnerFocus();
-
-	void scheduleViewIncrement(HistoryItem *item);
 
 	bool contentOverlapped(const QRect &globalRect);
 
-	void searchInChat(Dialogs::Key chat);
-
 	void showChooseReportMessages(
 		not_null<PeerData*> peer,
-		Ui::ReportReason reason,
-		Fn<void(MessageIdsList)> done);
+		Data::ReportInput reportInput,
+		Fn<void(std::vector<MsgId>)> done);
 	void clearChooseReportMessages();
 
-	void ui_showPeerHistory(
+	void toggleChooseChatTheme(
+		not_null<PeerData*> peer,
+		std::optional<bool> show);
+
+	void showHistory(
 		PeerId peer,
 		const SectionShow &params,
 		MsgId msgId);
-	PeerData *ui_getPeerForMouseAction();
+	bool handleDrawToReplyRequest(Data::DrawToReplyRequest request);
+	void showMessage(
+		not_null<const HistoryItem*> item,
+		const SectionShow &params);
+	void showForum(not_null<Data::Forum*> forum, const SectionShow &params);
 
 	bool notify_switchInlineBotButtonReceived(const QString &query, UserData *samePeerBot, MsgId samePeerReplyTo);
 
 	using FloatDelegate::floatPlayerAreaUpdated;
 
-	void closeBothPlayers();
 	void stopAndClosePlayer();
 
 	bool preventsCloseSection(Fn<void()> callback) const;
@@ -238,28 +228,26 @@ public:
 		Fn<void()> callback,
 		const SectionShow &params) const;
 
-public Q_SLOTS:
-	void inlineResultLoadProgress(FileLoader *loader);
-	void inlineResultLoadFailed(FileLoader *loader, bool started);
+	void showNonPremiumLimitToast(bool download);
 
 	void dialogsCancelled();
-
-protected:
-	void paintEvent(QPaintEvent *e) override;
-	void resizeEvent(QResizeEvent *e) override;
-	void keyPressEvent(QKeyEvent *e) override;
-	bool eventFilter(QObject *o, QEvent *e) override;
+	void toggleFiltersMenu(bool value) const;
 
 private:
-	void viewsIncrement();
+	void paintEvent(QPaintEvent *e) override;
+	void resizeEvent(QResizeEvent *e) override;
+	bool eventFilter(QObject *o, QEvent *e) override;
 
-	void animationCallback();
+	[[nodiscard]] bool relevantForDialogsFocus(
+		not_null<QWidget*> widget) const;
+
+	void showFinished();
 	void handleAdaptiveLayoutUpdate();
 	void updateWindowAdaptiveLayout();
 	void handleAudioUpdate(const Media::Player::TrackState &state);
-	void updateMediaPlayerPosition();
 	void updateMediaPlaylistPosition(int x);
 	void updateControlsGeometry();
+	void updateMainSectionShown();
 	void updateDialogsWidthAnimated();
 	void updateThirdColumnToCurrentChat(
 		Dialogs::Key key,
@@ -274,7 +262,7 @@ private:
 
 	void setCurrentCall(Calls::Call *call);
 	void setCurrentGroupCall(Calls::GroupCall *call);
-	void createCallTopBar();
+	void createCallTopBar(Calls::Call *call, Calls::GroupCall *group);
 	void destroyCallTopBar();
 	void callTopBarHeightUpdated(int callTopBarHeight);
 
@@ -284,34 +272,39 @@ private:
 	void exportTopBarHeightUpdated();
 
 	Window::SectionSlideParams prepareShowAnimation(
-		bool willHaveTopBarShadow);
+		bool willHaveTopBarShadow,
+		bool fromBottom);
 	void showNewSection(
 		std::shared_ptr<Window::SectionMemento> memento,
 		const SectionShow &params);
-	void dropMainSection(Window::SectionWidget *widget);
+	void destroyThirdSection();
 
 	Window::SectionSlideParams prepareThirdSectionAnimation(Window::SectionWidget *section);
 
 	// All this methods use the prepareShowAnimation().
-	Window::SectionSlideParams prepareMainSectionAnimation(Window::SectionWidget *section);
+	Window::SectionSlideParams prepareMainSectionAnimation(
+		Window::SectionWidget *section,
+		bool fromBottom);
 	Window::SectionSlideParams prepareHistoryAnimation(PeerId historyPeerId);
-	Window::SectionSlideParams prepareDialogsAnimation();
 
-	void saveSectionInStack();
+	bool saveSectionInStack(
+		const SectionShow &params,
+		Window::SectionWidget *newMainSection = nullptr);
 
 	int getMainSectionTop() const;
 	int getThirdSectionTop() const;
 
 	void hideAll();
 	void showAll();
+	void hiderLayer(base::unique_qptr<Window::HistoryHider> h);
 	void clearHider(not_null<Window::HistoryHider*> instance);
 
-	void cacheBackground();
-	void clearCachedBackground();
+	void closeBothPlayers();
 
 	[[nodiscard]] auto floatPlayerDelegate()
 		-> not_null<Media::Player::FloatDelegate*>;
 	not_null<Ui::RpWidget*> floatPlayerWidget() override;
+	void floatPlayerToggleGifsPaused(bool paused) override;
 	not_null<Media::Player::FloatSectionDelegate*> floatPlayerGetSection(
 		Window::Column column) override;
 	void floatPlayerEnumerateSections(Fn<void(
@@ -319,12 +312,8 @@ private:
 		Window::Column widgetColumn)> callback) override;
 	bool floatPlayerIsVisible(not_null<HistoryItem*> item) override;
 	void floatPlayerClosed(FullMsgId itemId);
-
-	void viewsIncrementDone(
-		QVector<MTPint> ids,
-		const MTPmessages_MessageViews &result,
-		mtpRequestId requestId);
-	void viewsIncrementFail(const MTP::Error &error, mtpRequestId requestId);
+	void floatPlayerDoubleClickEvent(
+		not_null<const HistoryItem*> item) override;
 
 	void refreshResizeAreas();
 	template <typename MoveCallback, typename FinishCallback>
@@ -343,28 +332,34 @@ private:
 		QImage &&image);
 
 	void handleHistoryBack();
+	bool showHistoryInDifferentWindow(
+		PeerId peerId,
+		const SectionShow &params,
+		MsgId showAtMsgId);
+
+	bool isOneColumn() const;
+	bool isNormalColumn() const;
+	bool isThreeColumn() const;
 
 	const not_null<Window::SessionController*> _controller;
-	MTP::Sender _api;
 
-	Ui::Animations::Simple _a_show;
-	bool _showBack = false;
-	QPixmap _cacheUnder, _cacheOver;
+	std::unique_ptr<Window::SlideAnimation> _showAnimation;
 
 	int _dialogsWidth = 0;
 	int _thirdColumnWidth = 0;
 	Ui::Animations::Simple _a_dialogsWidth;
 
-	object_ptr<Ui::PlainShadow> _sideShadow;
-	object_ptr<Ui::PlainShadow> _thirdShadow = { nullptr };
-	object_ptr<Ui::ResizeArea> _firstColumnResizeArea = { nullptr };
-	object_ptr<Ui::ResizeArea> _thirdColumnResizeArea = { nullptr };
-	object_ptr<Dialogs::Widget> _dialogs;
-	object_ptr<HistoryWidget> _history;
+	const base::unique_qptr<Dialogs::Widget> _dialogs;
+	const base::unique_qptr<HistoryWidget> _history;
 	object_ptr<Window::SectionWidget> _mainSection = { nullptr };
 	object_ptr<Window::SectionWidget> _thirdSection = { nullptr };
 	std::shared_ptr<Window::SectionMemento> _thirdSectionFromStack;
 	std::unique_ptr<Window::ConnectionState> _connecting;
+
+	const base::unique_qptr<Ui::PlainShadow> _sideShadow;
+	object_ptr<Ui::PlainShadow> _thirdShadow = { nullptr };
+	object_ptr<Ui::ResizeArea> _firstColumnResizeArea = { nullptr };
+	object_ptr<Ui::ResizeArea> _thirdColumnResizeArea = { nullptr };
 
 	base::weak_ptr<Calls::Call> _currentCall;
 	base::weak_ptr<Calls::GroupCall> _currentGroupCall;
@@ -378,9 +373,7 @@ private:
 
 	object_ptr<Window::TopBarWrapWidget<Media::Player::Widget>> _player
 		= { nullptr };
-	object_ptr<Media::Player::VolumeWidget> _playerVolume = { nullptr };
 	object_ptr<Media::Player::Panel> _playerPlaylist;
-	bool _playerUsingPanel = false;
 
 	base::unique_qptr<Window::HistoryHider> _hider;
 	std::vector<std::unique_ptr<StackItem>> _stack;
@@ -390,31 +383,10 @@ private:
 	int _exportTopBarHeight = 0;
 	int _contentScrollAddToY = 0;
 
-	QPixmap _cachedBackground;
-	QRect _cachedFor, _willCacheFor;
-	int _cachedX = 0;
-	int _cachedY = 0;
-	base::Timer _cacheBackgroundTimer;
-
-	PhotoData *_deletingPhoto = nullptr;
-
-	base::flat_map<not_null<PeerData*>, base::flat_set<MsgId>> _viewsIncremented;
-	base::flat_map<not_null<PeerData*>, base::flat_set<MsgId>> _viewsToIncrement;
-	base::flat_map<not_null<PeerData*>, mtpRequestId> _viewsIncrementRequests;
-	base::flat_map<mtpRequestId, not_null<PeerData*>> _viewsIncrementByRequest;
-	base::Timer _viewsIncrementTimer;
-
 	struct SettingBackground;
 	std::unique_ptr<SettingBackground> _background;
-
-	bool _firstColumnResizing = false;
-	int _firstColumnResizingShift = 0;
 
 	// _changelogs depends on _data, subscribes on chats loading event.
 	const std::unique_ptr<Core::Changelogs> _changelogs;
 
 };
-
-namespace App {
-MainWidget *main();
-} // namespace App

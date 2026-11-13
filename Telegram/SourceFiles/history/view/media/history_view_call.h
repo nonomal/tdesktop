@@ -10,7 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/view/media/history_view_media.h"
 
 namespace Data {
-enum class CallFinishReason : char;
+enum class CallState : char;
 struct Call;
 } // namespace Data
 
@@ -22,7 +22,7 @@ public:
 		not_null<Element*> parent,
 		not_null<Data::Call*> call);
 
-	void draw(Painter &p, const QRect &r, TextSelection selection, crl::time ms) const override;
+	void draw(Painter &p, const PaintContext &context) const override;
 	TextState textState(QPoint point, StateRequest request) const override;
 
 	bool toggleSelectionByHandlerClick(const ClickHandlerPtr &p) const override {
@@ -40,16 +40,18 @@ public:
 	}
 
 private:
-	using FinishReason = Data::CallFinishReason;
+	using State = Data::CallState;
 
 	QSize countOptimalSize() override;
 
 	const int _duration = 0;
-	const FinishReason _reason;
+	const State _state = {};
+	const bool _conference = false;
 	const bool _video = false;
 
 	QString _text;
 	QString _status;
+	int _textWidth = 0;
 
 	ClickHandlerPtr _link;
 

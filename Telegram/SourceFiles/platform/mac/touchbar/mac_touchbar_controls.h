@@ -7,8 +7,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#ifndef OS_OSX
-
 namespace Media {
 namespace Player {
 struct TrackState;
@@ -18,7 +16,6 @@ struct TrackState;
 @class NSButton;
 @class NSCustomTouchBarItem;
 @class NSImage;
-@class NSSliderTouchBarItem;
 
 namespace TouchBar {
 
@@ -53,7 +50,7 @@ NSButton *CreateTouchBarButtonWithTwoStates(
 	rpl::producer<bool> stateChanged = rpl::never<bool>());
 
 [[nodiscard]] API_AVAILABLE(macos(10.12.2))
-NSSliderTouchBarItem *CreateTouchBarSlider(
+NSCustomTouchBarItem *CreateTouchBarSlider(
 	NSString *itemId,
 	rpl::lifetime &lifetime,
 	Fn<void(bool, double, double)> callback,
@@ -65,5 +62,3 @@ NSCustomTouchBarItem *CreateTouchBarTrackPosition(
 	rpl::producer<Media::Player::TrackState> stateChanged);
 
 } // namespace TouchBar
-
-#endif // OS_OSX

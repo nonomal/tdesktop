@@ -6,7 +6,7 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "storage/localstorage.h"
-//
+
 #include "storage/serialize_common.h"
 #include "storage/storage_account.h"
 #include "storage/details/storage_file_utilities.h"
@@ -15,10 +15,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_document.h"
 #include "data/data_document_media.h"
 #include "base/platform/base_platform_info.h"
-#include "ui/effects/animation_value.h"
+#include "base/random.h"
+#include "ui/power_saving.h"
 #include "core/update_checker.h"
 #include "core/file_location.h"
 #include "core/application.h"
+#include "core/core_settings.h"
+#include "core/version.h"
 #include "media/audio/media_audio.h"
 #include "mtproto/mtproto_config.h"
 #include "mtproto/mtproto_dc_options.h"
@@ -26,10 +29,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_account.h"
 #include "main/main_session.h"
 #include "window/themes/window_theme.h"
+#include "window/window_saved_windows.h"
 #include "lang/lang_instance.h"
-#include "facades.h"
 
 #include <QtCore/QDirIterator>
+#include <QtCore/QSaveFile>
 
 #ifndef Q_OS_WIN
 #include <unistd.h>
@@ -50,7 +54,7 @@ constexpr auto kWallPaperLegacySerializeTagId = int32(-111);
 constexpr auto kWallPaperSerializeTagId = int32(-112);
 constexpr auto kWallPaperSidesLimit = 10'000;
 
-const auto kThemeNewPathRelativeTag = qstr("special://new_tag");
+const auto kThemeNewPathRelativeTag = u"special://new_tag"_q;
 
 using namespace Storage::details;
 using Storage::FileKey;
@@ -59,8 +63,7 @@ using Database = Storage::Cache::Database;
 
 QString _basePath, _userBasePath, _userDbPath;
 
-bool _started = false;
-TaskQueue *_localLoader = nullptr;
+auto _localLoader = (TaskQueue*)nullptr;
 
 QByteArray _settingsSalt;
 
@@ -83,7 +86,6 @@ bool _useGlobalBackgroundKeys = false;
 bool _backgroundCanWrite = true;
 
 int32 _oldSettingsVersion = 0;
-bool _settingsRewritten = false;
 bool _settingsRewriteNeeded = false;
 bool _settingsWriteAllowed = false;
 
@@ -92,10 +94,6 @@ enum class WriteMapWhen {
 	Fast,
 	Soon,
 };
-
-bool _working() {
-	return !_basePath.isEmpty();
-}
 
 bool CheckStreamStatus(QDataStream &stream) {
 	if (stream.status() != QDataStream::Ok) {
@@ -132,6 +130,10 @@ bool CheckStreamStatus(QDataStream &stream) {
 void applyReadContext(ReadSettingsContext &&context) {
 	ApplyReadFallbackConfig(context);
 
+	DEBUG_LOG(("Theme: applying context, legacy: %1, day: %2, night: %3"
+		).arg(context.themeKeyLegacy
+		).arg(context.themeKeyDay
+		).arg(context.themeKeyNight));
 	_themeKeyLegacy = context.themeKeyLegacy;
 	_themeKeyDay = context.themeKeyDay;
 	_themeKeyNight = context.themeKeyNight;
@@ -144,7 +146,7 @@ void applyReadContext(ReadSettingsContext &&context) {
 
 bool _readOldSettings(bool remove, ReadSettingsContext &context) {
 	bool result = false;
-	QFile file(cWorkingDir() + qsl("tdata/config"));
+	auto file = QFile(cWorkingDir() + u"tdata/config"_q);
 	if (file.open(QIODevice::ReadOnly)) {
 		LOG(("App Info: reading old config..."));
 		QDataStream stream(&file);
@@ -241,9 +243,9 @@ void _readOldUserSettingsFields(
 bool _readOldUserSettings(bool remove, ReadSettingsContext &context) {
 	bool result = false;
 	// We dropped old test authorizations when migrated to multi auth.
-	//const auto testPrefix = (cTestMode() ? qsl("_test") : QString());
+	//const auto testPrefix = (cTestMode() ? u"_test"_q : QString());
 	const auto testPrefix = QString();
-	QFile file(cWorkingDir() + cDataFile() + testPrefix + qsl("_config"));
+	QFile file(cWorkingDir() + cDataFile() + testPrefix + u"_config"_q);
 	if (file.open(QIODevice::ReadOnly)) {
 		LOG(("App Info: reading old user config..."));
 		qint32 version = 0;
@@ -322,7 +324,7 @@ void _readOldMtpDataFields(
 bool _readOldMtpData(bool remove, ReadSettingsContext &context) {
 	bool result = false;
 	// We dropped old test authorizations when migrated to multi auth.
-	//const auto testPostfix = (cTestMode() ? qsl("_test") : QString());
+	//const auto testPostfix = (cTestMode() ? u"_test"_q : QString());
 	const auto testPostfix = QString();
 	QFile file(cWorkingDir() + cDataFile() + testPostfix);
 	if (file.open(QIODevice::ReadOnly)) {
@@ -338,8 +340,13 @@ bool _readOldMtpData(bool remove, ReadSettingsContext &context) {
 
 } // namespace
 
+void sync() {
+	Storage::details::Sync();
+}
+
 void finish() {
 	delete base::take(_localLoader);
+	Storage::details::Finish();
 }
 
 void InitialLoadTheme();
@@ -351,13 +358,13 @@ void start() {
 
 	_localLoader = new TaskQueue(kFileLoaderQueueStopTimeout);
 
-	_basePath = cWorkingDir() + qsl("tdata/");
+	_basePath = cWorkingDir() + u"tdata/"_q;
 	if (!QDir().exists(_basePath)) QDir().mkpath(_basePath);
 
 	ReadSettingsContext context;
 	FileReadDescriptor settingsData;
 	// We dropped old test authorizations when migrated to multi auth.
-	//const auto name = cTestMode() ? qsl("settings_test") : qsl("settings");
+	//const auto name = cTestMode() ? u"settings_test"_q : u"settings"_q;
 	const auto name = u"settings"_q;
 	if (!ReadFile(settingsData, name, _basePath)) {
 		_readOldSettings(true, context);
@@ -438,12 +445,12 @@ void writeSettings() {
 	if (!QDir().exists(_basePath)) QDir().mkpath(_basePath);
 
 	// We dropped old test authorizations when migrated to multi auth.
-	//const auto name = cTestMode() ? qsl("settings_test") : qsl("settings");
+	//const auto name = cTestMode() ? u"settings_test"_q : u"settings"_q;
 	const auto name = u"settings"_q;
 	FileWriteDescriptor settings(name, _basePath);
 	if (_settingsSalt.isEmpty() || !SettingsKey) {
 		_settingsSalt.resize(LocalEncryptSaltSize);
-		memset_rand(_settingsSalt.data(), _settingsSalt.size());
+		base::RandomFill(_settingsSalt.data(), _settingsSalt.size());
 		SettingsKey = CreateLegacyLocalKey(QByteArray(), _settingsSalt);
 	}
 	settings.writeData(_settingsSalt);
@@ -461,19 +468,6 @@ void writeSettings() {
 	size += sizeof(quint32) + Serialize::bytearraySize(applicationSettings);
 	size += sizeof(quint32) + Serialize::stringSize(cDialogLastPath());
 
-	auto &proxies = Global::RefProxiesList();
-	const auto &proxy = Global::SelectedProxy();
-	auto proxyIt = ranges::find(proxies, proxy);
-	if (proxy.type != MTP::ProxyData::Type::None
-		&& proxyIt == end(proxies)) {
-		proxies.push_back(proxy);
-		proxyIt = end(proxies) - 1;
-	}
-	size += sizeof(quint32) + sizeof(qint32) + sizeof(qint32) + sizeof(qint32);
-	for (const auto &proxy : proxies) {
-		size += sizeof(qint32) + Serialize::stringSize(proxy.host) + sizeof(qint32) + Serialize::stringSize(proxy.user) + Serialize::stringSize(proxy.password);
-	}
-
 	// Theme keys and night mode.
 	size += sizeof(quint32) + sizeof(quint64) * 2 + sizeof(quint32);
 	size += sizeof(quint32) + sizeof(quint64) * 2;
@@ -482,11 +476,12 @@ void writeSettings() {
 	}
 	size += sizeof(quint32) + sizeof(qint32) * 8;
 
+	const auto powerSaving = PowerSaving::Current().value();
+
 	EncryptedDescriptor data(size);
 	data.stream << quint32(dbiAutoStart) << qint32(cAutoStart());
 	data.stream << quint32(dbiStartMinimized) << qint32(cStartMinimized());
 	data.stream << quint32(dbiSendToMenu) << qint32(cSendToMenu());
-	data.stream << quint32(dbiWorkMode) << qint32(Global::WorkMode().value());
 	data.stream << quint32(dbiSeenTrayTooltip) << qint32(cSeenTrayTooltip());
 	data.stream << quint32(dbiAutoUpdate) << qint32(cAutoUpdate());
 	data.stream << quint32(dbiLastUpdateCheck) << qint32(cLastUpdateCheck());
@@ -494,19 +489,8 @@ void writeSettings() {
 	data.stream << quint32(dbiFallbackProductionConfig) << configSerialized;
 	data.stream << quint32(dbiApplicationSettings) << applicationSettings;
 	data.stream << quint32(dbiDialogLastPath) << cDialogLastPath();
-	data.stream << quint32(dbiAnimationsDisabled) << qint32(anim::Disabled() ? 1 : 0);
+	data.stream << quint32(dbiPowerSaving) << qint32(powerSaving);
 
-	data.stream << quint32(dbiConnectionType) << qint32(dbictProxiesList);
-	data.stream << qint32(proxies.size());
-	data.stream << qint32(proxyIt - begin(proxies)) + 1;
-	data.stream << qint32(Global::ProxySettings());
-	data.stream << qint32(Global::UseProxyForCalls() ? 1 : 0);
-	for (const auto &proxy : proxies) {
-		data.stream << qint32(kProxyTypeShift + int(proxy.type));
-		data.stream << proxy.host << qint32(proxy.port) << proxy.user << proxy.password;
-	}
-
-	data.stream << quint32(dbiTryIPv6) << qint32(Global::TryIPv6());
 	data.stream
 		<< quint32(dbiThemeKey)
 		<< quint64(_themeKeyDay)
@@ -572,7 +556,7 @@ const QString &readAutoupdatePrefixRaw() {
 			return AutoupdatePrefix(value);
 		}
 	}
-	return AutoupdatePrefix("https://updates.tdesktop.com");
+	return AutoupdatePrefix("https://td.telegram.org");
 }
 
 void writeAutoupdatePrefix(const QString &prefix) {
@@ -598,8 +582,59 @@ void writeAutoupdatePrefix(const QString &prefix) {
 QString readAutoupdatePrefix() {
 	Expects(!Core::UpdaterDisabled());
 
+	static const auto RegExp = QRegularExpression("/+$");
 	auto result = readAutoupdatePrefixRaw();
-	return result.replace(QRegularExpression("/+$"), QString());
+	return result.replace(RegExp, QString());
+}
+
+QString updateManifestFile() {
+	Expects(!Core::UpdaterDisabled());
+
+	return cWorkingDir() + "tdata/update-manifest";
+}
+
+// The file holds the detached 64-byte root Ed25519 signature followed by
+// the manifest JSON verbatim. The content is attacker-reachable bytes as
+// far as readers are concerned: the caller verifies it against the pinned
+// root key after reading.
+void writeUpdateManifest(
+		const QByteArray &manifest,
+		const QByteArray &signature) {
+	if (Core::UpdaterDisabled()
+		|| signature.size() != 64
+		|| manifest.isEmpty()) {
+		return;
+	}
+	QSaveFile f(updateManifestFile());
+	if (!f.open(QIODevice::WriteOnly)
+		|| f.write(signature) != signature.size()
+		|| f.write(manifest) != manifest.size()
+		|| !f.commit()) {
+		LOG(("Storage Error: Could not write the update manifest: %1."
+			).arg(f.errorString()));
+	}
+}
+
+bool readUpdateManifest(QByteArray *manifest, QByteArray *signature) {
+	Expects(manifest != nullptr && signature != nullptr);
+
+	if (Core::UpdaterDisabled()) {
+		return false;
+	}
+	QFile f(updateManifestFile());
+	if (!f.open(QIODevice::ReadOnly)) {
+		return false;
+	}
+	constexpr auto kSignatureSize = 64;
+	constexpr auto kMaxManifestSize = 256 * 1024;
+	const auto content = f.readAll();
+	if (content.size() <= kSignatureSize
+		|| content.size() > kSignatureSize + kMaxManifestSize) {
+		return false;
+	}
+	*signature = content.left(kSignatureSize);
+	*manifest = content.mid(kSignatureSize);
+	return true;
 }
 
 void writeBackground(const Data::WallPaper &paper, const QImage &image) {
@@ -632,7 +667,7 @@ void writeBackground(const Data::WallPaper &paper, const QImage &image) {
 		dst = dst.subspan(sizeof(qint32));
 		bytes::copy(dst, bytes::object_as_span(&height));
 		dst = dst.subspan(sizeof(qint32));
-		const auto src = bytes::make_span(image.constBits(), srcsize);
+		const auto src = bytes::make_span(copy.constBits(), srcsize);
 		if (srcsize == dstsize) {
 			bytes::copy(dst, src);
 		} else {
@@ -709,11 +744,13 @@ bool readBackground() {
 	const auto isOldEmptyImage = (bg.stream.status() != QDataStream::Ok);
 	if (isOldEmptyImage
 		|| Data::IsLegacy1DefaultWallPaper(*paper)
+		|| (Data::IsLegacy2DefaultWallPaper(*paper) && bg.version < 3000000)
+		|| (Data::IsLegacy3DefaultWallPaper(*paper) && bg.version < 3000000)
+		|| (Data::IsLegacy4DefaultWallPaper(*paper) && bg.version < 3000000)
 		|| Data::IsDefaultWallPaper(*paper)) {
 		_backgroundCanWrite = false;
-		if (isOldEmptyImage || bg.version < 8005) {
+		if (isOldEmptyImage || bg.version < 3000000) {
 			Window::Theme::Background()->set(Data::DefaultWallPaper());
-			Window::Theme::Background()->setTile(false);
 		} else {
 			Window::Theme::Background()->set(*paper);
 		}
@@ -761,14 +798,12 @@ bool readBackground() {
 	} else {
 		auto buffer = QBuffer(&imageData);
 		auto reader = QImageReader(&buffer);
-#ifndef OS_MAC_OLD
 		reader.setAutoTransform(true);
-#endif // OS_MAC_OLD
 		if (!reader.read(&image)) {
 			image = QImage();
 		}
 	}
-	if (!image.isNull() || paper->backgroundColor()) {
+	if (!image.isNull() || !paper->backgroundColors().empty()) {
 		_backgroundCanWrite = false;
 		Window::Theme::Background()->set(*paper, std::move(image));
 		_backgroundCanWrite = true;
@@ -814,6 +849,10 @@ void reset() {
 	Window::Theme::Background()->reset();
 	_oldSettingsVersion = 0;
 	Core::App().settings().resetOnLastLogout();
+	Core::App().reseedWindowInSettings();
+	if (const auto saved = Core::App().savedWindows()) {
+		saved->resetOnLastLogout();
+	}
 	writeSettings();
 }
 
@@ -896,6 +935,7 @@ Window::Theme::Saved readThemeUsingKey(FileKey key) {
 
 	FileReadDescriptor theme;
 	if (!ReadEncryptedFile(theme, key, _basePath, SettingsKey)) {
+		DEBUG_LOG(("Theme: Could not read file for key: %1").arg(key));
 		return {};
 	}
 
@@ -903,10 +943,11 @@ Window::Theme::Saved readThemeUsingKey(FileKey key) {
 	auto result = Saved();
 	auto &object = result.object;
 	auto &cache = result.cache;
+	auto field1 = qint32();
+	auto field2 = quint32();
 	theme.stream >> object.content;
 	theme.stream >> tag >> object.pathAbsolute;
 	if (tag == kThemeNewPathRelativeTag) {
-		auto creator = qint32();
 		theme.stream
 			>> object.pathRelative
 			>> object.cloud.id
@@ -914,12 +955,14 @@ Window::Theme::Saved readThemeUsingKey(FileKey key) {
 			>> object.cloud.slug
 			>> object.cloud.title
 			>> object.cloud.documentId
-			>> creator;
-		object.cloud.createdBy = creator;
+			>> field1;
 	} else {
 		object.pathRelative = tag;
 	}
 	if (theme.stream.status() != QDataStream::Ok) {
+		DEBUG_LOG(("Theme: Bad status for key: %1, tag: %2"
+			).arg(key
+			).arg(tag));
 		return {};
 	}
 
@@ -947,17 +990,85 @@ Window::Theme::Saved readThemeUsingKey(FileKey key) {
 			}
 		}
 	}
+	int32 cachePaletteChecksum = 0;
+	int32 cacheContentChecksum = 0;
+	QByteArray cacheColors;
+	QByteArray cacheBackground;
+	theme.stream
+		>> cachePaletteChecksum
+		>> cacheContentChecksum
+		>> cacheColors
+		>> cacheBackground
+		>> field2;
 	if (!ignoreCache) {
-		quint32 backgroundIsTiled = 0;
-		theme.stream
-			>> cache.paletteChecksum
-			>> cache.contentChecksum
-			>> cache.colors
-			>> cache.background
-			>> backgroundIsTiled;
-		cache.tiled = (backgroundIsTiled == 1);
 		if (theme.stream.status() != QDataStream::Ok) {
+			DEBUG_LOG(("Theme: Bad status for cache, key: %1, tag: %2"
+				).arg(key
+				).arg(tag));
 			return {};
+		}
+		cache.paletteChecksum = cachePaletteChecksum;
+		cache.contentChecksum = cacheContentChecksum;
+		cache.colors = std::move(cacheColors);
+		cache.background = std::move(cacheBackground);
+		cache.tiled = ((field2 & quint32(0xFF)) == 1);
+	}
+	if (tag == kThemeNewPathRelativeTag) {
+		object.cloud.createdBy = UserId(
+			((quint64(field2) >> 8) << 32) | quint64(quint32(field1)));
+	}
+	auto chatTheme = QByteArray();
+	if (!theme.stream.atEnd()) {
+		theme.stream >> chatTheme;
+	}
+	if (theme.stream.status() == QDataStream::Ok && !chatTheme.isEmpty()) {
+		auto stream = QDataStream(&chatTheme, QIODevice::ReadOnly);
+		stream.setVersion(QDataStream::Qt_5_1);
+		auto emoticon = QString();
+		auto count = qint32();
+		stream >> emoticon >> count;
+		auto settings = base::flat_map<
+			Data::CloudThemeType,
+			Data::CloudTheme::Settings>();
+		if (count < 0 || count > 4) {
+			return result;
+		}
+		for (auto i = 0; i != count; ++i) {
+			auto type = qint32();
+			stream >> type;
+			auto entry = Data::CloudTheme::Settings();
+			entry.accentColor = Serialize::readColor(stream);
+			auto hasOutgoingAccent = qint32();
+			stream >> hasOutgoingAccent;
+			if (hasOutgoingAccent) {
+				entry.outgoingAccentColor = Serialize::readColor(stream);
+			}
+			auto colorsCount = qint32();
+			stream >> colorsCount;
+			if (colorsCount < 0 || colorsCount > 8) {
+				return result;
+			}
+			for (auto j = 0; j != colorsCount; ++j) {
+				entry.outgoingMessagesColors.push_back(
+					Serialize::readColor(stream));
+			}
+			auto paper = QByteArray();
+			stream >> paper;
+			if (!paper.isEmpty()) {
+				entry.paper = Data::WallPaper::FromSerialized(paper);
+			}
+			const auto uncheckedType = static_cast<Data::CloudThemeType>(
+				type);
+			switch (uncheckedType) {
+			case Data::CloudThemeType::Dark:
+			case Data::CloudThemeType::Light:
+				settings.emplace(uncheckedType, std::move(entry));
+				break;
+			}
+		}
+		if (stream.status() == QDataStream::Ok) {
+			object.cloud.emoticon = emoticon;
+			object.cloud.settings = std::move(settings);
 		}
 	}
 	return result;
@@ -966,8 +1077,12 @@ Window::Theme::Saved readThemeUsingKey(FileKey key) {
 std::optional<QString> InitialLoadThemeUsingKey(FileKey key) {
 	auto read = readThemeUsingKey(key);
 	const auto result = read.object.pathAbsolute;
+	if (read.object.content.isEmpty()) {
+		DEBUG_LOG(("Theme: Could not read content for key: %1").arg(key));
+	}
 	if (read.object.content.isEmpty()
 		|| !Window::Theme::Initialize(std::move(read))) {
+		DEBUG_LOG(("Theme: Could not initialized for key: %1").arg(key));
 		return std::nullopt;
 	}
 	return result;
@@ -977,13 +1092,23 @@ void writeTheme(const Window::Theme::Saved &saved) {
 	using namespace Window::Theme;
 
 	if (_themeKeyLegacy) {
+		DEBUG_LOG(("Theme: skipping write, because legacy: %1"
+			).arg(_themeKeyLegacy));
 		return;
 	}
 	auto &themeKey = IsNightMode()
 		? _themeKeyNight
 		: _themeKeyDay;
+	DEBUG_LOG(("Theme: writing (night: %1), key_day: %2, key_night: %3"
+		).arg(Logs::b(IsNightMode())
+		).arg(_themeKeyDay
+		).arg(_themeKeyNight));
 	if (saved.object.content.isEmpty()) {
 		if (themeKey) {
+			if (IsNightMode()) {
+				DEBUG_LOG(("Theme: cleared for night mode."));
+				SetNightModeValue(false);
+			}
 			ClearKey(themeKey, _basePath);
 			themeKey = 0;
 			writeSettings();
@@ -999,6 +1124,29 @@ void writeTheme(const Window::Theme::Saved &saved) {
 	const auto &object = saved.object;
 	const auto &cache = saved.cache;
 	const auto tag = QString(kThemeNewPathRelativeTag);
+	auto chatTheme = QByteArray();
+	if (!object.cloud.settings.empty()) {
+		auto stream = QDataStream(&chatTheme, QIODevice::WriteOnly);
+		stream.setVersion(QDataStream::Qt_5_1);
+		stream
+			<< object.cloud.emoticon
+			<< qint32(object.cloud.settings.size());
+		for (const auto &[type, settings] : object.cloud.settings) {
+			stream << qint32(type);
+			Serialize::writeColor(stream, settings.accentColor);
+			stream << qint32(settings.outgoingAccentColor ? 1 : 0);
+			if (settings.outgoingAccentColor) {
+				Serialize::writeColor(stream, *settings.outgoingAccentColor);
+			}
+			stream << qint32(settings.outgoingMessagesColors.size());
+			for (const auto &color : settings.outgoingMessagesColors) {
+				Serialize::writeColor(stream, color);
+			}
+			stream << (settings.paper
+				? settings.paper->serialize()
+				: QByteArray());
+		}
+	}
 	quint32 size = Serialize::bytearraySize(object.content)
 		+ Serialize::stringSize(tag)
 		+ Serialize::stringSize(object.pathAbsolute)
@@ -1010,7 +1158,13 @@ void writeTheme(const Window::Theme::Saved &saved) {
 		+ sizeof(qint32) * 2
 		+ Serialize::bytearraySize(cache.colors)
 		+ Serialize::bytearraySize(cache.background)
-		+ sizeof(quint32);
+		+ sizeof(quint32)
+		+ Serialize::bytearraySize(chatTheme);
+	const auto bareCreatedById = object.cloud.createdBy.bare;
+	Assert((bareCreatedById & PeerId::kChatTypeMask) == bareCreatedById);
+	const auto field1 = qint32(quint32(bareCreatedById & 0xFFFFFFFFULL));
+	const auto field2 = quint32(cache.tiled ? 1 : 0)
+		| (quint32(bareCreatedById >> 32) << 8);
 	EncryptedDescriptor data(size);
 	data.stream
 		<< object.content
@@ -1022,12 +1176,13 @@ void writeTheme(const Window::Theme::Saved &saved) {
 		<< object.cloud.slug
 		<< object.cloud.title
 		<< object.cloud.documentId
-		<< qint32(object.cloud.createdBy)
+		<< field1
 		<< cache.paletteChecksum
 		<< cache.contentChecksum
 		<< cache.colors
 		<< cache.background
-		<< quint32(cache.tiled ? 1 : 0);
+		<< field2
+		<< chatTheme;
 
 	FileWriteDescriptor file(themeKey, _basePath);
 	file.writeEncrypted(data, SettingsKey);
@@ -1043,17 +1198,36 @@ void InitialLoadTheme() {
 		: (Window::Theme::IsNightMode()
 			? _themeKeyNight
 			: _themeKeyDay);
+	DEBUG_LOG(("Theme: initial load (night: %1), "
+		"key_legacy: %2, key_day: %3, key_night: %4"
+		).arg(Logs::b(Window::Theme::IsNightMode())
+		).arg(_themeKeyLegacy
+		).arg(_themeKeyDay
+		).arg(_themeKeyNight));
 	if (!key) {
+		if (Window::Theme::IsNightMode()) {
+			DEBUG_LOG(("Theme: zero key for night mode."));
+			Window::Theme::SetNightModeValue(false);
+		}
 		return;
 	} else if (const auto path = InitialLoadThemeUsingKey(key)) {
+		DEBUG_LOG(("Theme: loaded with result: %1").arg(*path));
 		if (_themeKeyLegacy) {
 			Window::Theme::SetNightModeValue(*path
 				== Window::Theme::NightThemePath());
 			(Window::Theme::IsNightMode()
 				? _themeKeyNight
 				: _themeKeyDay) = base::take(_themeKeyLegacy);
+			DEBUG_LOG(("Theme: now (night: %1), "
+				"key_legacy: %2, key_day: %3, key_night: %4 (path: %5)"
+				).arg(Logs::b(Window::Theme::IsNightMode())
+				).arg(_themeKeyLegacy
+				).arg(_themeKeyDay
+				).arg(_themeKeyNight
+				).arg(*path));
 		}
 	} else {
+		DEBUG_LOG(("Theme: could not load, clearing.."));
 		clearTheme();
 	}
 }
@@ -1201,7 +1375,7 @@ std::vector<Lang::Language> readRecentLanguages() {
 Window::Theme::Object ReadThemeContent() {
 	using namespace Window::Theme;
 
-	auto &themeKey = IsNightMode() ? _themeKeyNight : _themeKeyDay;
+	const auto &themeKey = IsNightMode() ? _themeKeyNight : _themeKeyDay;
 	if (!themeKey) {
 		return Object();
 	}
@@ -1229,7 +1403,7 @@ void incrementRecentHashtag(RecentHashtagPack &recent, const QString &tag) {
 	for (; i != e; ++i) {
 		if (i->first == tag) {
 			++i->second;
-			if (qAbs(i->second) > 0x4000) {
+			if (i->second > 0x4000) {
 				for (auto j = recent.begin(); j != e; ++j) {
 					if (j->second > 1) {
 						j->second /= 2;
@@ -1239,22 +1413,22 @@ void incrementRecentHashtag(RecentHashtagPack &recent, const QString &tag) {
 				}
 			}
 			for (; i != recent.begin(); --i) {
-				if (qAbs((i - 1)->second) > qAbs(i->second)) {
+				if ((i - 1)->second > i->second) {
 					break;
 				}
-				qSwap(*i, *(i - 1));
+				std::swap(*i, *(i - 1));
 			}
 			break;
 		}
 	}
 	if (i == e) {
 		while (recent.size() >= 64) recent.pop_back();
-		recent.push_back(qMakePair(tag, 1));
+		recent.push_back({ tag, 1 });
 		for (i = recent.end() - 1; i != recent.begin(); --i) {
 			if ((i - 1)->second > i->second) {
 				break;
 			}
-			qSwap(*i, *(i - 1));
+			std::swap(*i, *(i - 1));
 		}
 	}
 }

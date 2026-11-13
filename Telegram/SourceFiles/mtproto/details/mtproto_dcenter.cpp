@@ -17,9 +17,6 @@ namespace MTP {
 namespace details {
 namespace {
 
-constexpr auto kEnumerateDcTimeout = 8000; // 8 seconds timeout for help_getConfig to work (then move to other dc)
-constexpr auto kSpecialRequestTimeoutMs = 6000; // 4 seconds timeout for it to work in a specially requested dc.
-
 int IndexByType(TemporaryKeyType type) {
 	switch (type) {
 	case TemporaryKeyType::Regular: return 0;
@@ -113,7 +110,7 @@ CreatingKeyType Dcenter::acquireKeyCreation(DcType type) {
 	QReadLocker lock(&_mutex);
 	const auto keyType = TemporaryKeyTypeByDcType(type);
 	const auto index = IndexByType(keyType);
-	auto &key = _temporaryKeys[index];
+	const auto &key = _temporaryKeys[index];
 	if (key != nullptr) {
 		return CreatingKeyType::None;
 	}

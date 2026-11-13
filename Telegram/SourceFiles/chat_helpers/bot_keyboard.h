@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "ui/widgets/tooltip.h"
+#include "chat_helpers/bot_command.h"
 
 class ReplyKeyboard;
 
@@ -15,35 +16,40 @@ namespace style {
 struct BotKeyboardButton;
 } // namespace style
 
-namespace Main {
-class Session;
-} // namespace Main
+namespace Window {
+class SessionController;
+} // namespace Window
 
 class BotKeyboard
-	: public TWidget
+	: public Ui::RpWidget
 	, public Ui::AbstractTooltipShower
 	, public ClickHandlerHost {
 public:
-	BotKeyboard(not_null<Main::Session*> session, QWidget *parent);
+	BotKeyboard(
+		not_null<Window::SessionController*> controller,
+		QWidget *parent);
 
-	bool moderateKeyActivate(int index);
+	bool moderateKeyActivate(int index, Fn<ClickContext(FullMsgId)> context);
 
 	// With force=true the markup is updated even if it is
 	// already shown for the passed history item.
 	bool updateMarkup(HistoryItem *last, bool force = false);
-	bool hasMarkup() const;
-	bool forceReply() const;
+	[[nodiscard]] bool hasMarkup() const;
+	[[nodiscard]] bool forceReply() const;
 
-	void step_selected(crl::time ms, bool timer);
-	void resizeToWidth(int newWidth, int maxOuterHeight) {
-		_maxOuterHeight = maxOuterHeight;
-		return TWidget::resizeToWidth(newWidth);
+	[[nodiscard]] QString placeholder() const {
+		return _placeholder;
 	}
 
-	bool maximizeSize() const;
-	bool singleUse() const;
+	void resizeToWidth(int newWidth, int maxOuterHeight) {
+		_maxOuterHeight = maxOuterHeight;
+		return RpWidget::resizeToWidth(newWidth);
+	}
 
-	FullMsgId forMsgId() const {
+	[[nodiscard]] bool singleUse() const;
+	[[nodiscard]] bool persistent() const;
+
+	[[nodiscard]] FullMsgId forMsgId() const {
 		return _wasForMsgId;
 	}
 
@@ -56,6 +62,8 @@ public:
 	void clickHandlerActiveChanged(const ClickHandlerPtr &p, bool active) override;
 	void clickHandlerPressedChanged(const ClickHandlerPtr &p, bool pressed) override;
 
+	rpl::producer<Bot::SendCommandRequest> sendCommandRequests() const;
+
 	~BotKeyboard();
 
 protected:
@@ -65,7 +73,7 @@ protected:
 	void mousePressEvent(QMouseEvent *e) override;
 	void mouseMoveEvent(QMouseEvent *e) override;
 	void mouseReleaseEvent(QMouseEvent *e) override;
-	void enterEventHook(QEvent *e) override;
+	void enterEventHook(QEnterEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
 
 private:
@@ -74,16 +82,20 @@ private:
 	void updateStyle(int newWidth);
 	void clearSelection();
 
-	const not_null<Main::Session*> _session;
+	const not_null<Window::SessionController*> _controller;
 	FullMsgId _wasForMsgId;
+	QString _placeholder;
 	int _height = 0;
 	int _maxOuterHeight = 0;
 	bool _maximizeSize = false;
 	bool _singleUse = false;
 	bool _forceReply = false;
+	bool _persistent = false;
 
 	QPoint _lastMousePos;
 	std::unique_ptr<ReplyKeyboard> _impl;
+
+	rpl::event_stream<Bot::SendCommandRequest> _sendCommandRequests;
 
 	const style::BotKeyboardButton *_st = nullptr;
 

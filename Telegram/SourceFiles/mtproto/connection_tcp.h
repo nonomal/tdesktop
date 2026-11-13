@@ -32,10 +32,10 @@ public:
 		const QString &address,
 		int port,
 		const bytes::vector &protocolSecret,
-		int16 protocolDcId) override;
+		int16 protocolDcId,
+		bool protocolForFiles) override;
 	void timedOut() override;
 	bool isConnected() const override;
-	bool requiresExtendedPadding() const override;
 
 	int32 debugState() const override;
 
@@ -62,10 +62,6 @@ private:
 
 	mtpBuffer parsePacket(bytes::const_span bytes);
 	void ensureAvailableInBuffer(int amount);
-	static uint32 fourCharsToUInt(char ch1, char ch2, char ch3, char ch4) {
-		char ch[4] = { ch1, ch2, ch3, ch4 };
-		return *reinterpret_cast<uint32*>(ch);
-	}
 
 	const not_null<Instance*> _instance;
 	std::unique_ptr<AbstractSocket> _socket;

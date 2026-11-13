@@ -8,7 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "ui/rp_widget.h"
-#include "boxes/abstract_box.h"
+#include "ui/layers/box_content.h"
 #include "history/admin_log/history_admin_log_item.h"
 #include "history/view/history_view_element.h"
 #include "history/history.h"
@@ -24,6 +24,7 @@ class SessionController;
 namespace Ui {
 class ScrollArea;
 class InputField;
+class ChatStyle;
 } // namespace Ui
 
 namespace Support {
@@ -83,6 +84,7 @@ protected:
 	void keyPressEvent(QKeyEvent *e) override;
 
 private:
+	std::unique_ptr<Ui::ChatStyle> _chatStyle;
 	AdminLog::OwnedItem _comment;
 	AdminLog::OwnedItem _contact;
 	Fn<void(Qt::KeyboardModifiers)> _submit;

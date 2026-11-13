@@ -7,12 +7,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "boxes/abstract_box.h"
+#include "ui/layers/box_content.h"
 #include "base/unique_qptr.h"
-
-namespace MTP {
-class Error;
-} // namespace MTP
+#include "data/data_chat_participant_status.h"
 
 namespace Ui {
 class FlatLabel;
@@ -20,16 +17,13 @@ class LinkButton;
 class Checkbox;
 class Radiobutton;
 class RadiobuttonGroup;
-class CalendarBox;
+class VerticalLayout;
 template <typename Widget>
 class SlideWrap;
 } // namespace Ui
 
-namespace Core {
-struct CloudPasswordResult;
-} // namespace Core
-
-class PasscodeBox;
+class ChannelOwnershipTransfer;
+class EditTagControl;
 
 class EditParticipantBox : public Ui::BoxContent {
 public:
@@ -38,6 +32,8 @@ public:
 		not_null<PeerData*> peer,
 		not_null<UserData*> user,
 		bool hasAdminRights);
+
+	[[nodiscard]] not_null<Ui::VerticalLayout*> verticalLayout() const;
 
 protected:
 	void prepare() override;
@@ -53,6 +49,8 @@ protected:
 	template <typename Widget>
 	Widget *addControl(object_ptr<Widget> widget, QMargins margin = {});
 
+	void setCoverMode(bool enabled);
+
 	bool hasAdminRights() const {
 		return _hasAdminRights;
 	}
@@ -67,20 +65,28 @@ private:
 
 };
 
+struct EditAdminBotFields {
+	QString token;
+	ChatAdminRights existing;
+};
+
 class EditAdminBox : public EditParticipantBox {
 public:
 	EditAdminBox(
 		QWidget*,
 		not_null<PeerData*> peer,
 		not_null<UserData*> user,
-		const MTPChatAdminRights &rights,
-		const QString &rank);
+		ChatAdminRightsInfo rights,
+		const QString &rank,
+		TimeId promotedSince,
+		UserData *by,
+		std::optional<EditAdminBotFields> addingBot = {});
 
 	void setSaveCallback(
 			Fn<void(
-				MTPChatAdminRights,
-				MTPChatAdminRights,
-				const QString &rank)> callback) {
+				ChatAdminRightsInfo,
+				ChatAdminRightsInfo,
+				const std::optional<QString> &rank)> callback) {
 		_saveCallback = std::move(callback);
 	}
 
@@ -88,37 +94,39 @@ protected:
 	void prepare() override;
 
 private:
-	using Flag = MTPDchatAdminRights::Flag;
-	using Flags = MTPDchatAdminRights::Flags;
+	[[nodiscard]] ChatAdminRightsInfo defaultRights() const;
 
-	[[nodiscard]] MTPChatAdminRights defaultRights() const;
-
-	not_null<Ui::InputField*> addRankInput();
 	void transferOwnership();
-	void transferOwnershipChecked();
-	bool handleTransferPasswordError(const MTP::Error &error);
-	void requestTransferPassword(not_null<ChannelData*> channel);
-	void sendTransferRequestFrom(
-		QPointer<PasscodeBox> box,
-		not_null<ChannelData*> channel,
-		const Core::CloudPasswordResult &result);
-	bool canSave() const {
+	[[nodiscard]] bool canSave() const {
 		return _saveCallback != nullptr;
 	}
-	void refreshAboutAddAdminsText(bool canAddAdmins);
-	bool canTransferOwnership() const;
-	not_null<Ui::SlideWrap<Ui::RpWidget>*> setupTransferButton(bool isGroup);
+	void finishAddAdmin();
+	void confirmGuardBotSave(ChatAdminRightsInfo rights, Fn<void()> done);
+	void refreshButtons();
+	[[nodiscard]] bool canTransferOwnership() const;
+	not_null<Ui::SlideWrap<Ui::RpWidget>*> setupTransferButton(
+		not_null<Ui::VerticalLayout*> container,
+		bool isGroup);
 
-	const MTPChatAdminRights _oldRights;
+	const ChatAdminRightsInfo _oldRights;
 	const QString _oldRank;
 	Fn<void(
-		MTPChatAdminRights,
-		MTPChatAdminRights,
-		const QString &rank)> _saveCallback;
+		ChatAdminRightsInfo,
+		ChatAdminRightsInfo,
+		const std::optional<QString> &rank)> _saveCallback;
 
-	QPointer<Ui::FlatLabel> _aboutAddAdmins;
-	mtpRequestId _checkTransferRequestId = 0;
-	mtpRequestId _transferRequestId = 0;
+	base::weak_qptr<Ui::BoxContent> _confirmBox;
+	Ui::Checkbox *_addAsAdmin = nullptr;
+	Ui::SlideWrap<Ui::VerticalLayout> *_adminControlsWrap = nullptr;
+	EditTagControl *_tagControl = nullptr;
+
+	Fn<void()> _save, _finishSave;
+
+	TimeId _promotedSince = 0;
+	UserData *_by = nullptr;
+	std::optional<EditAdminBotFields> _addingBot;
+
+	std::unique_ptr<ChannelOwnershipTransfer> _ownershipTransfer;
 
 };
 
@@ -132,10 +140,13 @@ public:
 		not_null<PeerData*> peer,
 		not_null<UserData*> user,
 		bool hasAdminRights,
-		const MTPChatBannedRights &rights);
+		ChatRestrictionsInfo rights,
+		const QString &rank,
+		UserData *by,
+		TimeId since);
 
 	void setSaveCallback(
-			Fn<void(MTPChatBannedRights, MTPChatBannedRights)> callback) {
+			Fn<void(ChatRestrictionsInfo, ChatRestrictionsInfo)> callback) {
 		_saveCallback = std::move(callback);
 	}
 
@@ -143,10 +154,7 @@ protected:
 	void prepare() override;
 
 private:
-	using Flag = MTPDchatBannedRights::Flag;
-	using Flags = MTPDchatBannedRights::Flags;
-
-	[[nodiscard]] MTPChatBannedRights defaultRights() const;
+	[[nodiscard]] ChatRestrictionsInfo defaultRights() const;
 
 	bool canSave() const {
 		return !!_saveCallback;
@@ -158,13 +166,16 @@ private:
 	void createUntilVariants();
 	TimeId getRealUntilValue() const;
 
-	const MTPChatBannedRights _oldRights;
+	const ChatRestrictionsInfo _oldRights;
+	const QString _oldRank;
+	EditTagControl *_tagControl = nullptr;
+	UserData *_by = nullptr;
+	TimeId _since = 0;
 	TimeId _until = 0;
-	Fn<void(MTPChatBannedRights, MTPChatBannedRights)> _saveCallback;
+	Fn<void(ChatRestrictionsInfo, ChatRestrictionsInfo)> _saveCallback;
 
 	std::shared_ptr<Ui::RadiobuttonGroup> _untilGroup;
 	std::vector<base::unique_qptr<Ui::Radiobutton>> _untilVariants;
-	QPointer<Ui::CalendarBox> _restrictUntilBox;
 
 	static constexpr auto kUntilOneDay = -1;
 	static constexpr auto kUntilOneWeek = -2;

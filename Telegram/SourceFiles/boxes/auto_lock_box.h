@@ -7,11 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "boxes/abstract_box.h"
-
-namespace Main {
-class Session;
-} // namespace Main
+#include "ui/layers/box_content.h"
 
 namespace Ui {
 class Radiobutton;
@@ -19,15 +15,13 @@ class Radiobutton;
 
 class AutoLockBox : public Ui::BoxContent {
 public:
-	AutoLockBox(QWidget*, not_null<Main::Session*> session);
+	AutoLockBox(QWidget*);
 
 protected:
 	void prepare() override;
 
 private:
 	void durationChanged(int seconds);
-
-	const not_null<Main::Session*> _session;
 
 	std::vector<object_ptr<Ui::Radiobutton>> _options;
 

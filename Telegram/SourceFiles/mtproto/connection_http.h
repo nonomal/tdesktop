@@ -29,7 +29,8 @@ public:
 		const QString &address,
 		int port,
 		const bytes::vector &protocolSecret,
-		int16 protocolDcId) override;
+		int16 protocolDcId,
+		bool protocolForFiles) override;
 	bool isConnected() const override;
 	bool usingHttpWait() override;
 	bool needHttpWait() override;
@@ -39,8 +40,8 @@ public:
 	QString transport() const override;
 	QString tag() const override;
 
-	static mtpBuffer handleResponse(QNetworkReply *reply);
-	static qint32 handleError(QNetworkReply *reply); // returnes error code
+	mtpBuffer handleResponse(QNetworkReply *reply);
+	qint32 handleError(QNetworkReply *reply); // Returns error code.
 
 private:
 	QUrl url() const;

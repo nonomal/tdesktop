@@ -7,9 +7,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "base/value_ordering.h"
-#include "ui/text/text.h" // For QFIXED_MAX
+#include "ui/text/text.h" // Ui::kQFixedMax.
+#include "data/data_peer_id.h"
+#include "data/data_msg_id.h"
+#include "base/qt/qt_compare.h"
 
+struct AudioAlbumThumbLocation;
 class HistoryItem;
 using HistoryItemsList = std::vector<not_null<HistoryItem*>>;
 
@@ -27,10 +30,6 @@ namespace Ui {
 class InputField;
 } // namespace Ui
 
-namespace Main {
-class Session;
-} // namespace Main
-
 namespace Images {
 enum class Option;
 using Options = base::flags<Option>;
@@ -38,12 +37,17 @@ using Options = base::flags<Option>;
 
 namespace Data {
 
+struct FileOrigin;
+struct EmojiStatusCollectible;
+
 struct UploadState {
-	UploadState(int size) : size(size) {
+	explicit UploadState(int64 size) : size(size) {
 	}
-	int offset = 0;
-	int size = 0;
+	int64 offset = 0;
+	int64 size = 0;
 	bool waitingForAlbum = false;
+	bool preparing = false;
+	float64 prepareProgress = 0.;
 };
 
 Storage::Cache::Key DocumentCacheKey(int32 dcId, uint64 id);
@@ -51,6 +55,8 @@ Storage::Cache::Key DocumentThumbCacheKey(int32 dcId, uint64 id);
 Storage::Cache::Key WebDocumentCacheKey(const WebFileLocation &location);
 Storage::Cache::Key UrlCacheKey(const QString &location);
 Storage::Cache::Key GeoPointCacheKey(const GeoPointLocation &location);
+Storage::Cache::Key AudioAlbumThumbCacheKey(
+	const AudioAlbumThumbLocation &location);
 
 constexpr auto kImageCacheTag = uint8(0x01);
 constexpr auto kStickerCacheTag = uint8(0x02);
@@ -58,18 +64,20 @@ constexpr auto kVoiceMessageCacheTag = uint8(0x03);
 constexpr auto kVideoMessageCacheTag = uint8(0x04);
 constexpr auto kAnimationCacheTag = uint8(0x05);
 
-struct FileOrigin;
-
 } // namespace Data
 
 struct MessageGroupId {
-	uint64 peer = 0;
+	uint64 peerAndScheduledFlag = 0;
 	uint64 value = 0;
 
 	MessageGroupId() = default;
-	static MessageGroupId FromRaw(uint64 peer, uint64 value) {
+	static MessageGroupId FromRaw(
+			PeerId peer,
+			uint64 value,
+			bool scheduled) {
 		auto result = MessageGroupId();
-		result.peer = peer;
+		result.peerAndScheduledFlag = peer.value
+			| (scheduled ? (1ULL << 55) : 0);
 		result.value = value;
 		return result;
 	}
@@ -84,9 +92,9 @@ struct MessageGroupId {
 		return value;
 	}
 
-	friend inline std::pair<uint64, uint64> value_ordering_helper(MessageGroupId value) {
-		return std::make_pair(value.value, value.peer);
-	}
+	friend inline constexpr auto operator<=>(
+		MessageGroupId,
+		MessageGroupId) noexcept = default;
 
 };
 
@@ -94,189 +102,34 @@ class PeerData;
 class UserData;
 class ChatData;
 class ChannelData;
-class BotCommand;
 struct BotInfo;
 
 namespace Data {
 class Folder;
 } // namespace Data
 
-using UserId = int32;
-using ChatId = int32;
-using ChannelId = int32;
 using FolderId = int32;
 using FilterId = int32;
 
-constexpr auto NoChannel = ChannelId(0);
-
-using PeerId = uint64;
-
-constexpr auto PeerIdMask         = PeerId(0xFFFFFFFFULL);
-constexpr auto PeerIdTypeMask     = PeerId(0xF00000000ULL);
-constexpr auto PeerIdUserShift    = PeerId(0x000000000ULL);
-constexpr auto PeerIdChatShift    = PeerId(0x100000000ULL);
-constexpr auto PeerIdChannelShift = PeerId(0x200000000ULL);
-constexpr auto PeerIdFakeShift    = PeerId(0xF00000000ULL);
-
-inline constexpr bool peerIsUser(const PeerId &id) {
-	return (id & PeerIdTypeMask) == PeerIdUserShift;
-}
-inline constexpr bool peerIsChat(const PeerId &id) {
-	return (id & PeerIdTypeMask) == PeerIdChatShift;
-}
-inline constexpr bool peerIsChannel(const PeerId &id) {
-	return (id & PeerIdTypeMask) == PeerIdChannelShift;
-}
-inline constexpr PeerId peerFromUser(UserId user_id) {
-	return PeerIdUserShift | uint64(uint32(user_id));
-}
-inline constexpr PeerId peerFromChat(ChatId chat_id) {
-	return PeerIdChatShift | uint64(uint32(chat_id));
-}
-inline constexpr PeerId peerFromChannel(ChannelId channel_id) {
-	return PeerIdChannelShift | uint64(uint32(channel_id));
-}
-inline constexpr PeerId peerFromUser(const MTPint &user_id) {
-	return peerFromUser(user_id.v);
-}
-inline constexpr PeerId peerFromChat(const MTPint &chat_id) {
-	return peerFromChat(chat_id.v);
-}
-inline constexpr PeerId peerFromChannel(const MTPint &channel_id) {
-	return peerFromChannel(channel_id.v);
-}
-inline constexpr int32 peerToBareInt(const PeerId &id) {
-	return int32(uint32(id & PeerIdMask));
-}
-inline constexpr UserId peerToUser(const PeerId &id) {
-	return peerIsUser(id) ? peerToBareInt(id) : 0;
-}
-inline constexpr ChatId peerToChat(const PeerId &id) {
-	return peerIsChat(id) ? peerToBareInt(id) : 0;
-}
-inline constexpr ChannelId peerToChannel(const PeerId &id) {
-	return peerIsChannel(id) ? peerToBareInt(id) : NoChannel;
-}
-inline MTPint peerToBareMTPInt(const PeerId &id) {
-	return MTP_int(peerToBareInt(id));
-}
-inline PeerId peerFromMTP(const MTPPeer &peer) {
-	switch (peer.type()) {
-	case mtpc_peerUser: return peerFromUser(peer.c_peerUser().vuser_id());
-	case mtpc_peerChat: return peerFromChat(peer.c_peerChat().vchat_id());
-	case mtpc_peerChannel: return peerFromChannel(peer.c_peerChannel().vchannel_id());
-	}
-	return 0;
-}
-inline MTPpeer peerToMTP(const PeerId &id) {
-	if (peerIsUser(id)) {
-		return MTP_peerUser(peerToBareMTPInt(id));
-	} else if (peerIsChat(id)) {
-		return MTP_peerChat(peerToBareMTPInt(id));
-	} else if (peerIsChannel(id)) {
-		return MTP_peerChannel(peerToBareMTPInt(id));
-	}
-	return MTP_peerUser(MTP_int(0));
-}
-
-using MsgId = int32;
-constexpr auto StartClientMsgId = MsgId(-0x7FFFFFFF);
-constexpr auto EndClientMsgId = MsgId(-0x40000000);
-constexpr auto ShowAtTheEndMsgId = MsgId(-0x40000000);
-constexpr auto SwitchAtTopMsgId = MsgId(-0x3FFFFFFF);
-constexpr auto ShowAtProfileMsgId = MsgId(-0x3FFFFFFE);
-constexpr auto ShowAndStartBotMsgId = MsgId(-0x3FFFFFFD);
-constexpr auto ShowAtGameShareMsgId = MsgId(-0x3FFFFFFC);
-constexpr auto ShowForChooseMessagesMsgId = MsgId(-0x3FFFFFFB);
-constexpr auto ServerMaxMsgId = MsgId(0x3FFFFFFF);
-constexpr auto ShowAtUnreadMsgId = MsgId(0);
-constexpr inline bool IsClientMsgId(MsgId id) {
-	return (id >= StartClientMsgId && id < EndClientMsgId);
-}
-constexpr inline bool IsServerMsgId(MsgId id) {
-	return (id > 0 && id < ServerMaxMsgId);
-}
-
-struct MsgRange {
-	MsgRange() = default;
-	MsgRange(MsgId from, MsgId till) : from(from), till(till) {
-	}
-
-	MsgId from = 0;
-	MsgId till = 0;
-};
-inline bool operator==(const MsgRange &a, const MsgRange &b) {
-	return (a.from == b.from) && (a.till == b.till);
-}
-inline bool operator!=(const MsgRange &a, const MsgRange &b) {
-	return !(a == b);
-}
-
-struct FullMsgId {
-	constexpr FullMsgId() = default;
-	constexpr FullMsgId(ChannelId channel, MsgId msg) : channel(channel), msg(msg) {
-	}
-
-	explicit operator bool() const {
-		return msg != 0;
-	}
-
-
-	inline constexpr bool operator<(const FullMsgId &other) const {
-		if (channel < other.channel) {
-			return true;
-		} else if (channel > other.channel) {
-			return false;
-		}
-		return msg < other.msg;
-	}
-	inline constexpr bool operator>(const FullMsgId &other) const {
-		return other < *this;
-	}
-	inline constexpr bool operator<=(const FullMsgId &other) const {
-		return !(other < *this);
-	}
-	inline constexpr bool operator>=(const FullMsgId &other) const {
-		return !(*this < other);
-	}
-	inline constexpr bool operator==(const FullMsgId &other) const {
-		return (channel == other.channel) && (msg == other.msg);
-	}
-	inline constexpr bool operator!=(const FullMsgId &other) const {
-		return !(*this == other);
-	}
-
-	ChannelId channel = NoChannel;
-	MsgId msg = 0;
-
-};
-
-Q_DECLARE_METATYPE(FullMsgId);
-
 using MessageIdsList = std::vector<FullMsgId>;
 
-PeerId PeerFromMessage(const MTPmessage &message);
-MTPDmessage::Flags FlagsFromMessage(const MTPmessage &message);
-MsgId IdFromMessage(const MTPmessage &message);
-TimeId DateFromMessage(const MTPmessage &message);
+[[nodiscard]] PeerId PeerFromMessage(const MTPmessage &message);
+[[nodiscard]] MsgId IdFromMessage(const MTPmessage &message);
+[[nodiscard]] TimeId DateFromMessage(const MTPmessage &message);
+[[nodiscard]] BusinessShortcutId BusinessShortcutIdFromMessage(
+	const MTPmessage &message);
+
+[[nodiscard]] inline MTPint MTP_int(MsgId id) noexcept {
+	return MTP_int(id.bare);
+}
 
 class DocumentData;
 class PhotoData;
 struct WebPageData;
 struct GameData;
+struct BotAppData;
 struct PollData;
-
-class AudioMsgId;
-class PhotoClickHandler;
-class PhotoOpenClickHandler;
-class PhotoSaveClickHandler;
-class PhotoCancelClickHandler;
-class DocumentClickHandler;
-class DocumentSaveClickHandler;
-class DocumentOpenClickHandler;
-class DocumentCancelClickHandler;
-class DocumentWrappedClickHandler;
-class VoiceSeekClickHandler;
+struct TodoListData;
 
 using PhotoId = uint64;
 using VideoId = uint64;
@@ -285,7 +138,29 @@ using DocumentId = uint64;
 using WebPageId = uint64;
 using GameId = uint64;
 using PollId = uint64;
+using TodoListId = FullMsgId;
 using WallPaperId = uint64;
+using CallId = uint64;
+using BotAppId = uint64;
+using EffectId = uint64;
+using CollectibleId = uint64;
+
+struct EmojiStatusId {
+	DocumentId documentId = 0;
+	std::shared_ptr<Data::EmojiStatusCollectible> collectible;
+
+	explicit operator bool() const {
+		return documentId || collectible;
+	}
+
+	friend inline auto operator<=>(
+		const EmojiStatusId &,
+		const EmojiStatusId &) = default;
+	friend inline bool operator==(
+		const EmojiStatusId &,
+		const EmojiStatusId &) = default;
+};
+
 constexpr auto CancelledWebPageId = WebPageId(0xFFFFFFFFFFFFFFFFULL);
 
 struct PreparedPhotoThumb {
@@ -307,7 +182,7 @@ enum LocationType {
 	SecureFileLocation = 0xcbc7ee28, // mtpc_inputSecureFileLocation
 };
 
-enum FileStatus {
+enum FileStatus : signed char {
 	FileDownloadFailed = -2,
 	FileUploadFailed = -1,
 	FileReady = 1,
@@ -330,78 +205,6 @@ inline constexpr auto kStickerSideSize = 512;
 
 using MediaKey = QPair<uint64, uint64>;
 
-class AudioMsgId {
-public:
-	enum class Type {
-		Unknown,
-		Voice,
-		Song,
-		Video,
-	};
-
-	AudioMsgId() = default;
-	AudioMsgId(
-		not_null<DocumentData*> audio,
-		FullMsgId msgId,
-		uint32 externalPlayId = 0)
-	: _audio(audio)
-	, _contextId(msgId)
-	, _externalPlayId(externalPlayId) {
-		setTypeFromAudio();
-	}
-
-	[[nodiscard]] static uint32 CreateExternalPlayId();
-	[[nodiscard]] static AudioMsgId ForVideo();
-
-	[[nodiscard]] Type type() const {
-		return _type;
-	}
-	[[nodiscard]] DocumentData *audio() const {
-		return _audio;
-	}
-	[[nodiscard]] FullMsgId contextId() const {
-		return _contextId;
-	}
-	[[nodiscard]] uint32 externalPlayId() const {
-		return _externalPlayId;
-	}
-	[[nodiscard]] explicit operator bool() const {
-		return (_audio != nullptr) || (_externalPlayId != 0);
-	}
-
-private:
-	void setTypeFromAudio();
-
-	DocumentData *_audio = nullptr;
-	Type _type = Type::Unknown;
-	FullMsgId _contextId;
-	uint32 _externalPlayId = 0;
-
-};
-
-inline bool operator<(const AudioMsgId &a, const AudioMsgId &b) {
-	if (quintptr(a.audio()) < quintptr(b.audio())) {
-		return true;
-	} else if (quintptr(b.audio()) < quintptr(a.audio())) {
-		return false;
-	} else if (a.contextId() < b.contextId()) {
-		return true;
-	} else if (b.contextId() < a.contextId()) {
-		return false;
-	}
-	return (a.externalPlayId() < b.externalPlayId());
-}
-
-inline bool operator==(const AudioMsgId &a, const AudioMsgId &b) {
-	return (a.audio() == b.audio())
-		&& (a.contextId() == b.contextId())
-		&& (a.externalPlayId() == b.externalPlayId());
-}
-
-inline bool operator!=(const AudioMsgId &a, const AudioMsgId &b) {
-	return !(a == b);
-}
-
 struct MessageCursor {
 	MessageCursor() = default;
 	MessageCursor(int position, int anchor, int scroll)
@@ -418,7 +221,7 @@ struct MessageCursor {
 
 	int position = 0;
 	int anchor = 0;
-	int scroll = QFIXED_MAX;
+	int scroll = Ui::kQFixedMax;
 
 };
 
@@ -436,32 +239,177 @@ inline bool operator!=(
 	return !(a == b);
 }
 
-class FileClickHandler : public LeftButtonClickHandler {
-public:
-	FileClickHandler(
-		not_null<Main::Session*> session,
-		FullMsgId context)
-	: _session(session)
-	, _context(context) {
+struct StickerSetIdentifier {
+	uint64 id = 0;
+	uint64 accessHash = 0;
+	QString shortName;
+
+	[[nodiscard]] bool empty() const {
+		return !id && shortName.isEmpty();
 	}
-
-	[[nodiscard]] Main::Session &session() const {
-		return *_session;
+	[[nodiscard]] explicit operator bool() const {
+		return !empty();
 	}
-
-	void setMessageId(FullMsgId context) {
-		_context = context;
-	}
-
-	[[nodiscard]] FullMsgId context() const {
-		return _context;
-	}
-
-protected:
-	HistoryItem *getActionItem() const;
-
-private:
-	const not_null<Main::Session*> _session;
-	FullMsgId _context;
-
 };
+
+enum class MessageFlag : uint64 {
+	HideEdited            = (1ULL << 0),
+	Legacy                = (1ULL << 1),
+	HasReplyMarkup        = (1ULL << 2),
+	HasFromId             = (1ULL << 3),
+	HasPostAuthor         = (1ULL << 4),
+	HasViews              = (1ULL << 5),
+	HasReplyInfo          = (1ULL << 6),
+	CanViewReactions      = (1ULL << 7),
+	AdminLogEntry         = (1ULL << 8),
+	Post                  = (1ULL << 9),
+	Silent                = (1ULL << 10),
+	Outgoing              = (1ULL << 11),
+	Pinned                = (1ULL << 12),
+	MediaIsUnread         = (1ULL << 13),
+	HasUnreadReaction     = (1ULL << 14),
+	MentionsMe            = (1ULL << 15),
+	IsOrWasScheduled      = (1ULL << 16),
+	NoForwards            = (1ULL << 17),
+	InvertMedia           = (1ULL << 18),
+
+	// Needs to return back to inline mode.
+	HasSwitchInlineButton = (1ULL << 19),
+
+	// For "shared links" indexing.
+	HasTextLinks          = (1ULL << 20),
+
+	// Group / channel create or migrate service message.
+	IsGroupEssential      = (1ULL << 21),
+
+	// Edited media is generated on the client
+	// and should not update media from server.
+	IsLocalUpdateMedia    = (1ULL << 22),
+
+	// Sent from inline bot, need to re-set media when sent.
+	FromInlineBot         = (1ULL << 23),
+
+	// Generated on the client side and should be unread.
+	ClientSideUnread      = (1ULL << 24),
+
+	// In a supergroup.
+	HasAdminBadge         = (1ULL << 25),
+
+	// Outgoing message that is being sent.
+	BeingSent             = (1ULL << 26),
+
+	// Outgoing message and failed to be sent.
+	SendingFailed         = (1ULL << 27),
+
+	EmojiInteractionWatched = (1ULL << 28),
+
+	// Message existing in the message history.
+	HistoryEntry          = (1ULL << 29),
+
+	// Local message, not existing on the server.
+	Local                 = (1ULL << 30),
+
+	// Fake message for some UI element.
+	FakeHistoryItem       = (1ULL << 31),
+
+	// Contact sign-up message, notification should be skipped for Silent.
+	IsContactSignUp       = (1ULL << 32),
+
+	// Optimization for item text custom emoji repainting.
+	CustomEmojiRepainting = (1ULL << 33),
+
+	// Profile photo suggestion, views have special media type.
+	IsUserpicSuggestion   = (1ULL << 34),
+
+	OnlyEmojiAndSpaces    = (1ULL << 35),
+	OnlyEmojiAndSpacesSet = (1ULL << 36),
+
+	// Fake message with some info, like bot cover and information.
+	FakeAboutView         = (1ULL << 37),
+
+	StoryItem             = (1ULL << 38),
+
+	InHighlightProcess    = (1ULL << 39),
+
+	// If not set then we need to refresh _displayFrom value.
+	DisplayFromChecked    = (1ULL << 40),
+	DisplayFromProfiles   = (1ULL << 41),
+
+	ShowSimilarChannels   = (1ULL << 42),
+
+	Sponsored             = (1ULL << 43),
+
+	ReactionsAreTags      = (1ULL << 44),
+
+	ShortcutMessage       = (1ULL << 45),
+
+	EffectWatched         = (1ULL << 46),
+
+	SensitiveContent      = (1ULL << 47),
+	HasRestrictions       = (1ULL << 48),
+
+	EstimatedDate         = (1ULL << 49),
+
+	ReactionsAllowed      = (1ULL << 50),
+
+	HideDisplayDate       = (1ULL << 51),
+
+	StarsPaidSuggested    = (1ULL << 52),
+	TonPaidSuggested      = (1ULL << 53),
+
+	StoryInProfile        = (1ULL << 54),
+	SavedMusicItem        = (1ULL << 55),
+
+	HasHiddenLinks        = (1ULL << 56),
+	HasSummaryEntry       = (1ULL << 57),
+	CanBeSummarized       = (1ULL << 58),
+	HasUnreadPollVote     = (1ULL << 59),
+
+	TextAppearing         = (1ULL << 60),
+	TextAppearingStarted  = (1ULL << 61),
+
+	GuestChatViaFrom      = (1ULL << 62),
+
+	Ephemeral             = (1ULL << 63),
+};
+inline constexpr bool is_flag_type(MessageFlag) { return true; }
+using MessageFlags = base::flags<MessageFlag>;
+
+enum class MediaWebPageFlag : uint8 {
+	ForceLargeMedia = (1 << 0),
+	ForceSmallMedia = (1 << 1),
+	Manual = (1 << 2),
+	Safe = (1 << 3),
+	Sponsored = (1 << 4),
+};
+inline constexpr bool is_flag_type(MediaWebPageFlag) { return true; }
+using MediaWebPageFlags = base::flags<MediaWebPageFlag>;
+
+namespace Data {
+
+enum class ForwardOptions {
+	PreserveInfo,
+	NoSenderNames,
+	NoNamesAndCaptions,
+};
+
+enum class ViewRemovalReason : uchar {
+	Removed,
+	Detached,
+};
+
+struct ForwardDraft {
+	MessageIdsList ids;
+	ForwardOptions options = ForwardOptions::PreserveInfo;
+
+	friend inline auto operator<=>(
+		const ForwardDraft&,
+		const ForwardDraft&) = default;
+};
+
+struct ResolvedForwardDraft {
+	HistoryItemsList items;
+	ForwardOptions options = ForwardOptions::PreserveInfo;
+};
+
+} // namespace Data

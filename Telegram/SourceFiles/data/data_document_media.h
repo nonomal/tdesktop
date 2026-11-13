@@ -12,9 +12,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 class Image;
 class FileLoader;
 
+namespace Ui {
+class FrameGenerator;
+} // namespace Ui
+
 namespace Media {
 namespace Clip {
-enum Notification : int;
+enum class Notification;
 class ReaderPointer;
 } // namespace Clip
 } // namespace Media
@@ -52,6 +56,7 @@ public:
 	void setGoodThumbnail(QImage thumbnail);
 
 	[[nodiscard]] Image *thumbnailInline() const;
+	[[nodiscard]] const QPainterPath &thumbnailPath() const;
 
 	[[nodiscard]] Image *thumbnail() const;
 	[[nodiscard]] QSize thumbnailSize() const;
@@ -102,6 +107,7 @@ private:
 	const not_null<DocumentData*> _owner;
 	std::unique_ptr<Image> _goodThumbnail;
 	mutable std::unique_ptr<Image> _inlineThumbnail;
+	mutable QPainterPath _pathThumbnail;
 	std::unique_ptr<Image> _thumbnail;
 	std::unique_ptr<Image> _sticker;
 	QByteArray _bytes;
@@ -109,5 +115,12 @@ private:
 	Flags _flags;
 
 };
+
+[[nodiscard]] auto DocumentIconFrameGenerator(not_null<DocumentMedia*> media)
+-> FnMut<std::unique_ptr<Ui::FrameGenerator>()>;
+
+[[nodiscard]] auto DocumentIconFrameGenerator(
+	const std::shared_ptr<DocumentMedia> &media)
+-> FnMut<std::unique_ptr<Ui::FrameGenerator>()>;
 
 } // namespace Data

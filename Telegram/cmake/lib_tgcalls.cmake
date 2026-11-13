@@ -5,14 +5,7 @@
 # https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 add_library(lib_tgcalls STATIC)
-
-if (WIN32)
-    init_target(lib_tgcalls cxx_std_17) # Small amount of patches required here.
-elseif (LINUX)
-    init_target(lib_tgcalls) # All C++20 on Linux, because otherwise ODR violation.
-else()
-    init_target(lib_tgcalls cxx_std_14) # Can't use std::optional::value on macOS.
-endif()
+init_target(lib_tgcalls) # Can't use std::optional::value on macOS.
 
 add_library(tdesktop::lib_tgcalls ALIAS lib_tgcalls)
 
@@ -29,12 +22,19 @@ nice_target_sources(lib_tgcalls ${tgcalls_loc}
 PRIVATE
     AudioDeviceHelper.cpp
     AudioDeviceHelper.h
+    ChannelManager.cpp
+    ChannelManager.h
     CodecSelectHelper.cpp
     CodecSelectHelper.h
     CryptoHelper.cpp
     CryptoHelper.h
+    DirectConnectionChannel.h
     EncryptedConnection.cpp
     EncryptedConnection.h
+    FakeAudioDeviceModule.cpp
+    FakeAudioDeviceModule.h
+    FieldTrialsConfig.cpp
+    FieldTrialsConfig.h
     InstanceImpl.cpp
     InstanceImpl.h
     LogSinkImpl.cpp
@@ -47,21 +47,86 @@ PRIVATE
     Message.h
     NetworkManager.cpp
     NetworkManager.h
+    SctpDataChannelProviderInterfaceImpl.cpp
+    SctpDataChannelProviderInterfaceImpl.h
     StaticThreads.cpp
     StaticThreads.h
     ThreadLocalObject.h
+    TurnCustomizerImpl.cpp
+    TurnCustomizerImpl.h
     VideoCaptureInterface.cpp
     VideoCaptureInterface.h
     VideoCaptureInterfaceImpl.cpp
     VideoCaptureInterfaceImpl.h
     VideoCapturerInterface.h
 
+    utils/gzip.cpp
+    utils/gzip.h
+
+    v2/ContentNegotiation.cpp
+    v2/ContentNegotiation.h
+    v2/CustomDcSctpSocket.cpp
+    v2/CustomDcSctpSocket.h
+    v2/CustomParameters.h
+    v2/DirectNetworkingImpl.cpp
+    v2/DirectNetworkingImpl.h
+    v2/ExternalSignalingConnection.cpp
+    v2/ExternalSignalingConnection.h
+    v2/InstanceNetworking.h
+    v2/InstanceV2ReferenceImpl.cpp
+    v2/InstanceV2ReferenceImpl.h
+    v2/InstanceV2Impl.cpp
+    v2/InstanceV2Impl.h
+    v2/MtProtoIceTransport.cpp
+    v2/MtProtoIceTransport.h
+    v2/NativeNetworkingImpl.cpp
+    v2/NativeNetworkingImpl.h
+    v2/RawTcpSocket.cpp
+    v2/RawTcpSocket.h
+    v2/ReflectorPort.cpp
+    v2/ReflectorPort.h
+    v2/ReflectorRelayPortFactory.cpp
+    v2/ReflectorRelayPortFactory.h
+    v2/Signaling.cpp
+    v2/Signaling.h
+    v2/SignalingConnection.cpp
+    v2/SignalingConnection.h
+    v2/SignalingEncryption.cpp
+    v2/SignalingEncryption.h
+    v2/SignalingSctpConnection.cpp
+    v2/SignalingSctpConnection.h
+
+    # Desktop capturer
+    desktop_capturer/DesktopCaptureSource.h
+    desktop_capturer/DesktopCaptureSource.cpp
+    desktop_capturer/DesktopCaptureSourceHelper.h
+    desktop_capturer/DesktopCaptureSourceHelper.cpp
+    desktop_capturer/DesktopCaptureSourceManager.h
+    desktop_capturer/DesktopCaptureSourceManager.cpp
+
+    # Group calls
+    group/AVIOContextImpl.cpp
+    group/AVIOContextImpl.h
+    group/AudioStreamingPart.cpp
+    group/AudioStreamingPart.h
+    group/AudioStreamingPartInternal.cpp
+    group/AudioStreamingPartInternal.h
+    group/AudioStreamingPartPersistentDecoder.cpp
+    group/AudioStreamingPartPersistentDecoder.h
     group/GroupInstanceCustomImpl.cpp
     group/GroupInstanceCustomImpl.h
+    group/GroupInstanceImpl.h
+    group/GroupJoinPayloadInternal.cpp
+    group/GroupJoinPayloadInternal.h
+    group/GroupJoinPayload.h
     group/GroupNetworkManager.cpp
     group/GroupNetworkManager.h
-    group/StreamingPart.cpp
-    group/StreamingPart.h
+    group/StreamingAudioRenderer.cpp
+    group/StreamingAudioRenderer.h
+    group/StreamingMediaContext.cpp
+    group/StreamingMediaContext.h
+    group/VideoStreamingPart.cpp
+    group/VideoStreamingPart.h
 
     platform/PlatformInterface.h
 
@@ -76,10 +141,33 @@ PRIVATE
     platform/android/VideoCapturerInterfaceImpl.h
 
     # iOS / macOS
+    platform/darwin/CustomSimulcastEncoderAdapter.cpp
+    platform/darwin/CustomSimulcastEncoderAdapter.h
+    platform/darwin/DarwinFFMpeg.h
+    platform/darwin/DarwinFFMpeg.mm
     platform/darwin/DarwinInterface.h
     platform/darwin/DarwinInterface.mm
-    platform/darwin/GLVideoView.h
-    platform/darwin/GLVideoView.mm
+    platform/darwin/DarwinVideoSource.h
+    platform/darwin/DarwinVideoSource.mm
+    platform/darwin/DesktopSharingCapturer.h
+    platform/darwin/DesktopSharingCapturer.mm
+    platform/darwin/ExtractCVPixelBuffer.h
+    platform/darwin/ExtractCVPixelBuffer.mm
+    platform/darwin/h265_nalu_rewriter.cc
+    platform/darwin/h265_nalu_rewriter.h
+    platform/darwin/objc_video_encoder_factory.h
+    platform/darwin/objc_video_encoder_factory.mm
+    platform/darwin/objc_video_decoder_factory.h
+    platform/darwin/objc_video_decoder_factory.mm
+    platform/darwin/RTCCodecSpecificInfoH265+Private.h
+    platform/darwin/RTCCodecSpecificInfoH265.h
+    platform/darwin/RTCCodecSpecificInfoH265.mm
+    platform/darwin/RTCH265ProfileLevelId.h
+    platform/darwin/RTCH265ProfileLevelId.mm
+    platform/darwin/TGCMIOCapturer.h
+    platform/darwin/TGCMIOCapturer.m
+    platform/darwin/TGCMIODevice.h
+    platform/darwin/TGCMIODevice.mm
     platform/darwin/TGRTCCVPixelBuffer.h
     platform/darwin/TGRTCCVPixelBuffer.mm
     platform/darwin/TGRTCDefaultVideoDecoderFactory.h
@@ -100,6 +188,8 @@ PRIVATE
     platform/darwin/VideoCameraCapturerMac.mm
     platform/darwin/VideoCapturerInterfaceImpl.h
     platform/darwin/VideoCapturerInterfaceImpl.mm
+    platform/darwin/VideoCMIOCapture.h
+    platform/darwin/VideoCMIOCapture.mm
     platform/darwin/VideoMetalView.h
     platform/darwin/VideoMetalView.mm
     platform/darwin/VideoMetalViewMac.h
@@ -117,40 +207,35 @@ PRIVATE
     platform/tdesktop/VideoCameraCapturer.cpp
     platform/tdesktop/VideoCameraCapturer.h
 
-    # All
-    reference/InstanceImplReference.cpp
-    reference/InstanceImplReference.h
+    # third-party
+    third-party/json11.cpp
+    third-party/json11.hpp
 )
 
 target_link_libraries(lib_tgcalls
 PRIVATE
     desktop-app::external_webrtc
     desktop-app::external_ffmpeg
+    desktop-app::external_openssl
+    desktop-app::external_rnnoise
+    desktop-app::external_zlib
 )
 
 target_compile_definitions(lib_tgcalls
+PUBLIC
+    TGCALLS_USE_STD_OPTIONAL
 PRIVATE
     WEBRTC_APP_TDESKTOP
+    RTC_ENABLE_H265
     RTC_ENABLE_VP9
 )
 
-if (WIN32)
-    target_compile_definitions(lib_tgcalls
-    PRIVATE
-        WEBRTC_WIN
-    )
-elseif (APPLE)
+if (APPLE)
     target_compile_options(lib_tgcalls
     PRIVATE
         -fobjc-arc
     )
-    target_compile_definitions(lib_tgcalls
-    PRIVATE
-        WEBRTC_MAC
-    )
     remove_target_sources(lib_tgcalls ${tgcalls_loc}
-        platform/darwin/GLVideoView.h
-        platform/darwin/GLVideoView.mm
         platform/darwin/VideoCameraCapturer.h
         platform/darwin/VideoCameraCapturer.mm
         platform/darwin/VideoMetalView.h
@@ -159,15 +244,23 @@ elseif (APPLE)
         platform/darwin/VideoMetalViewMac.mm
         platform/tdesktop/DesktopInterface.cpp
         platform/tdesktop/DesktopInterface.h
-        platform/tdesktop/VideoCapturerTrackSource.cpp
-        platform/tdesktop/VideoCapturerTrackSource.h
         platform/tdesktop/VideoCapturerInterfaceImpl.cpp
         platform/tdesktop/VideoCapturerInterfaceImpl.h
+        platform/tdesktop/VideoCapturerTrackSource.cpp
+        platform/tdesktop/VideoCapturerTrackSource.h
+        platform/tdesktop/VideoCameraCapturer.cpp
+        platform/tdesktop/VideoCameraCapturer.h
     )
-elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(lib_tgcalls
+endif()
+
+if (NOT MSVC)
+    target_compile_options_if_exists(lib_tgcalls
     PRIVATE
-        WEBRTC_LINUX
+        -Wno-deprecated-volatile
+        -Wno-ambiguous-reversed-operator
+        -Wno-deprecated-declarations
+        -Wno-unqualified-std-cast-call
+        -Wno-unused-function
     )
 endif()
 
@@ -189,34 +282,4 @@ PUBLIC
     ${tgcalls_dir}
 PRIVATE
     ${tgcalls_loc}
-)
-
-add_library(lib_tgcalls_legacy STATIC)
-
-if (WIN32)
-    init_target(lib_tgcalls_legacy cxx_std_17) # Small amount of patches required here.
-elseif (LINUX)
-    init_target(lib_tgcalls_legacy) # All C++20 on Linux, because otherwise ODR violation.
-else()
-    init_target(lib_tgcalls_legacy cxx_std_14) # Can't use std::optional::value on macOS.
-endif()
-
-add_library(tdesktop::lib_tgcalls_legacy ALIAS lib_tgcalls_legacy)
-
-nice_target_sources(lib_tgcalls_legacy ${tgcalls_loc}
-PRIVATE
-    legacy/InstanceImplLegacy.cpp
-    legacy/InstanceImplLegacy.h
-)
-
-target_include_directories(lib_tgcalls_legacy
-PRIVATE
-    ${tgcalls_loc}
-)
-
-target_link_libraries(lib_tgcalls_legacy
-PRIVATE
-    tdesktop::lib_tgcalls
-    tdesktop::lib_tgvoip
-    desktop-app::external_openssl
 )

@@ -9,19 +9,18 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "info/common_groups/info_common_groups_inner_widget.h"
 #include "info/info_controller.h"
-#include "ui/search_field_controller.h"
 #include "ui/widgets/scroll_area.h"
 #include "ui/ui_utility.h"
+#include "lang/lang_keys.h"
 #include "data/data_user.h"
 #include "data/data_session.h"
 #include "main/main_session.h"
-#include "styles/style_info.h"
 
 namespace Info {
 namespace CommonGroups {
 
 Memento::Memento(not_null<UserData*> user)
-: ContentMemento(user, 0) {
+: ContentMemento(user, nullptr, nullptr, PeerId()) {
 }
 
 Section Memento::section() const {
@@ -62,6 +61,10 @@ Widget::Widget(
 		user));
 }
 
+rpl::producer<QString> Widget::title() {
+	return tr::lng_profile_common_groups_section();
+}
+
 not_null<UserData*> Widget::user() const {
 	return _inner->user();
 }
@@ -100,7 +103,6 @@ void Widget::saveState(not_null<Memento*> memento) {
 
 void Widget::restoreState(not_null<Memento*> memento) {
 	_inner->restoreState(memento);
-	auto scrollTop = memento->scrollTop();
 	scrollTopRestore(memento->scrollTop());
 }
 

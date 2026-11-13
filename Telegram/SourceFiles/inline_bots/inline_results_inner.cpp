@@ -9,34 +9,55 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "api/api_common.h"
 #include "chat_helpers/gifs_list_widget.h" // ChatHelpers::AddGifAction
-#include "chat_helpers/send_context_menu.h" // SendMenu::FillSendMenu
+#include "menu/menu_send.h" // SendMenu::FillSendMenu
+#include "core/click_handler_types.h"
+#include "data/data_document.h"
 #include "data/data_file_origin.h"
 #include "data/data_user.h"
 #include "data/data_changes.h"
+#include "data/data_chat_participant_status.h"
+#include "data/data_session.h"
+#include "inline_bots/bot_attach_web_view.h"
 #include "inline_bots/inline_bot_result.h"
 #include "inline_bots/inline_bot_layout_item.h"
 #include "lang/lang_keys.h"
+#include "layout/layout_position.h"
 #include "mainwindow.h"
-#include "facades.h"
 #include "main/main_session.h"
 #include "window/window_session_controller.h"
+#include "ui/text/text_utilities.h"
 #include "ui/widgets/popup_menu.h"
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/labels.h"
+#include "ui/effects/path_shift_gradient.h"
+#include "ui/painter.h"
+#include "ui/ui_utility.h"
 #include "history/view/history_view_cursor_state.h"
+#include "history/history.h"
 #include "styles/style_chat_helpers.h"
 
 #include <QtWidgets/QApplication>
 
 namespace InlineBots {
 namespace Layout {
+namespace {
+
+constexpr auto kMinRepaintDelay = crl::time(33);
+constexpr auto kMinAfterScrollDelay = crl::time(33);
+
+} // namespace
 
 Inner::Inner(
 	QWidget *parent,
 	not_null<Window::SessionController*> controller)
 : RpWidget(parent)
 , _controller(controller)
+, _pathGradient(std::make_unique<Ui::PathShiftGradient>(
+	st::windowBgRipple,
+	st::windowBgOver,
+	[=] { repaintItems(); }))
 , _updateInlineItems([=] { updateInlineItems(); })
+, _mosaic(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft)
 , _previewTimer([=] { showPreview(); }) {
 	resize(st::emojiPanWidth - st::emojiScroll.width - st::roundRadiusSmall, st::inlineResultsMinHeight);
 
@@ -44,27 +65,36 @@ Inner::Inner(
 	setAttribute(Qt::WA_OpaquePaintEvent);
 
 	_controller->session().downloaderTaskFinished(
-	) | rpl::start_with_next([=] {
-		update();
+	) | rpl::on_next([=] {
+		updateInlineItems();
 	}, lifetime());
 
-	subscribe(controller->gifPauseLevelChanged(), [this] {
-		if (!_controller->isGifPausedAtLeastFor(Window::GifPauseReason::InlineResults)) {
-			update();
+	controller->gifPauseLevelChanged(
+	) | rpl::on_next([=] {
+		if (!_controller->isGifPausedAtLeastFor(
+				Window::GifPauseReason::InlineResults)) {
+			updateInlineItems();
 		}
-	});
+	}, lifetime());
 
 	_controller->session().changes().peerUpdates(
 		Data::PeerUpdate::Flag::Rights
 	) | rpl::filter([=](const Data::PeerUpdate &update) {
 		return (update.peer.get() == _inlineQueryPeer);
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		auto isRestricted = (_restrictedLabel != nullptr);
 		if (isRestricted != isRestrictedView()) {
 			auto h = countHeight();
 			if (h != height()) resize(width(), h);
 		}
 	}, lifetime());
+
+	sizeValue(
+	) | rpl::on_next([=](const QSize &s) {
+		_mosaic.setFullWidth(s.width());
+	}, lifetime());
+
+	_mosaic.setRightSkip(st::inlineResultsSkip);
 }
 
 void Inner::visibleTopBottomUpdated(
@@ -73,7 +103,8 @@ void Inner::visibleTopBottomUpdated(
 	_visibleBottom = visibleBottom;
 	if (_visibleTop != visibleTop) {
 		_visibleTop = visibleTop;
-		_lastScrolled = crl::now();
+		_lastScrolledAt = crl::now();
+		update();
 	}
 }
 
@@ -81,28 +112,56 @@ void Inner::checkRestrictedPeer() {
 	if (_inlineQueryPeer) {
 		const auto error = Data::RestrictionError(
 			_inlineQueryPeer,
-			ChatRestriction::f_send_inline);
-		if (error) {
-			if (!_restrictedLabel) {
-				_restrictedLabel.create(this, *error, st::stickersRestrictedLabel);
-				_restrictedLabel->show();
-				_restrictedLabel->move(st::inlineResultsLeft - st::roundRadiusSmall, st::stickerPanPadding);
-				_restrictedLabel->resizeToNaturalWidth(width() - (st::inlineResultsLeft - st::roundRadiusSmall) * 2);
-				if (_switchPmButton) {
-					_switchPmButton->hide();
-				}
-				update();
-			}
+			ChatRestriction::SendInline);
+		const auto changed = (_restrictedLabelKey != error.text);
+		if (!changed) {
 			return;
 		}
+		_restrictedLabelKey = error.text;
+		if (error) {
+			const auto window = _controller;
+			const auto peer = _inlineQueryPeer;
+			_restrictedLabel.create(
+				this,
+				rpl::single(error.boostsToLift
+					? tr::link(error.text)
+					: TextWithEntities{ error.text }),
+				st::stickersRestrictedLabel);
+			const auto lifting = error.boostsToLift;
+			_restrictedLabel->setClickHandlerFilter([=](auto...) {
+				window->resolveBoostState(peer->asChannel(), lifting);
+				return false;
+			});
+			_restrictedLabel->show();
+			updateRestrictedLabelGeometry();
+			if (_switchPmButton) {
+				_switchPmButton->hide();
+			}
+			repaintItems();
+			return;
+		}
+	} else {
+		_restrictedLabelKey = QString();
 	}
 	if (_restrictedLabel) {
 		_restrictedLabel.destroy();
 		if (_switchPmButton) {
 			_switchPmButton->show();
 		}
-		update();
+		repaintItems();
 	}
+}
+
+void Inner::updateRestrictedLabelGeometry() {
+	if (!_restrictedLabel) {
+		return;
+	}
+
+	auto labelWidth = width() - st::stickerPanPadding * 2;
+	_restrictedLabel->resizeToWidth(labelWidth);
+	_restrictedLabel->moveToLeft(
+		(width() - _restrictedLabel->width()) / 2,
+		st::stickerPanPadding);
 }
 
 bool Inner::isRestrictedView() {
@@ -113,15 +172,15 @@ bool Inner::isRestrictedView() {
 int Inner::countHeight() {
 	if (isRestrictedView()) {
 		return st::stickerPanPadding + _restrictedLabel->height() + st::stickerPanPadding;
-	} else if (_rows.isEmpty() && !_switchPmButton) {
+	} else if (_mosaic.empty() && !_switchPmButton) {
 		return st::stickerPanPadding + st::normalFont->height + st::stickerPanPadding;
 	}
 	auto result = st::stickerPanPadding;
 	if (_switchPmButton) {
 		result += _switchPmButton->height() + st::inlineResultsSkip;
 	}
-	for (int i = 0, l = _rows.count(); i < l; ++i) {
-		result += _rows[i].height;
+	for (auto i = 0, l = _mosaic.rowsCount(); i < l; ++i) {
+		result += _mosaic.rowHeightAt(i);
 	}
 	return result + st::stickerPanPadding;
 }
@@ -147,6 +206,10 @@ rpl::producer<> Inner::inlineRowsCleared() const {
 
 Inner::~Inner() = default;
 
+void Inner::resizeEvent(QResizeEvent *e) {
+	updateRestrictedLabelGeometry();
+}
+
 void Inner::paintEvent(QPaintEvent *e) {
 	Painter p(this);
 	QRect r = e ? e->rect() : rect();
@@ -162,46 +225,28 @@ void Inner::paintInlineItems(Painter &p, const QRect &r) {
 	if (_restrictedLabel) {
 		return;
 	}
-	if (_rows.isEmpty() && !_switchPmButton) {
+	if (_mosaic.empty() && !_switchPmButton) {
 		p.setFont(st::normalFont);
 		p.setPen(st::noContactsColor);
 		p.drawText(QRect(0, 0, width(), (height() / 3) * 2 + st::normalFont->height), tr::lng_inline_bot_no_results(tr::now), style::al_center);
 		return;
 	}
-	auto gifPaused = _controller->isGifPausedAtLeastFor(Window::GifPauseReason::InlineResults);
-	InlineBots::Layout::PaintContext context(crl::now(), false, gifPaused, false);
+	const auto gifPaused = _controller->isGifPausedAtLeastFor(
+		Window::GifPauseReason::InlineResults);
+	using namespace InlineBots::Layout;
+	PaintContext context(crl::now(), false, gifPaused, false);
+	context.pathGradient = _pathGradient.get();
+	context.pathGradient->startFrame(0, width(), width() / 2);
 
-	auto top = st::stickerPanPadding;
-	if (_switchPmButton) {
-		top += _switchPmButton->height() + st::inlineResultsSkip;
-	}
-
-	auto fromx = rtl() ? (width() - r.x() - r.width()) : r.x();
-	auto tox = rtl() ? (width() - r.x()) : (r.x() + r.width());
-	for (auto row = 0, rows = _rows.size(); row != rows; ++row) {
-		auto &inlineRow = _rows[row];
-		if (top >= r.top() + r.height()) break;
-		if (top + inlineRow.height > r.top()) {
-			auto left = st::inlineResultsLeft - st::roundRadiusSmall;
-			if (row == rows - 1) context.lastRow = true;
-			for (int col = 0, cols = inlineRow.items.size(); col < cols; ++col) {
-				if (left >= tox) break;
-
-				auto item = inlineRow.items.at(col);
-				auto w = item->width();
-				if (left + w > fromx) {
-					p.translate(left, top);
-					item->paint(p, r.translated(-left, -top), &context);
-					p.translate(-left, -top);
-				}
-				left += w;
-				if (item->hasRightSkip()) {
-					left += st::inlineResultsSkip;
-				}
-			}
-		}
-		top += inlineRow.height;
-	}
+	auto paintItem = [&](not_null<const ItemBase*> item, QPoint point) {
+		p.translate(point.x(), point.y());
+		item->paint(
+			p,
+			r.translated(-point),
+			&context);
+		p.translate(-point.x(), -point.y());
+	};
+	_mosaic.paint(std::move(paintItem), r);
 }
 
 void Inner::mousePressEvent(QMouseEvent *e) {
@@ -234,33 +279,62 @@ void Inner::mouseReleaseEvent(QMouseEvent *e) {
 		return;
 	}
 
-	if (dynamic_cast<InlineBots::Layout::SendClickHandler*>(activated.get())) {
-		int row = _selected / MatrixRowShift, column = _selected % MatrixRowShift;
-		selectInlineResult(row, column);
+	using namespace InlineBots::Layout;
+	const auto open = dynamic_cast<OpenFileClickHandler*>(activated.get());
+	if (dynamic_cast<SendClickHandler*>(activated.get()) || open) {
+		selectInlineResult(_selected, {}, !!open);
 	} else {
-		ActivateClickHandler(window(), activated, e->button());
+		ActivateClickHandler(window(), activated, {
+			e->button(),
+			QVariant::fromValue(ClickHandlerContext{
+				.sessionWindow = base::make_weak(_controller),
+			})
+		});
 	}
-}
-
-void Inner::selectInlineResult(int row, int column) {
-	selectInlineResult(row, column, Api::SendOptions());
 }
 
 void Inner::selectInlineResult(
-		int row,
-		int column,
-		Api::SendOptions options) {
-	if (row >= _rows.size() || column >= _rows.at(row).items.size()) {
+		int index,
+		Api::SendOptions options,
+		bool open) {
+	const auto item = _mosaic.maybeItemAt(index);
+	if (!item) {
 		return;
 	}
+	const auto messageSendingFrom = [&]() -> Ui::MessageSendingAnimationFrom {
+		const auto document = item->getDocument()
+			? item->getDocument()
+			: item->getPreviewDocument();
+		if (options.scheduled
+			|| item->isFullLine()
+			|| !document
+			|| (!document->sticker() && !document->isGifv())) {
+			return {};
+		}
+		using Type = Ui::MessageSendingAnimationFrom::Type;
+		const auto type = document->sticker()
+			? Type::Sticker
+			: document->isGifv()
+			? Type::Gif
+			: Type::None;
+		const auto rect = item->innerContentRect().translated(
+			_mosaic.findRect(index).topLeft());
+		return {
+			.type = type,
+			.localId = _controller->session().data().nextLocalMessageId(),
+			.globalStartGeometry = mapToGlobal(rect),
+			.crop = document->isGifv(),
+		};
+	};
 
-	auto item = _rows[row].items[column];
 	if (const auto inlineResult = item->getResult()) {
 		if (inlineResult->onChoose(item)) {
 			_resultSelectedCallback({
-				.result = inlineResult,
+				.result = std::move(inlineResult),
 				.bot = _inlineBot,
-				.options = std::move(options)
+				.options = std::move(options),
+				.messageSendingFrom = messageSendingFrom(),
+				.open = open,
 			});
 		}
 	}
@@ -289,30 +363,51 @@ void Inner::contextMenuEvent(QContextMenuEvent *e) {
 	if (_selected < 0 || _pressed >= 0) {
 		return;
 	}
-	const auto row = _selected / MatrixRowShift;
-	const auto column = _selected % MatrixRowShift;
-	const auto type = _sendMenuType
-		? _sendMenuType()
-		: SendMenu::Type::Disabled;
+	auto details = _sendMenuDetails
+		? _sendMenuDetails()
+		: SendMenu::Details();
 
-	_menu = base::make_unique_q<Ui::PopupMenu>(this);
+	// inline results don't have effects
+	details.effectAllowed = false;
 
-	const auto send = [=](Api::SendOptions options) {
-		selectInlineResult(row, column, options);
-	};
+	_menu = base::make_unique_q<Ui::PopupMenu>(
+		this,
+		st::popupMenuWithIcons);
+
+	const auto selected = _selected;
+	const auto send = crl::guard(this, [=](Api::SendOptions options) {
+		selectInlineResult(selected, options, false);
+	});
+	const auto show = _controller->uiShow();
+
+	// In case we're adding items after FillSendMenu we have
+	// to pass nullptr for showForEffect and attach selector later.
+	// Otherwise added items widths won't be respected in menu geometry.
 	SendMenu::FillSendMenu(
 		_menu,
-		type,
-		SendMenu::DefaultSilentCallback(send),
-		SendMenu::DefaultScheduleCallback(this, type, send));
+		nullptr, // showForEffect
+		details,
+		SendMenu::DefaultCallback(show, send));
 
-	auto item = _rows[row].items[column];
+	const auto item = _mosaic.itemAt(_selected);
 	if (const auto previewDocument = item->getPreviewDocument()) {
-		auto callback = [&](const QString &text, Fn<void()> &&done) {
-			_menu->addAction(text, std::move(done));
+		auto callback = [&](
+				const QString &text,
+				Fn<void()> &&done,
+				const style::icon *icon) {
+			_menu->addAction(text, std::move(done), icon);
 		};
-		ChatHelpers::AddGifAction(std::move(callback), previewDocument);
+		ChatHelpers::AddGifAction(
+			std::move(callback),
+			_controller->uiShow(),
+			previewDocument);
 	}
+
+	SendMenu::AttachSendMenuEffect(
+		_menu,
+		show,
+		details,
+		SendMenu::DefaultCallback(show, send));
 
 	if (!_menu->empty()) {
 		_menu->popup(QCursor::pos());
@@ -321,13 +416,11 @@ void Inner::contextMenuEvent(QContextMenuEvent *e) {
 
 void Inner::clearSelection() {
 	if (_selected >= 0) {
-		int srow = _selected / MatrixRowShift, scol = _selected % MatrixRowShift;
-		Assert(srow >= 0 && srow < _rows.size() && scol >= 0 && scol < _rows.at(srow).items.size());
-		ClickHandler::clearActive(_rows.at(srow).items.at(scol));
+		ClickHandler::clearActive(_mosaic.itemAt(_selected));
 		setCursor(style::cur_default);
 	}
 	_selected = _pressed = -1;
-	update();
+	updateInlineItems();
 }
 
 void Inner::hideFinished() {
@@ -341,39 +434,6 @@ void Inner::clearHeavyData() {
 	}
 }
 
-bool Inner::inlineRowsAddItem(Result *result, Row &row, int32 &sumWidth) {
-	auto layout = layoutPrepareInlineResult(result, (_rows.size() * MatrixRowShift) + row.items.size());
-	if (!layout) return false;
-
-	layout->preload();
-	if (inlineRowFinalize(row, sumWidth, layout->isFullLine())) {
-		layout->setPosition(_rows.size() * MatrixRowShift);
-	}
-
-	sumWidth += layout->maxWidth();
-	if (!row.items.isEmpty() && row.items.back()->hasRightSkip()) {
-		sumWidth += st::inlineResultsSkip;
-	}
-
-	row.items.push_back(layout);
-	return true;
-}
-
-bool Inner::inlineRowFinalize(Row &row, int32 &sumWidth, bool force) {
-	if (row.items.isEmpty()) return false;
-
-	auto full = (row.items.size() >= kInlineItemsMaxPerRow);
-	auto big = (sumWidth >= st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft);
-	if (full || big || force) {
-		_rows.push_back(layoutInlineRow(row, (full || big) ? sumWidth : 0));
-		row = Row();
-		row.items.reserve(kInlineItemsMaxPerRow);
-		sumWidth = 0;
-		return true;
-	}
-	return false;
-}
-
 void Inner::inlineBotChanged() {
 	refreshInlineRows(nullptr, nullptr, nullptr, true);
 }
@@ -383,20 +443,20 @@ void Inner::clearInlineRows(bool resultsDeleted) {
 		_selected = _pressed = -1;
 	} else {
 		clearSelection();
-		for_const (auto &row, _rows) {
-			for_const (auto &item, row.items) {
-				item->setPosition(-1);
-			}
-		}
 	}
-	_rows.clear();
+	_mosaic.clearRows(resultsDeleted);
 }
 
-ItemBase *Inner::layoutPrepareInlineResult(Result *result, int32 position) {
-	auto it = _inlineLayouts.find(result);
+ItemBase *Inner::layoutPrepareInlineResult(std::shared_ptr<Result> result) {
+	const auto raw = result.get();
+	auto it = _inlineLayouts.find(raw);
 	if (it == _inlineLayouts.cend()) {
-		if (auto layout = ItemBase::createLayout(this, result, _inlineWithThumb)) {
-			it = _inlineLayouts.emplace(result, std::move(layout)).first;
+		if (auto layout = ItemBase::createLayout(
+				this,
+				std::move(result),
+				_inlineWithThumb,
+				_gallery)) {
+			it = _inlineLayouts.emplace(raw, std::move(layout)).first;
 			it->second->initDimensions();
 		} else {
 			return nullptr;
@@ -406,12 +466,11 @@ ItemBase *Inner::layoutPrepareInlineResult(Result *result, int32 position) {
 		return nullptr;
 	}
 
-	it->second->setPosition(position);
 	return it->second.get();
 }
 
 void Inner::deleteUnusedInlineLayouts() {
-	if (_rows.isEmpty()) { // delete all
+	if (_mosaic.empty()) { // delete all
 		_inlineLayouts.clear();
 	} else {
 		for (auto i = _inlineLayouts.begin(); i != _inlineLayouts.cend();) {
@@ -424,45 +483,10 @@ void Inner::deleteUnusedInlineLayouts() {
 	}
 }
 
-Inner::Row &Inner::layoutInlineRow(Row &row, int32 sumWidth) {
-	auto count = int(row.items.size());
-	Assert(count <= kInlineItemsMaxPerRow);
-
-	// enumerate items in the order of growing maxWidth()
-	// for that sort item indices by maxWidth()
-	int indices[kInlineItemsMaxPerRow];
-	for (auto i = 0; i != count; ++i) {
-		indices[i] = i;
-	}
-	std::sort(indices, indices + count, [&row](int a, int b) -> bool {
-		return row.items.at(a)->maxWidth() < row.items.at(b)->maxWidth();
-	});
-
-	row.height = 0;
-	int availw = width() - (st::inlineResultsLeft - st::roundRadiusSmall);
-	for (int i = 0; i < count; ++i) {
-		int index = indices[i];
-		int w = sumWidth ? (row.items.at(index)->maxWidth() * availw / sumWidth) : row.items.at(index)->maxWidth();
-		int actualw = qMax(w, int(st::inlineResultsMinWidth));
-		row.height = qMax(row.height, row.items.at(index)->resizeGetHeight(actualw));
-		if (sumWidth) {
-			availw -= actualw;
-			sumWidth -= row.items.at(index)->maxWidth();
-			if (index > 0 && row.items.at(index - 1)->hasRightSkip()) {
-				availw -= st::inlineResultsSkip;
-				sumWidth -= st::inlineResultsSkip;
-			}
-		}
-	}
-	return row;
-}
-
 void Inner::preloadImages() {
-	for (auto row = 0, rows = _rows.size(); row != rows; ++row) {
-		for (auto col = 0, cols = _rows[row].items.size(); col != cols; ++col) {
-			_rows[row].items[col]->preload();
-		}
-	}
+	_mosaic.forEach([](not_null<const ItemBase*> item) {
+		item->preload();
+	});
 }
 
 void Inner::hideInlineRowsPanel() {
@@ -473,32 +497,41 @@ void Inner::clearInlineRowsPanel() {
 	clearInlineRows(false);
 }
 
+void Inner::refreshMosaicOffset() {
+	const auto top = _switchPmButton
+		? (_switchPmButton->height() + st::inlineResultsSkip)
+		: 0;
+	_mosaic.setPadding(st::emojiPanMargins + QMargins(0, top, 0, 0));
+}
+
 void Inner::refreshSwitchPmButton(const CacheEntry *entry) {
 	if (!entry || entry->switchPmText.isEmpty()) {
 		_switchPmButton.destroy();
 		_switchPmStartToken.clear();
+		_switchPmUrl = QByteArray();
 	} else {
 		if (!_switchPmButton) {
 			_switchPmButton.create(this, nullptr, st::switchPmButton);
 			_switchPmButton->show();
-			_switchPmButton->setTextTransform(Ui::RoundButton::TextTransform::NoTransform);
 			_switchPmButton->addClickHandler([=] { switchPm(); });
 		}
 		_switchPmButton->setText(rpl::single(entry->switchPmText));
 		_switchPmStartToken = entry->switchPmStartToken;
+		_switchPmUrl = entry->switchPmUrl;
 		const auto buttonTop = st::stickerPanPadding;
 		_switchPmButton->move(st::inlineResultsLeft - st::roundRadiusSmall, buttonTop);
 		if (isRestrictedView()) {
 			_switchPmButton->hide();
 		}
 	}
-	update();
+	repaintItems();
 }
 
 int Inner::refreshInlineRows(PeerData *queryPeer, UserData *bot, const CacheEntry *entry, bool resultsDeleted) {
 	_inlineBot = bot;
 	_inlineQueryPeer = queryPeer;
 	refreshSwitchPmButton(entry);
+	refreshMosaicOffset();
 	auto clearResults = [&] {
 		if (!entry) {
 			return true;
@@ -522,26 +555,39 @@ int Inner::refreshInlineRows(PeerData *queryPeer, UserData *bot, const CacheEntr
 
 	Assert(_inlineBot != 0);
 
-	auto count = int(entry->results.size());
-	auto from = validateExistingInlineRows(entry->results);
+	_gallery = entry->gallery;
+
+	const auto count = int(entry->results.size());
+	const auto from = validateExistingInlineRows(entry->results);
 	auto added = 0;
 
 	if (count) {
-		_rows.reserve(count);
-		auto row = Row();
-		row.items.reserve(kInlineItemsMaxPerRow);
-		auto sumWidth = 0;
-		for (auto i = from; i != count; ++i) {
-			if (inlineRowsAddItem(entry->results[i].get(), row, sumWidth)) {
-				++added;
+		const auto resultItems = entry->results | ranges::views::slice(
+			from,
+			count
+		) | ranges::views::transform([&](const std::shared_ptr<Result> &r) {
+			return layoutPrepareInlineResult(r);
+		}) | ranges::views::filter([](const ItemBase *item) {
+			return item != nullptr;
+		}) | ranges::to<std::vector<not_null<ItemBase*>>>;
+
+		auto pending = std::vector<not_null<ItemBase*>>();
+		for (const auto &item : resultItems) {
+			if (item->isFullLine()) {
+				_mosaic.addItems(base::take(pending));
+				_mosaic.addItems({ item });
+			} else {
+				pending.push_back(item);
 			}
 		}
-		inlineRowFinalize(row, sumWidth, true);
+		_mosaic.addItems(pending);
+		added = resultItems.size();
+		preloadImages();
 	}
 
 	auto h = countHeight();
 	if (h != height()) resize(width(), h);
-	update();
+	repaintItems();
 
 	_lastMousePos = QCursor::pos();
 	updateSelected();
@@ -550,56 +596,15 @@ int Inner::refreshInlineRows(PeerData *queryPeer, UserData *bot, const CacheEntr
 }
 
 int Inner::validateExistingInlineRows(const Results &results) {
-	int count = results.size(), until = 0, untilrow = 0, untilcol = 0;
-	for (; until < count;) {
-		if (untilrow >= _rows.size() || _rows[untilrow].items[untilcol]->getResult() != results[until].get()) {
-			break;
-		}
-		++until;
-		if (++untilcol == _rows[untilrow].items.size()) {
-			++untilrow;
-			untilcol = 0;
-		}
-	}
-	if (until == count) { // all items are layed out
-		if (untilrow == _rows.size()) { // nothing changed
-			return until;
-		}
+	const auto until = _mosaic.validateExistingRows([&](
+			not_null<const ItemBase*> item,
+			int untilIndex) {
+		return item->getResult().get() != results[untilIndex].get();
+	}, results.size());
 
-		for (int i = untilrow, l = _rows.size(), skip = untilcol; i < l; ++i) {
-			for (int j = 0, s = _rows[i].items.size(); j < s; ++j) {
-				if (skip) {
-					--skip;
-				} else {
-					_rows[i].items[j]->setPosition(-1);
-				}
-			}
-		}
-		if (!untilcol) { // all good rows are filled
-			_rows.resize(untilrow);
-			return until;
-		}
-		_rows.resize(untilrow + 1);
-		_rows[untilrow].items.resize(untilcol);
-		_rows[untilrow] = layoutInlineRow(_rows[untilrow]);
-		return until;
-	}
-	if (untilrow && !untilcol) { // remove last row, maybe it is not full
-		--untilrow;
-		untilcol = _rows[untilrow].items.size();
-	}
-	until -= untilcol;
-
-	for (int i = untilrow, l = _rows.size(); i < l; ++i) {
-		for (int j = 0, s = _rows[i].items.size(); j < s; ++j) {
-			_rows[i].items[j]->setPosition(-1);
-		}
-	}
-	_rows.resize(untilrow);
-
-	if (_rows.isEmpty()) {
+	if (_mosaic.empty()) {
 		_inlineWithThumb = false;
-		for (int i = until; i < count; ++i) {
+		for (int i = until; i < results.size(); ++i) {
 			if (results.at(i)->hasThumbDisplay()) {
 				_inlineWithThumb = true;
 				break;
@@ -614,21 +619,15 @@ void Inner::inlineItemLayoutChanged(const ItemBase *layout) {
 		return;
 	}
 
-	int row = _selected / MatrixRowShift, col = _selected % MatrixRowShift;
-	if (row < _rows.size() && col < _rows.at(row).items.size()) {
-		if (layout == _rows.at(row).items.at(col)) {
+	if (const auto item = _mosaic.maybeItemAt(_selected)) {
+		if (layout == item) {
 			updateSelected();
 		}
 	}
 }
 
 void Inner::inlineItemRepaint(const ItemBase *layout) {
-	auto ms = crl::now();
-	if (_lastScrolled + 100 <= ms) {
-		update();
-	} else {
-		_updateInlineItems.callOnce(_lastScrolled + 100 - ms);
-	}
+	updateInlineItems();
 }
 
 bool Inner::inlineItemVisible(const ItemBase *layout) {
@@ -637,16 +636,15 @@ bool Inner::inlineItemVisible(const ItemBase *layout) {
 		return false;
 	}
 
-	int row = position / MatrixRowShift, col = position % MatrixRowShift;
-	Assert((row < _rows.size()) && (col < _rows[row].items.size()));
+	const auto &[row, column] = ::Layout::IndexToPosition(position);
 
-	auto &inlineItems = _rows[row].items;
-	int top = st::stickerPanPadding;
-	for (int32 i = 0; i < row; ++i) {
-		top += _rows.at(i).height;
+	auto top = st::stickerPanPadding;
+	for (auto i = 0; i != row; ++i) {
+		top += _mosaic.rowHeightAt(i);
 	}
 
-	return (top < _visibleBottom) && (top + _rows[row].items[col]->height() > _visibleTop);
+	return (top < _visibleBottom)
+		&& (top + _mosaic.itemAt(row, column)->height() > _visibleTop);
 }
 
 Data::FileOrigin Inner::inlineItemFileOrigin() {
@@ -658,97 +656,52 @@ void Inner::updateSelected() {
 		return;
 	}
 
-	auto newSelected = -1;
-	auto p = mapFromGlobal(_lastMousePos);
+	const auto p = mapFromGlobal(_lastMousePos);
+	const auto sx = rtl() ? (width() - p.x()) : p.x();
+	const auto sy = p.y();
+	const auto &[index, exact, relative] = _mosaic.findByPoint({ sx, sy });
+	const auto selected = exact ? index : -1;
+	const auto item = exact ? _mosaic.itemAt(selected).get() : nullptr;
+	const auto link = exact ? item->getState(relative, {}).link : nullptr;
 
-	int sx = (rtl() ? width() - p.x() : p.x()) - (st::inlineResultsLeft - st::roundRadiusSmall);
-	int sy = p.y() - st::stickerPanPadding;
-	if (_switchPmButton) {
-		sy -= _switchPmButton->height() + st::inlineResultsSkip;
-	}
-	int row = -1, col = -1, sel = -1;
-	ClickHandlerPtr lnk;
-	ClickHandlerHost *lnkhost = nullptr;
-	HistoryView::CursorState cursor = HistoryView::CursorState::None;
-	if (sy >= 0) {
-		row = 0;
-		for (int rows = _rows.size(); row < rows; ++row) {
-			if (sy < _rows[row].height) {
-				break;
-			}
-			sy -= _rows[row].height;
+	if (_selected != selected) {
+		if (const auto s = _mosaic.maybeItemAt(_selected)) {
+			s->update();
 		}
-	}
-	if (sx >= 0 && row >= 0 && row < _rows.size()) {
-		auto &inlineItems = _rows[row].items;
-		col = 0;
-		for (int cols = inlineItems.size(); col < cols; ++col) {
-			int width = inlineItems.at(col)->width();
-			if (sx < width) {
-				break;
-			}
-			sx -= width;
-			if (inlineItems.at(col)->hasRightSkip()) {
-				sx -= st::inlineResultsSkip;
-			}
-		}
-		if (col < inlineItems.size()) {
-			sel = row * MatrixRowShift + col;
-			auto result = inlineItems[col]->getState(
-				QPoint(sx, sy),
-				HistoryView::StateRequest());
-			lnk = result.link;
-			cursor = result.cursor;
-			lnkhost = inlineItems[col];
-		} else {
-			row = col = -1;
-		}
-	} else {
-		row = col = -1;
-	}
-	int srow = (_selected >= 0) ? (_selected / MatrixRowShift) : -1;
-	int scol = (_selected >= 0) ? (_selected % MatrixRowShift) : -1;
-	if (_selected != sel) {
-		if (srow >= 0 && scol >= 0) {
-			Assert(srow >= 0 && srow < _rows.size() && scol >= 0 && scol < _rows.at(srow).items.size());
-			_rows[srow].items[scol]->update();
-		}
-		_selected = sel;
-		if (row >= 0 && col >= 0) {
-			Assert(row >= 0 && row < _rows.size() && col >= 0 && col < _rows.at(row).items.size());
-			_rows[row].items[col]->update();
+		_selected = selected;
+		if (item) {
+			item->update();
 		}
 		if (_previewShown && _selected >= 0 && _pressed != _selected) {
 			_pressed = _selected;
-			if (row >= 0 && col >= 0) {
-				auto layout = _rows.at(row).items.at(col);
-				if (const auto previewDocument = layout->getPreviewDocument()) {
+			if (item) {
+				if (const auto preview = item->getPreviewDocument()) {
 					_controller->widget()->showMediaPreview(
 						Data::FileOrigin(),
-						previewDocument);
-				} else if (auto previewPhoto = layout->getPreviewPhoto()) {
+						preview);
+				} else if (const auto preview = item->getPreviewPhoto()) {
 					_controller->widget()->showMediaPreview(
 						Data::FileOrigin(),
-						previewPhoto);
+						preview);
 				}
 			}
 		}
 	}
-	if (ClickHandler::setActive(lnk, lnkhost)) {
-		setCursor(lnk ? style::cur_pointer : style::cur_default);
+	if (ClickHandler::setActive(link, item)) {
+		setCursor(link ? style::cur_pointer : style::cur_default);
 		Ui::Tooltip::Hide();
 	}
-	if (lnk) {
+	if (link) {
 		Ui::Tooltip::Show(1000, this);
 	}
 }
 
 void Inner::showPreview() {
-	if (_pressed < 0) return;
+	if (_pressed < 0) {
+		return;
+	}
 
-	int row = _pressed / MatrixRowShift, col = _pressed % MatrixRowShift;
-	if (row < _rows.size() && col < _rows.at(row).items.size()) {
-		auto layout = _rows.at(row).items.at(col);
+	if (const auto layout = _mosaic.maybeItemAt(_pressed)) {
 		if (const auto previewDocument = layout->getPreviewDocument()) {
 			_previewShown = _controller->widget()->showMediaPreview(
 				Data::FileOrigin(),
@@ -762,24 +715,48 @@ void Inner::showPreview() {
 }
 
 void Inner::updateInlineItems() {
-	auto ms = crl::now();
-	if (_lastScrolled + 100 <= ms) {
-		update();
-	} else {
-		_updateInlineItems.callOnce(_lastScrolled + 100 - ms);
+	const auto now = crl::now();
+
+	const auto delay = std::max(
+		_lastScrolledAt + kMinAfterScrollDelay - now,
+		_lastUpdatedAt + kMinRepaintDelay - now);
+	if (delay <= 0) {
+		repaintItems();
+	} else if (!_updateInlineItems.isActive()
+		|| _updateInlineItems.remainingTime() > kMinRepaintDelay) {
+		_updateInlineItems.callOnce(std::max(delay, kMinRepaintDelay));
 	}
+}
+
+void Inner::repaintItems(crl::time now) {
+	_lastUpdatedAt = now ? now : crl::now();
+	update();
 }
 
 void Inner::switchPm() {
-	if (_inlineBot && _inlineBot->isBot()) {
+	if (!_inlineBot || !_inlineBot->isBot()) {
+		return;
+	} else if (!_switchPmUrl.isEmpty()) {
+		const auto bot = _inlineBot;
+		_inlineBot->session().attachWebView().open({
+			.bot = bot,
+			.context = { .controller = _controller },
+			.button = { .url = _switchPmUrl },
+			.source = InlineBots::WebViewSourceSwitch(),
+		});
+	} else {
 		_inlineBot->botInfo->startToken = _switchPmStartToken;
-		_inlineBot->botInfo->inlineReturnTo = _currentDialogsEntryState;
-		Ui::showPeerHistory(_inlineBot, ShowAndStartBotMsgId);
+		_inlineBot->botInfo->setInlineReturnTo(
+			_controller->dialogsEntryStateCurrent());
+		_controller->showPeerHistory(
+			_inlineBot,
+			Window::SectionShow::Way::ClearStack,
+			ShowAndStartBotMsgId);
 	}
 }
 
-void Inner::setSendMenuType(Fn<SendMenu::Type()> &&callback) {
-	_sendMenuType = std::move(callback);
+void Inner::setSendMenuDetails(Fn<SendMenu::Details()> &&callback) {
+	_sendMenuDetails = std::move(callback);
 }
 
 } // namespace Layout

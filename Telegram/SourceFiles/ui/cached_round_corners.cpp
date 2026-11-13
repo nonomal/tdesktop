@@ -6,7 +6,8 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "ui/cached_round_corners.h"
-
+#include "ui/chat/chat_style.h"
+#include "ui/painter.h"
 #include "ui/ui_utility.h"
 #include "ui/image/image_prepare.h"
 #include "styles/style_chat.h"
@@ -18,26 +19,23 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 namespace Ui {
 namespace {
 
-struct CornersPixmaps {
-	QPixmap p[4];
-};
+constexpr auto kCachedCornerRadiusCount = int(CachedCornerRadius::kCount);
+
 std::vector<CornersPixmaps> Corners;
-base::flat_map<uint32, CornersPixmaps> CornersMap;
 QImage CornersMaskLarge[4], CornersMaskSmall[4];
 rpl::lifetime PaletteChangedLifetime;
 
-void PrepareCorners(CachedRoundCorners index, int32 radius, const QBrush &brush, const style::color *shadow = nullptr, QImage *cors = nullptr) {
-	Expects(Corners.size() > index);
+std::array<std::array<QImage, 4>, kCachedCornerRadiusCount> CachedMasks;
 
+[[nodiscard]] std::array<QImage, 4> PrepareCorners(int32 radius, const QBrush &brush, const style::color *shadow = nullptr) {
 	int32 r = radius * style::DevicePixelRatio(), s = st::msgShadow * style::DevicePixelRatio();
-	QImage rect(r * 3, r * 3 + (shadow ? s : 0), QImage::Format_ARGB32_Premultiplied), localCors[4];
+	QImage rect(r * 3, r * 3 + (shadow ? s : 0), QImage::Format_ARGB32_Premultiplied);
+	rect.fill(Qt::transparent);
 	{
-		Painter p(&rect);
+		auto p = QPainter(&rect);
 		PainterHighQualityEnabler hq(p);
 
 		p.setCompositionMode(QPainter::CompositionMode_Source);
-		p.fillRect(QRect(0, 0, rect.width(), rect.height()), Qt::transparent);
-		p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 		p.setPen(Qt::NoPen);
 		if (shadow) {
 			p.setBrush((*shadow)->b);
@@ -46,27 +44,31 @@ void PrepareCorners(CachedRoundCorners index, int32 radius, const QBrush &brush,
 		p.setBrush(brush);
 		p.drawRoundedRect(0, 0, r * 3, r * 3, r, r);
 	}
-	if (!cors) cors = localCors;
-	cors[0] = rect.copy(0, 0, r, r);
-	cors[1] = rect.copy(r * 2, 0, r, r);
-	cors[2] = rect.copy(0, r * 2, r, r + (shadow ? s : 0));
-	cors[3] = rect.copy(r * 2, r * 2, r, r + (shadow ? s : 0));
-	if (index != SmallMaskCorners && index != LargeMaskCorners) {
-		for (int i = 0; i < 4; ++i) {
-			Corners[index].p[i] = PixmapFromImage(std::move(cors[i]));
-			Corners[index].p[i].setDevicePixelRatio(style::DevicePixelRatio());
-		}
+	auto result = std::array<QImage, 4>();
+	result[0] = rect.copy(0, 0, r, r);
+	result[1] = rect.copy(r * 2, 0, r, r);
+	result[2] = rect.copy(0, r * 2, r, r + (shadow ? s : 0));
+	result[3] = rect.copy(r * 2, r * 2, r, r + (shadow ? s : 0));
+	return result;
+}
+
+void PrepareCorners(CachedRoundCorners index, int32 radius, const QBrush &brush, const style::color *shadow = nullptr) {
+	Expects(index < Corners.size());
+
+	auto images = PrepareCorners(radius, brush, shadow);
+	for (int i = 0; i < 4; ++i) {
+		Corners[index].p[i] = PixmapFromImage(std::move(images[i]));
+		Corners[index].p[i].setDevicePixelRatio(style::DevicePixelRatio());
 	}
 }
 
 void CreateMaskCorners() {
-	QImage mask[4];
-	PrepareCorners(SmallMaskCorners, st::roundRadiusSmall, QColor(255, 255, 255), nullptr, mask);
+	auto mask = PrepareCorners(st::roundRadiusSmall, QColor(255, 255, 255), nullptr);
 	for (int i = 0; i < 4; ++i) {
 		CornersMaskSmall[i] = mask[i].convertToFormat(QImage::Format_ARGB32_Premultiplied);
 		CornersMaskSmall[i].setDevicePixelRatio(style::DevicePixelRatio());
 	}
-	PrepareCorners(LargeMaskCorners, st::historyMessageRadius, QColor(255, 255, 255), nullptr, mask);
+	mask = PrepareCorners(st::roundRadiusLarge, QColor(255, 255, 255), nullptr);
 	for (int i = 0; i < 4; ++i) {
 		CornersMaskLarge[i] = mask[i].convertToFormat(QImage::Format_ARGB32_Premultiplied);
 		CornersMaskLarge[i].setDevicePixelRatio(style::DevicePixelRatio());
@@ -74,35 +76,20 @@ void CreateMaskCorners() {
 }
 
 void CreatePaletteCorners() {
-	PrepareCorners(MenuCorners, st::roundRadiusSmall, st::menuBg);
+	PrepareCorners(MenuCorners, st::innerDropdownRadius, st::menuBg);
 	PrepareCorners(BoxCorners, st::boxRadius, st::boxBg);
-	PrepareCorners(BotKbOverCorners, st::dateRadius, st::msgBotKbOverBgAdd);
-	PrepareCorners(StickerCorners, st::dateRadius, st::msgServiceBg);
-	PrepareCorners(StickerSelectedCorners, st::dateRadius, st::msgServiceBgSelected);
-	PrepareCorners(SelectedOverlaySmallCorners, st::roundRadiusSmall, st::msgSelectOverlay);
-	PrepareCorners(SelectedOverlayLargeCorners, st::historyMessageRadius, st::msgSelectOverlay);
 	PrepareCorners(DateCorners, st::dateRadius, st::msgDateImgBg);
-	PrepareCorners(DateSelectedCorners, st::dateRadius, st::msgDateImgBgSelected);
 	PrepareCorners(OverviewVideoCorners, st::overviewVideoStatusRadius, st::msgDateImgBg);
 	PrepareCorners(OverviewVideoSelectedCorners, st::overviewVideoStatusRadius, st::msgDateImgBgSelected);
-	PrepareCorners(InShadowCorners, st::historyMessageRadius, st::msgInShadow);
-	PrepareCorners(InSelectedShadowCorners, st::historyMessageRadius, st::msgInShadowSelected);
-	PrepareCorners(ForwardCorners, st::historyMessageRadius, st::historyForwardChooseBg);
+	PrepareCorners(ForwardCorners, st::roundRadiusLarge, st::historyForwardChooseBg);
 	PrepareCorners(MediaviewSaveCorners, st::mediaviewControllerRadius, st::mediaviewSaveMsgBg);
-	PrepareCorners(EmojiHoverCorners, st::roundRadiusSmall, st::emojiPanHover);
 	PrepareCorners(StickerHoverCorners, st::roundRadiusSmall, st::emojiPanHover);
 	PrepareCorners(BotKeyboardCorners, st::roundRadiusSmall, st::botKbBg);
-	PrepareCorners(PhotoSelectOverlayCorners, st::roundRadiusSmall, st::overviewPhotoSelectOverlay);
 
 	PrepareCorners(Doc1Corners, st::roundRadiusSmall, st::msgFile1Bg);
 	PrepareCorners(Doc2Corners, st::roundRadiusSmall, st::msgFile2Bg);
 	PrepareCorners(Doc3Corners, st::roundRadiusSmall, st::msgFile3Bg);
 	PrepareCorners(Doc4Corners, st::roundRadiusSmall, st::msgFile4Bg);
-
-	PrepareCorners(MessageInCorners, st::historyMessageRadius, st::msgInBg, &st::msgInShadow);
-	PrepareCorners(MessageInSelectedCorners, st::historyMessageRadius, st::msgInBgSelected, &st::msgInShadowSelected);
-	PrepareCorners(MessageOutCorners, st::historyMessageRadius, st::msgOutBg, &st::msgOutShadow);
-	PrepareCorners(MessageOutSelectedCorners, st::historyMessageRadius, st::msgOutBgSelected, &st::msgOutShadowSelected);
 }
 
 } // namespace
@@ -113,143 +100,186 @@ void StartCachedCorners() {
 	CreatePaletteCorners();
 
 	style::PaletteChanged(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		CreatePaletteCorners();
 	}, PaletteChangedLifetime);
 }
 
 void FinishCachedCorners() {
 	Corners.clear();
-	CornersMap.clear();
 	PaletteChangedLifetime.destroy();
 }
 
-void RectWithCorners(Painter &p, QRect rect, const style::color &bg, CachedRoundCorners index, RectParts corners) {
-	auto parts = RectPart::Top
-		| RectPart::NoTopBottom
-		| RectPart::Bottom
-		| corners;
-	FillRoundRect(p, rect, bg, index, nullptr, parts);
-	if ((corners & RectPart::AllCorners) != RectPart::AllCorners) {
-		const auto size = Corners[index].p[0].width() / style::DevicePixelRatio();
-		if (!(corners & RectPart::TopLeft)) {
-			p.fillRect(rect.x(), rect.y(), size, size, bg);
+void FillRoundRect(QPainter &p, int32 x, int32 y, int32 w, int32 h, style::color bg, const CornersPixmaps &corners) {
+	using namespace Images;
+
+	const auto fillBg = [&](QRect rect) {
+		p.fillRect(rect, bg);
+	};
+	const auto fillCorner = [&](int x, int y, int index) {
+		if (const auto &pix = corners.p[index]; !pix.isNull()) {
+			p.drawPixmap(x, y, pix);
 		}
-		if (!(corners & RectPart::TopRight)) {
-			p.fillRect(rect.x() + rect.width() - size, rect.y(), size, size, bg);
-		}
-		if (!(corners & RectPart::BottomLeft)) {
-			p.fillRect(rect.x(), rect.y() + rect.height() - size, size, size, bg);
-		}
-		if (!(corners & RectPart::BottomRight)) {
-			p.fillRect(rect.x() + rect.width() - size, rect.y() + rect.height() - size, size, size, bg);
-		}
+	};
+
+	if (corners.p[kTopLeft].isNull()
+		&& corners.p[kTopRight].isNull()
+		&& corners.p[kBottomLeft].isNull()
+		&& corners.p[kBottomRight].isNull()) {
+		p.fillRect(x, y, w, h, bg);
+		return;
 	}
-}
-
-void FillComplexOverlayRect(Painter &p, QRect rect, ImageRoundRadius radius, RectParts corners) {
-	if (radius == ImageRoundRadius::Ellipse) {
-		PainterHighQualityEnabler hq(p);
-		p.setPen(Qt::NoPen);
-		p.setBrush(p.textPalette().selectOverlay);
-		p.drawEllipse(rect);
-	} else {
-		auto overlayCorners = (radius == ImageRoundRadius::Small)
-			? SelectedOverlaySmallCorners
-			: SelectedOverlayLargeCorners;
-		const auto bg = p.textPalette().selectOverlay;
-		RectWithCorners(p, rect, bg, overlayCorners, corners);
-	}
-}
-
-void FillComplexLocationRect(Painter &p, QRect rect, ImageRoundRadius radius, RectParts corners) {
-	RectWithCorners(p, rect, st::msgInBg, MessageInCorners, corners);
-}
-
-void FillRoundRect(Painter &p, int32 x, int32 y, int32 w, int32 h, style::color bg, const CornersPixmaps &corner, const style::color *shadow, RectParts parts) {
-	auto cornerWidth = corner.p[0].width() / style::DevicePixelRatio();
-	auto cornerHeight = corner.p[0].height() / style::DevicePixelRatio();
-	if (w < 2 * cornerWidth || h < 2 * cornerHeight) return;
-	if (w > 2 * cornerWidth) {
-		if (parts & RectPart::Top) {
-			p.fillRect(x + cornerWidth, y, w - 2 * cornerWidth, cornerHeight, bg);
+	const auto ratio = style::DevicePixelRatio();
+	const auto cornerSize = [&](int index) {
+		return corners.p[index].isNull()
+			? 0
+			: (corners.p[index].width() / ratio);
+	};
+	const auto verticalSkip = [&](int left, int right) {
+		return std::max(cornerSize(left), cornerSize(right));
+	};
+	const auto top = verticalSkip(kTopLeft, kTopRight);
+	const auto bottom = verticalSkip(kBottomLeft, kBottomRight);
+	if (top) {
+		const auto left = cornerSize(kTopLeft);
+		const auto right = cornerSize(kTopRight);
+		if (left) {
+			fillCorner(x, y, kTopLeft);
+			if (const auto add = top - left) {
+				fillBg({ x, y + left, left, add });
+			}
 		}
-		if (parts & RectPart::Bottom) {
-			p.fillRect(x + cornerWidth, y + h - cornerHeight, w - 2 * cornerWidth, cornerHeight, bg);
-			if (shadow) {
-				p.fillRect(x + cornerWidth, y + h, w - 2 * cornerWidth, st::msgShadow, *shadow);
+		if (const auto fill = w - left - right; fill > 0) {
+			fillBg({ x + left, y, fill, top });
+		}
+		if (right) {
+			fillCorner(x + w - right, y, kTopRight);
+			if (const auto add = top - right) {
+				fillBg({ x + w - right, y + right, right, add });
 			}
 		}
 	}
-	if (h > 2 * cornerHeight) {
-		if ((parts & RectPart::NoTopBottom) == RectPart::NoTopBottom) {
-			p.fillRect(x, y + cornerHeight, w, h - 2 * cornerHeight, bg);
-		} else {
-			if (parts & RectPart::Left) {
-				p.fillRect(x, y + cornerHeight, cornerWidth, h - 2 * cornerHeight, bg);
+	if (const auto fill = h - top - bottom; fill > 0) {
+		fillBg({ x, y + top, w, fill });
+	}
+	if (bottom) {
+		const auto left = cornerSize(kBottomLeft);
+		const auto right = cornerSize(kBottomRight);
+		if (left) {
+			fillCorner(x, y + h - left, kBottomLeft);
+			if (const auto add = bottom - left) {
+				fillBg({ x, y + h - bottom, left, add });
 			}
-			if ((parts & RectPart::Center) && w > 2 * cornerWidth) {
-				p.fillRect(x + cornerWidth, y + cornerHeight, w - 2 * cornerWidth, h - 2 * cornerHeight, bg);
-			}
-			if (parts & RectPart::Right) {
-				p.fillRect(x + w - cornerWidth, y + cornerHeight, cornerWidth, h - 2 * cornerHeight, bg);
+		}
+		if (const auto fill = w - left - right; fill > 0) {
+			fillBg({ x + left, y + h - bottom, fill, bottom });
+		}
+		if (right) {
+			fillCorner(x + w - right, y + h - right, kBottomRight);
+			if (const auto add = bottom - right) {
+				fillBg({ x + w - right, y + h - bottom, right, add });
 			}
 		}
 	}
-	if (parts & RectPart::TopLeft) {
-		p.drawPixmap(x, y, corner.p[0]);
-	}
-	if (parts & RectPart::TopRight) {
-		p.drawPixmap(x + w - cornerWidth, y, corner.p[1]);
-	}
-	if (parts & RectPart::BottomLeft) {
-		p.drawPixmap(x, y + h - cornerHeight, corner.p[2]);
-	}
-	if (parts & RectPart::BottomRight) {
-		p.drawPixmap(x + w - cornerWidth, y + h - cornerHeight, corner.p[3]);
-	}
 }
 
-void FillRoundRect(Painter &p, int32 x, int32 y, int32 w, int32 h, style::color bg, CachedRoundCorners index, const style::color *shadow, RectParts parts) {
-	FillRoundRect(p, x, y, w, h, bg, Corners[index], shadow, parts);
+void FillRoundRect(QPainter &p, int32 x, int32 y, int32 w, int32 h, style::color bg, CachedRoundCorners index) {
+	FillRoundRect(p, x, y, w, h, bg, CachedCornerPixmaps(index));
 }
 
-void FillRoundShadow(Painter &p, int32 x, int32 y, int32 w, int32 h, style::color shadow, CachedRoundCorners index, RectParts parts) {
-	auto &corner = Corners[index];
-	auto cornerWidth = corner.p[0].width() / style::DevicePixelRatio();
-	auto cornerHeight = corner.p[0].height() / style::DevicePixelRatio();
-	if (parts & RectPart::Bottom) {
-		p.fillRect(x + cornerWidth, y + h, w - 2 * cornerWidth, st::msgShadow, shadow);
-	}
-	if (parts & RectPart::BottomLeft) {
-		p.fillRect(x, y + h - cornerHeight, cornerWidth, st::msgShadow, shadow);
-		p.drawPixmap(x, y + h - cornerHeight + st::msgShadow, corner.p[2]);
-	}
-	if (parts & RectPart::BottomRight) {
-		p.fillRect(x + w - cornerWidth, y + h - cornerHeight, cornerWidth, st::msgShadow, shadow);
-		p.drawPixmap(x + w - cornerWidth, y + h - cornerHeight + st::msgShadow, corner.p[3]);
-	}
-}
+void FillRoundShadow(QPainter &p, int32 x, int32 y, int32 w, int32 h, style::color shadow, const CornersPixmaps &corners) {
+	constexpr auto kLeft = 2;
+	constexpr auto kRight = 3;
 
-void FillRoundRect(Painter &p, int32 x, int32 y, int32 w, int32 h, style::color bg, ImageRoundRadius radius, RectParts parts) {
-	auto colorKey = ((uint32(bg->c.alpha()) & 0xFF) << 24) | ((uint32(bg->c.red()) & 0xFF) << 16) | ((uint32(bg->c.green()) & 0xFF) << 8) | ((uint32(bg->c.blue()) & 0xFF) << 24);
-	auto i = CornersMap.find(colorKey);
-	if (i == CornersMap.cend()) {
-		QImage images[4];
-		switch (radius) {
-		case ImageRoundRadius::Small: PrepareCorners(SmallMaskCorners, st::roundRadiusSmall, bg, nullptr, images); break;
-		case ImageRoundRadius::Large: PrepareCorners(LargeMaskCorners, st::historyMessageRadius, bg, nullptr, images); break;
-		default: p.fillRect(x, y, w, h, bg); return;
+	const auto ratio = style::DevicePixelRatio();
+	const auto size = [&](int index) {
+		const auto &pix = corners.p[index];
+		return pix.isNull() ? 0 : (pix.width() / ratio);
+	};
+	const auto fillCorner = [&](int left, int bottom, int index) {
+		const auto &pix = corners.p[index];
+		if (pix.isNull()) {
+			return;
 		}
-
-		CornersPixmaps pixmaps;
-		for (int j = 0; j < 4; ++j) {
-			pixmaps.p[j] = PixmapFromImage(std::move(images[j]));
-			pixmaps.p[j].setDevicePixelRatio(style::DevicePixelRatio());
-		}
-		i = CornersMap.emplace(colorKey, pixmaps).first;
+		const auto size = pix.width() / ratio;
+		p.drawPixmap(left, bottom - size, pix);
+	};
+	const auto left = size(kLeft);
+	const auto right = size(kRight);
+	const auto from = x + left;
+	fillCorner(x, y + h + st::msgShadow, kLeft);
+	if (const auto width = w - left - right; width > 0) {
+		p.fillRect(from, y + h, width, st::msgShadow, shadow);
 	}
-	FillRoundRect(p, x, y, w, h, bg, i->second, nullptr, parts);
+	fillCorner(x + w - right, y + h + st::msgShadow, kRight);
+}
+
+const CornersPixmaps &CachedCornerPixmaps(CachedRoundCorners index) {
+	Expects(index >= 0 && index < RoundCornersCount);
+
+	return Corners[index];
+}
+
+CornersPixmaps PrepareCornerPixmaps(int radius, style::color bg, const style::color *sh) {
+	auto images = PrepareCorners(radius, bg, sh);
+	auto result = CornersPixmaps();
+	for (int j = 0; j < 4; ++j) {
+		result.p[j] = PixmapFromImage(std::move(images[j]));
+		result.p[j].setDevicePixelRatio(style::DevicePixelRatio());
+	}
+	return result;
+}
+
+CornersPixmaps PrepareCornerPixmaps(ImageRoundRadius radius, style::color bg, const style::color *sh) {
+	switch (radius) {
+	case ImageRoundRadius::Small:
+		return PrepareCornerPixmaps(st::roundRadiusSmall, bg, sh);
+	case ImageRoundRadius::Large:
+		return PrepareCornerPixmaps(st::roundRadiusLarge, bg, sh);
+	}
+	Unexpected("Image round radius in PrepareCornerPixmaps.");
+}
+
+CornersPixmaps PrepareInvertedCornerPixmaps(int radius, style::color bg) {
+	const auto size = radius * style::DevicePixelRatio();
+	auto circle = style::colorizeImage(
+		style::createInvertedCircleMask(radius * 2),
+		bg);
+	circle.setDevicePixelRatio(style::DevicePixelRatio());
+	auto result = CornersPixmaps();
+	const auto fill = [&](int index, int xoffset, int yoffset) {
+		result.p[index] = PixmapFromImage(
+			circle.copy(QRect(xoffset, yoffset, size, size)));
+	};
+	fill(0, 0, 0);
+	fill(1, size, 0);
+	fill(2, size, size);
+	fill(3, 0, size);
+	return result;
+}
+
+[[nodiscard]] int CachedCornerRadiusValue(CachedCornerRadius tag) {
+	using Radius = CachedCornerRadius;
+	switch (tag) {
+	case Radius::Small: return st::roundRadiusSmall;
+	case Radius::ThumbSmall: return MsgFileThumbRadiusSmall();
+	case Radius::ThumbLarge: return MsgFileThumbRadiusLarge();
+	case Radius::BubbleSmall: return BubbleRadiusSmall();
+	case Radius::BubbleLarge: return BubbleRadiusLarge();
+	}
+	Unexpected("Radius tag in CachedCornerRadiusValue.");
+}
+
+[[nodiscard]] const std::array<QImage, 4> &CachedCornersMasks(
+		CachedCornerRadius radius) {
+	const auto index = static_cast<int>(radius);
+	Assert(index >= 0 && index < kCachedCornerRadiusCount);
+
+	if (CachedMasks[index][0].isNull()) {
+		CachedMasks[index] = Images::CornersMask(
+			CachedCornerRadiusValue(CachedCornerRadius(index)));
+	}
+	return CachedMasks[index];
 }
 
 } // namespace Ui

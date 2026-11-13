@@ -35,6 +35,10 @@ public:
 	void submit() override;
 	rpl::producer<QString> nextButtonText() const override;
 
+	bool hasBack() const override {
+		return true;
+	}
+
 protected:
 	void resizeEvent(QResizeEvent *e) override;
 
@@ -50,6 +54,7 @@ private:
 
 	void pwdSubmitDone(bool recover, const MTPauth_Authorization &result);
 	void pwdSubmitFail(const MTP::Error &error);
+	void codeSubmitDone(const QString &code, const MTPBool &result);
 	void codeSubmitFail(const MTP::Error &error);
 	void recoverStartFail(const MTP::Error &error);
 
@@ -62,12 +67,10 @@ private:
 	void passwordChecked();
 	void serverError();
 
-	Core::CloudPasswordCheckRequest _request;
+	Core::CloudPasswordState _passwordState;
 	crl::time _lastSrpIdInvalidTime = 0;
 	bytes::vector _passwordHash;
-	bool _hasRecovery = false;
-	bool _notEmptyPassport = false;
-	QString _hint, _emailPattern;
+	QString _emailPattern;
 
 	object_ptr<Ui::PasswordInput> _pwdField;
 	object_ptr<Ui::FlatLabel> _pwdHint;

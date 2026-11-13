@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "data/data_peer_id.h"
+
 class FileLoader;
 
 namespace Storage {
@@ -65,17 +67,17 @@ public:
 	StorageFileLocation() = default;
 	StorageFileLocation(
 		int32 dcId,
-		int32 self,
+		UserId self,
 		const MTPInputFileLocation &tl);
 
-	[[nodiscard]] StorageFileLocation convertToModern(
-		Type type,
+	[[nodiscard]] StorageFileLocation convertToModernPeerPhoto(
 		uint64 id,
-		uint64 accessHash) const;
+		uint64 accessHash,
+		uint64 photoId) const;
 
 	[[nodiscard]] int32 dcId() const;
 	[[nodiscard]] uint64 objectId() const;
-	[[nodiscard]] MTPInputFileLocation tl(int32 self) const;
+	[[nodiscard]] MTPInputFileLocation tl(UserId self) const;
 
 	[[nodiscard]] QByteArray serialize() const;
 	[[nodiscard]] int serializeSize() const;
@@ -112,7 +114,7 @@ private:
 	uint64 _id = 0;
 	uint64 _accessHash = 0;
 	uint64 _volumeId = 0;
-	uint32 _inMessagePeerId = 0; // > 0 'userId', < 0 '-channelId'.
+	PeerId _inMessagePeerId = 0;
 	uint32 _inMessageId = 0;
 	QByteArray _fileReference;
 
@@ -155,12 +157,12 @@ public:
 	[[nodiscard]] static std::optional<StorageImageLocation> FromSerialized(
 		const QByteArray &serialized);
 
-	[[nodiscard]] StorageImageLocation convertToModern(
-			StorageFileLocation::Type type,
+	[[nodiscard]] StorageImageLocation convertToModernPeerPhoto(
 			uint64 id,
-			uint64 accessHash) const {
+			uint64 accessHash,
+			uint64 photoId) const {
 		return StorageImageLocation(
-			_file.convertToModern(type, id, accessHash),
+			_file.convertToModernPeerPhoto(id, accessHash, photoId),
 			_width,
 			_height);
 	}
@@ -406,6 +408,14 @@ inline bool operator>=(
 	return !(a < b);
 }
 
+struct AudioAlbumThumbLocation {
+	uint64 documentId = 0;
+
+	friend inline auto operator<=>(
+		AudioAlbumThumbLocation,
+		AudioAlbumThumbLocation) = default;
+};
+
 struct InMemoryLocation {
 	QByteArray bytes;
 
@@ -452,6 +462,7 @@ public:
 		WebFileLocation,
 		GeoPointLocation,
 		PlainUrlLocation,
+		AudioAlbumThumbLocation,
 		InMemoryLocation> data;
 
 	[[nodiscard]] QByteArray serialize() const;
@@ -459,10 +470,10 @@ public:
 	[[nodiscard]] static std::optional<DownloadLocation> FromSerialized(
 		const QByteArray &serialized);
 
-	[[nodiscard]] DownloadLocation convertToModern(
-		StorageFileLocation::Type type,
+	[[nodiscard]] DownloadLocation convertToModernPeerPhoto(
 		uint64 id,
-		uint64 accessHash) const;
+		uint64 accessHash,
+		uint64 photoId) const;
 
 	[[nodiscard]] Storage::Cache::Key cacheKey() const;
 	[[nodiscard]] Storage::Cache::Key bigFileBaseCacheKey() const;
@@ -522,12 +533,12 @@ public:
 	[[nodiscard]] static std::optional<ImageLocation> FromSerialized(
 		const QByteArray &serialized);
 
-	[[nodiscard]] ImageLocation convertToModern(
-			StorageFileLocation::Type type,
+	[[nodiscard]] ImageLocation convertToModernPeerPhoto(
 			uint64 id,
-			uint64 accessHash) const {
+			uint64 accessHash,
+			uint64 photoId) const {
 		return ImageLocation(
-			_file.convertToModern(type, id, accessHash),
+			_file.convertToModernPeerPhoto(id, accessHash, photoId),
 			_width,
 			_height);
 	}
@@ -618,6 +629,11 @@ struct ImageWithLocation {
 	int progressivePartSize = 0;
 };
 
+struct InlineImageLocation {
+	QByteArray bytes;
+	bool isPath = false;
+};
+
 InMemoryKey inMemoryKey(const StorageFileLocation &location);
 
 inline InMemoryKey inMemoryKey(const StorageImageLocation &location) {
@@ -635,13 +651,13 @@ inline InMemoryKey inMemoryKey(const ImageLocation &location) {
 }
 
 inline QSize shrinkToKeepAspect(int32 width, int32 height, int32 towidth, int32 toheight) {
-	int32 w = qMax(width, 1), h = qMax(height, 1);
+	int32 w = std::max(width, 1), h = std::max(height, 1);
 	if (w * toheight > h * towidth) {
-		h = qRound(h * towidth / float64(w));
+		h = int(base::SafeRound(h * towidth / float64(w)));
 		w = towidth;
 	} else {
-		w = qRound(w * toheight / float64(h));
+		w = int(base::SafeRound(w * toheight / float64(h)));
 		h = toheight;
 	}
-	return QSize(qMax(w, 1), qMax(h, 1));
+	return QSize(std::max(w, 1), std::max(h, 1));
 }

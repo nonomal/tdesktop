@@ -49,6 +49,7 @@ using AuthKeyPtr = std::shared_ptr<AuthKey>;
 namespace Local {
 
 void start();
+void sync();
 void finish();
 
 void writeSettings();
@@ -56,6 +57,13 @@ void rewriteSettingsIfNeeded();
 
 void writeAutoupdatePrefix(const QString &prefix);
 QString readAutoupdatePrefix();
+
+void writeUpdateManifest(
+	const QByteArray &manifest,
+	const QByteArray &signature);
+[[nodiscard]] bool readUpdateManifest(
+	QByteArray *manifest,
+	QByteArray *signature);
 
 void writeBackground(const Data::WallPaper &paper, const QImage &image);
 bool readBackground();

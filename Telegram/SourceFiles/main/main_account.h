@@ -75,6 +75,7 @@ public:
 	[[nodiscard]] bool sessionExists() const;
 	[[nodiscard]] Session &session() const;
 	[[nodiscard]] Session *maybeSession() const;
+	[[nodiscard]] bool destroyingSession() const;
 	[[nodiscard]] rpl::producer<Session*> sessionValue() const;
 	[[nodiscard]] rpl::producer<Session*> sessionChanges() const;
 
@@ -82,6 +83,13 @@ public:
 		return *_mtp;
 	}
 	[[nodiscard]] rpl::producer<not_null<MTP::Instance*>> mtpValue() const;
+
+	// Each time the main session changes a new copy of the pointer is fired.
+	// This allows to resend the requests that were not requiring auth, and
+	// which could be forgotten without calling .done() or .fail() because
+	// of the main dc changing.
+	[[nodiscard]] auto mtpMainSessionValue() const
+		-> rpl::producer<not_null<MTP::Instance*>>;
 
 	// Set from legacy storage.
 	void setLegacyMtpKey(std::shared_ptr<MTP::AuthKey> key);
@@ -102,6 +110,9 @@ public:
 
 	void suggestMainDcId(MTP::DcId mainDcId);
 	void destroyStaleAuthorizationKeys();
+
+	void setHandleLoginCode(Fn<void(QString)> callback);
+	void handleLoginCode(const QString &code) const;
 
 	[[nodiscard]] rpl::lifetime &lifetime() {
 		return _lifetime;
@@ -145,6 +156,8 @@ private:
 	std::unique_ptr<Session> _session;
 	rpl::variable<Session*> _sessionValue;
 
+	Fn<void(QString)> _handleLoginCode = nullptr;
+
 	UserId _sessionUserId = 0;
 	QByteArray _sessionUserSerialized;
 	int32 _sessionUserStreamVersion = 0;
@@ -152,6 +165,7 @@ private:
 	MTP::Instance::Fields _mtpFields;
 	MTP::AuthKeysList _mtpKeysToDestroy;
 	bool _loggingOut = false;
+	bool _destroyingSession = false;
 
 	rpl::lifetime _lifetime;
 

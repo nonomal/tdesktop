@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/shadow.h"
+#include "ui/painter.h"
 #include "ui/ui_utility.h"
 #include "ui/cached_round_corners.h"
 #include "window/themes/window_theme.h"
@@ -25,13 +26,13 @@ constexpr int kWaitBeforeRevertMs = 15999;
 } // namespace
 
 WarningWidget::WarningWidget(QWidget *parent)
-: TWidget(parent)
+: RpWidget(parent)
 , _timer([=] { handleTimer(); })
 , _secondsLeft(kWaitBeforeRevertMs / 1000)
 , _keepChanges(this, tr::lng_theme_keep_changes(), st::defaultBoxButton)
 , _revert(this, tr::lng_theme_revert(), st::defaultBoxButton) {
-	_keepChanges->setClickedCallback([] { Window::Theme::KeepApplied(); });
-	_revert->setClickedCallback([] { Window::Theme::Revert(); });
+	_keepChanges->setClickedCallback([] { KeepApplied(); });
+	_revert->setClickedCallback([] { Revert(); });
 	updateText();
 }
 

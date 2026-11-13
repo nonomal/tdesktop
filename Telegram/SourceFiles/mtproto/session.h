@@ -142,6 +142,7 @@ public:
 
 	void start();
 	void reInitConnection();
+	void setConnectionNotInited();
 
 	void restart();
 	void refreshOptions();
@@ -211,7 +212,6 @@ private:
 
 	bool _ping = false;
 
-	base::Timer _timeouter;
 	base::Timer _sender;
 
 	rpl::lifetime _lifetime;

@@ -9,23 +9,25 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "mainwindow.h"
 #include "mainwidget.h"
+#include "calls/calls_instance.h"
 #include "core/sandbox.h"
 #include "core/application.h"
 #include "core/core_settings.h"
+#include "core/version.h"
 #include "core/crash_reports.h"
+#include "menu/menu_dock.h"
 #include "storage/localstorage.h"
 #include "media/audio/media_audio.h"
-#include "media/player/media_player_instance.h"
 #include "window/window_controller.h"
 #include "base/platform/mac/base_utilities_mac.h"
 #include "base/platform/base_platform_info.h"
-#include "lang/lang_keys.h"
 #include "base/timer.h"
 #include "styles/style_window.h"
 #include "platform/platform_specific.h"
 
 #include <QtGui/QWindow>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QMenu>
 #if __has_include(<QtCore/QOperatingSystemVersion>)
 #include <QtCore/QOperatingSystemVersion>
 #endif // __has_include(<QtCore/QOperatingSystemVersion>)
@@ -33,16 +35,23 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <CoreFoundation/CFURL.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/hidsystem/ev_keymap.h>
-#include <SPMediaKeyTap.h>
+
+using Platform::Q2NSString;
+using Platform::NS2QString;
 
 namespace {
 
 constexpr auto kIgnoreActivationTimeoutMs = 500;
 
-} // namespace
+void SetupDockMenu() {
+	static const auto DockMenu = std::make_unique<QMenu>();
+	QObject::connect(DockMenu.get(), &QMenu::aboutToShow, [] {
+		Menu::RefreshDockMenu(DockMenu.get());
+	});
+	DockMenu->setAsDockMenu();
+}
 
-using Platform::Q2NSString;
-using Platform::NS2QString;
+} // namespace
 
 @interface qVisualize : NSObject {
 }
@@ -92,14 +101,10 @@ using Platform::NS2QString;
 }
 
 - (BOOL) applicationShouldHandleReopen:(NSApplication *)theApplication hasVisibleWindows:(BOOL)flag;
-- (void) applicationDidFinishLaunching:(NSNotification *)aNotification;
 - (void) applicationDidBecomeActive:(NSNotification *)aNotification;
 - (void) applicationDidResignActive:(NSNotification *)aNotification;
 - (void) receiveWakeNote:(NSNotification*)note;
-
-- (void) setWatchingMediaKeys:(bool)watching;
-- (bool) isWatchingMediaKeys;
-- (void) mediaKeyTap:(SPMediaKeyTap*)keyTap receivedMediaKeyEvent:(NSEvent*)event;
+- (void) receiveSleepNote:(NSNotification*)note;
 
 - (void) ignoreApplicationActivationRightNow;
 
@@ -108,49 +113,42 @@ using Platform::NS2QString;
 ApplicationDelegate *_sharedDelegate = nil;
 
 @implementation ApplicationDelegate {
-	SPMediaKeyTap *_keyTap;
-	bool _watchingMediaKeys;
 	bool _ignoreActivation;
 	base::Timer _ignoreActivationStop;
 }
 
-- (BOOL) applicationShouldHandleReopen:(NSApplication *)theApplication hasVisibleWindows:(BOOL)flag {
-	if (const auto window = Core::App().activeWindow()) {
-		if (window->widget()->isHidden()) {
-			window->widget()->showFromTray();
-		}
-	}
-	return YES;
-}
-
-- (void) applicationDidFinishLaunching:(NSNotification *)aNotification {
-	_keyTap = nullptr;
-	_watchingMediaKeys = false;
+- (instancetype) init {
 	_ignoreActivation = false;
 	_ignoreActivationStop.setCallback([self] {
 		_ignoreActivation = false;
 	});
-#ifndef OS_MAC_STORE
-	if ([SPMediaKeyTap usesGlobalMediaKeyTap]) {
-		if (!Platform::IsMac10_14OrGreater()) {
-			_keyTap = [[SPMediaKeyTap alloc] initWithDelegate:self];
-		} else {
-			// In macOS Mojave it requires accessibility features.
-			LOG(("Media key monitoring disabled starting with Mojave."));
+	return [super init];
+}
+
+- (BOOL) applicationShouldHandleReopen:(NSApplication *)theApplication hasVisibleWindows:(BOOL)flag {
+	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		if (Core::IsAppLaunched()) {
+			if (const auto window = Core::App().activeWindow()) {
+				if (window->widget()->isHidden()) {
+					window->widget()->showFromTray();
+				}
+			}
 		}
-	} else {
-		LOG(("Media key monitoring disabled"));
-	}
-#endif // else for !OS_MAC_STORE
+	});
+	return YES;
 }
 
 - (void) applicationDidBecomeActive:(NSNotification *)aNotification {
 	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
 		if (Core::IsAppLaunched() && !_ignoreActivation) {
 			Core::App().handleAppActivated();
-			if (auto window = Core::App().activeWindow()) {
+			if (const auto window = Core::App().activeWindow()) {
 				if (window->widget()->isHidden()) {
-					window->widget()->showFromTray();
+					if (Core::App().calls().hasVisiblePanel()) {
+						Core::App().calls().activateCurrentCall();
+					} else {
+						window->widget()->showFromTray();
+					}
 				}
 			}
 		}
@@ -165,40 +163,25 @@ ApplicationDelegate *_sharedDelegate = nil;
 		return;
 	}
 	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		Core::App().notifySystemSleep();
 		Core::App().checkLocalTime();
 
 		LOG(("Audio Info: "
 			"-receiveWakeNote: received, scheduling detach from audio device"));
 		Media::Audio::ScheduleDetachFromDeviceSafe();
 
+#if QT_VERSION < QT_VERSION_CHECK(6, 5, 0)
 		Core::App().settings().setSystemDarkMode(Platform::IsDarkMode());
+#endif // Qt < 6.5.0
 	});
 }
 
-- (void) setWatchingMediaKeys:(bool)watching {
-	if (_watchingMediaKeys != watching) {
-		_watchingMediaKeys = watching;
-		if (_keyTap) {
-#ifndef OS_MAC_STORE
-			if (_watchingMediaKeys) {
-				[_keyTap startWatchingMediaKeys];
-			} else {
-				[_keyTap stopWatchingMediaKeys];
-			}
-#endif // else for !OS_MAC_STORE
-		}
+- (void) receiveSleepNote:(NSNotification*)aNotification {
+	if (!Core::IsAppLaunched()) {
+		return;
 	}
-}
-
-- (bool) isWatchingMediaKeys {
-	return _watchingMediaKeys;
-}
-
-- (void) mediaKeyTap:(SPMediaKeyTap*)keyTap receivedMediaKeyEvent:(NSEvent*)e {
 	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
-		if (e && [e type] == NSSystemDefined && [e subtype] == SPSystemDefinedEventMediaKeys) {
-			objc_handleMediaKeyEvent(e);
-		}
+		Core::App().notifySystemSleep();
 	});
 }
 
@@ -209,67 +192,83 @@ ApplicationDelegate *_sharedDelegate = nil;
 
 @end // @implementation ApplicationDelegate
 
-namespace Platform {
-
-void SetWatchingMediaKeys(bool watching) {
-	if (_sharedDelegate) {
-		[_sharedDelegate setWatchingMediaKeys:watching];
-	}
+// Never NSApp's delegate: setDelegate: drops the old one's NSApp observers.
+@interface ApplicationHiddenObserver : NSObject {
 }
+
+- (void) receiveHideNote:(NSNotification*)note;
+- (void) receiveUnhideNote:(NSNotification*)note;
+
+- (rpl::producer<bool>) hiddenChanges;
+
+@end // @interface ApplicationHiddenObserver
+
+namespace {
+
+ApplicationHiddenObserver *_hiddenObserver = nil;
+
+} // namespace
+
+@implementation ApplicationHiddenObserver {
+	rpl::event_stream<bool> _hiddenChanges;
+}
+
+- (void) receiveHideNote:(NSNotification*)aNotification {
+	if (!Core::IsAppLaunched()) {
+		return;
+	}
+	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		_hiddenChanges.fire(true);
+	});
+}
+
+- (void) receiveUnhideNote:(NSNotification*)aNotification {
+	if (!Core::IsAppLaunched()) {
+		return;
+	}
+	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		_hiddenChanges.fire(false);
+	});
+}
+
+- (rpl::producer<bool>) hiddenChanges {
+	return _hiddenChanges.events();
+}
+
+@end // @implementation ApplicationHiddenObserver
+
+namespace Platform {
 
 void SetApplicationIcon(const QIcon &icon) {
 	NSImage *image = nil;
 	if (!icon.isNull()) {
 		auto pixmap = icon.pixmap(1024, 1024);
-		pixmap.setDevicePixelRatio(cRetinaFactor());
+		pixmap.setDevicePixelRatio(style::DevicePixelRatio());
 		image = Q2NSImage(pixmap.toImage());
 	}
 	[[NSApplication sharedApplication] setApplicationIconImage:image];
 }
 
-} // namespace Platform
-
-bool objc_handleMediaKeyEvent(void *ev) {
-	auto e = reinterpret_cast<NSEvent*>(ev);
-
-	int keyCode = (([e data1] & 0xFFFF0000) >> 16);
-	int keyFlags = ([e data1] & 0x0000FFFF);
-	int keyState = (((keyFlags & 0xFF00) >> 8)) == 0xA;
-	int keyRepeat = (keyFlags & 0x1);
-
-	if (!_sharedDelegate || ![_sharedDelegate isWatchingMediaKeys]) {
-		return false;
+rpl::producer<bool> ApplicationHiddenValue() {
+	if (!_hiddenObserver) {
+		return rpl::single(false);
 	}
-
-	switch (keyCode) {
-	case NX_KEYTYPE_PLAY:
-		if (keyState == 0) { // Play pressed and released
-			Media::Player::instance()->playPause();
-			return true;
-		}
-		break;
-
-	case NX_KEYTYPE_FAST:
-		if (keyState == 0) { // Next pressed and released
-			Media::Player::instance()->next();
-			return true;
-		}
-		break;
-
-	case NX_KEYTYPE_REWIND:
-		if (keyState == 0) { // Previous pressed and released
-			Media::Player::instance()->previous();
-			return true;
-		}
-		break;
-	}
-	return false;
+	return rpl::single(
+		bool([NSApp isHidden])
+	) | rpl::then(
+		[_hiddenObserver hiddenChanges]
+	) | rpl::distinct_until_changed();
 }
+
+} // namespace Platform
 
 void objc_debugShowAlert(const QString &str) {
 	@autoreleasepool {
 
-	[[NSAlert alertWithMessageText:@"Debug Message" defaultButton:@"OK" alternateButton:nil otherButton:nil informativeTextWithFormat:@"%@", Q2NSString(str)] runModal];
+	NSAlert *alert = [[NSAlert alloc] init];
+	alert.messageText = @"Debug Message";
+	alert.informativeText = Q2NSString(str);
+	[alert runModal];
 
 	}
 }
@@ -283,7 +282,6 @@ void objc_outputDebugString(const QString &str) {
 }
 
 void objc_start() {
-#if QT_VERSION >= QT_VERSION_CHECK(5, 9, 0)
 	// Patch: Fix macOS regression. On 10.14.4, it crashes on GPU switches.
 	// See https://bugreports.qt.io/browse/QTCREATORBUG-22215
 	const auto version = QOperatingSystemVersion::current();
@@ -292,13 +290,28 @@ void objc_start() {
 		&& version.microVersion() == 4) {
 		qputenv("QT_MAC_PRO_WEBENGINE_WORKAROUND", "1");
 	}
-#endif // Qt 5.9.0
 
 	_sharedDelegate = [[ApplicationDelegate alloc] init];
 	[[NSApplication sharedApplication] setDelegate:_sharedDelegate];
-	[[[NSWorkspace sharedWorkspace] notificationCenter] addObserver: _sharedDelegate
-														   selector: @selector(receiveWakeNote:)
-															   name: NSWorkspaceDidWakeNotification object: NULL];
+	[[[NSWorkspace sharedWorkspace] notificationCenter]
+		addObserver: _sharedDelegate
+		selector: @selector(receiveWakeNote:)
+		name: NSWorkspaceDidWakeNotification object: NULL];
+	[[[NSWorkspace sharedWorkspace] notificationCenter]
+		addObserver: _sharedDelegate
+		selector: @selector(receiveSleepNote:)
+		name: NSWorkspaceWillSleepNotification object: NULL];
+	_hiddenObserver = [[ApplicationHiddenObserver alloc] init];
+	[[NSNotificationCenter defaultCenter]
+		addObserver: _hiddenObserver
+		selector: @selector(receiveHideNote:)
+		name: NSApplicationDidHideNotification object: NSApp];
+	[[NSNotificationCenter defaultCenter]
+		addObserver: _hiddenObserver
+		selector: @selector(receiveUnhideNote:)
+		name: NSApplicationDidUnhideNotification object: NSApp];
+
+	crl::on_main([=] { SetupDockMenu(); });
 }
 
 void objc_ignoreApplicationActivationRightNow() {
@@ -312,6 +325,16 @@ namespace {
 }
 
 void objc_finish() {
+	if (_hiddenObserver) {
+		[[NSNotificationCenter defaultCenter]
+			removeObserver: _hiddenObserver
+			name: NSApplicationDidHideNotification object: NSApp];
+		[[NSNotificationCenter defaultCenter]
+			removeObserver: _hiddenObserver
+			name: NSApplicationDidUnhideNotification object: NSApp];
+		[_hiddenObserver release];
+		_hiddenObserver = nil;
+	}
 	[_sharedDelegate release];
 	_sharedDelegate = nil;
 	if (_downloadPathUrl) {

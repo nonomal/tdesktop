@@ -11,6 +11,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/rp_widget.h"
 #include "base/object_ptr.h"
 
+namespace style {
+struct colorizer;
+} // namespace style
+
 namespace Ui {
 class FlatButton;
 class ScrollArea;
@@ -26,8 +30,6 @@ namespace Window {
 class Controller;
 
 namespace Theme {
-
-struct Colorizer;
 
 struct ParsedTheme {
 	QByteArray palette;
@@ -45,7 +47,7 @@ struct ParsedTheme {
 [[nodiscard]] Data::CloudTheme ReadCloudFromText(const QByteArray &text);
 [[nodiscard]] QByteArray StripCloudTextFields(const QByteArray &text);
 
-class Editor : public TWidget {
+class Editor : public Ui::RpWidget {
 public:
 	Editor(
 		QWidget*,
@@ -54,7 +56,7 @@ public:
 
 	[[nodiscard]] static QByteArray ColorizeInContent(
 		QByteArray content,
-		const Colorizer &colorizer);
+		const style::colorizer &colorizer);
 
 protected:
 	void paintEvent(QPaintEvent *e) override;

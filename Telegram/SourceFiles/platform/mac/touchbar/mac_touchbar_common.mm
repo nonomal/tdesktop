@@ -7,8 +7,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/mac/touchbar/mac_touchbar_common.h"
 
-#ifndef OS_OSX
-
 #include "base/platform/mac/base_utilities_mac.h"
 
 #import <AppKit/NSTextField.h>
@@ -22,12 +20,10 @@ int WidthFromString(NSString *s) {
 
 NSImage *CreateNSImageFromStyleIcon(const style::icon &icon, int size) {
 	auto instance = icon.instance(QColor(255, 255, 255, 255), 100);
-	instance.setDevicePixelRatio(cRetinaFactor());
+	instance.setDevicePixelRatio(style::DevicePixelRatio());
 	NSImage *image = Platform::Q2NSImage(instance);
 	[image setSize:NSMakeSize(size, size)];
 	return image;
 }
 
 } // namespace TouchBar
-
-#endif // OS_OSX

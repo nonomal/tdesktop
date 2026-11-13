@@ -7,21 +7,20 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/mac/touchbar/mac_touchbar_manager.h"
 
-#ifndef OS_OSX
-
 #include "apiwrap.h" // ApiWrap::updateStickers()
 #include "core/application.h"
-#include "data/data_peer.h" // PeerData::canWrite()
+#include "data/data_chat_participant_status.h" // Data::CanSendAnyOf.
+#include "data/data_forum_topic.h"
 #include "data/data_session.h"
 #include "data/stickers/data_stickers.h" // Stickers::setsRef()
 #include "main/main_domain.h"
 #include "main/main_session.h"
-#include "mainwidget.h" // MainWidget::closeBothPlayers
 #include "media/audio/media_audio_capture.h"
 #include "media/player/media_player_instance.h"
 #include "platform/mac/touchbar/mac_touchbar_audio.h"
 #include "platform/mac/touchbar/mac_touchbar_common.h"
 #include "platform/mac/touchbar/mac_touchbar_main.h"
+#include "ui/widgets/fields/input_field.h"
 #include "window/window_controller.h"
 #include "window/window_session_controller.h"
 
@@ -59,12 +58,12 @@ const auto kAudioItemIdentifier = @"touchbarAudio";
 	Main::Session *_session;
 	Window::Controller *_controller;
 
-	rpl::producer<bool> _canApplyMarkdown;
+	rpl::variable<Ui::MarkdownEnabledState> _markdownState;
 	rpl::event_stream<> _touchBarSwitches;
 	rpl::lifetime _lifetime;
 }
 
-- (id)init:(rpl::producer<bool>)canApplyMarkdown
+- (id)init:(rpl::producer<Ui::MarkdownEnabledState>)markdownState
 		controller:(not_null<Window::Controller*>)controller
 		domain:(not_null<Main::Domain*>)domain {
 	self = [super init];
@@ -76,7 +75,7 @@ const auto kAudioItemIdentifier = @"touchbarAudio";
 		self.defaultItemIdentifiers = @[];
 	});
 	_controller = controller;
-	_canApplyMarkdown = std::move(canApplyMarkdown);
+	_markdownState = std::move(markdownState);
 
 	auto sessionChanges = domain->activeSessionChanges(
 	) | rpl::map([=](Main::Session *session) {
@@ -99,7 +98,7 @@ const auto kAudioItemIdentifier = @"touchbarAudio";
 		rpl::single(false) | rpl::then(Core::App().passcodeLockChanges()),
 		rpl::single(false) | rpl::then(std::move(audioPlayer)),
 		rpl::single(false) | rpl::then(std::move(voiceRecording))
-	) | rpl::start_with_next([=](
+	) | rpl::on_next([=](
 			Main::Session *session,
 			bool lock,
 			bool audio,
@@ -122,9 +121,14 @@ const auto kAudioItemIdentifier = @"touchbarAudio";
 	return self;
 }
 
+- (void)invalidate {
+	_lifetime.destroy();
+	_controller = nullptr;
+}
+
 - (NSTouchBarItem*)touchBar:(NSTouchBar*)touchBar
 		makeItemForIdentifier:(NSTouchBarItemIdentifier)itemId {
-	if (!touchBar || !_controller->sessionController()) {
+	if (!touchBar || !_controller || !_controller->sessionController()) {
 		return nil;
 	}
 	const auto isEqual = [&](NSString *string) {
@@ -133,30 +137,32 @@ const auto kAudioItemIdentifier = @"touchbarAudio";
 
 	if (isEqual(kMainItemIdentifier)) {
 		auto *item = [[GroupTouchBarItem alloc] initWithIdentifier:itemId];
-		item.groupTouchBar =
-			[[[TouchBarMain alloc]
+		item.groupTouchBar
+			= [[[TouchBarMain alloc]
 				init:_controller
 				touchBarSwitches:_touchBarSwitches.events()] autorelease];
 		rpl::combine(
-			rpl::single(false) | rpl::then(rpl::duplicate(_canApplyMarkdown)),
-			rpl::single(
-				false
-			) | rpl::then(
-				_controller->sessionController()->activeChatChanges(
-				) | rpl::map([](Dialogs::Key k) {
-					return k.peer() && k.history() && k.peer()->canWrite();
-				})
-			) | rpl::distinct_until_changed()
-		) | rpl::start_with_next([=](
-				bool canApplyMarkdown,
+			_markdownState.value(),
+			_controller->sessionController()->activeChatValue(
+			) | rpl::map([](Dialogs::Key k) {
+				const auto topic = k.topic();
+				const auto peer = k.peer();
+				const auto rights = ChatRestriction::SendStickers
+					| ChatRestriction::SendOther;
+				return topic
+					? Data::CanSendAnyOf(topic, rights)
+					: (peer && Data::CanSendAnyOf(peer, rights));
+			}) | rpl::distinct_until_changed()
+		) | rpl::on_next([=](
+				Ui::MarkdownEnabledState state,
 				bool hasActiveChat) {
 			item.groupTouchBar.defaultItemIdentifiers = @[
 				kPinnedPanelItemIdentifier,
-				canApplyMarkdown
+				(!state.disabled()
 					? kPopoverInputItemIdentifier
 					: hasActiveChat
 					? kPopoverPickerItemIdentifier
-					: @""];
+					: @"")];
 		}, [item lifetime]);
 
 		return [item autorelease];
@@ -165,10 +171,8 @@ const auto kAudioItemIdentifier = @"touchbarAudio";
 		auto *touchBar = [[[TouchBarAudioPlayer alloc] init]
 			autorelease];
 		item.groupTouchBar = touchBar;
-		[touchBar closeRequests] | rpl::start_with_next([=] {
-			if (const auto session = _controller->sessionController()) {
-				session->content()->closeBothPlayers();
-			}
+		[touchBar closeRequests] | rpl::on_next([=] {
+			Media::Player::instance()->stopAndClose();
 		}, [item lifetime]);
 		return [item autorelease];
 	}
@@ -177,5 +181,3 @@ const auto kAudioItemIdentifier = @"touchbarAudio";
 }
 
 @end // @implementation RootTouchBar
-
-#endif // OS_OSX

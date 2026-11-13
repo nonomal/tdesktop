@@ -7,13 +7,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "mtproto/details/mtproto_serialized_request.h"
 
-#include "base/openssl_help.h"
+#include "base/random.h"
 
 namespace MTP::details {
 namespace {
 
-uint32 CountPaddingPrimesCount(uint32 requestSize, bool extended, bool old) {
-	if (old) {
+uint32 CountPaddingPrimesCount(
+		uint32 requestSize,
+		bool forAuthKeyInner) {
+	if (forAuthKeyInner) {
 		return ((8 + requestSize) & 0x03)
 			? (4 - ((8 + requestSize) & 0x03))
 			: 0;
@@ -27,12 +29,8 @@ uint32 CountPaddingPrimesCount(uint32 requestSize, bool extended, bool old) {
 		result += 4;
 	}
 
-	if (extended) {
-		// Some more random padding.
-		result += ((openssl::RandomValue<uchar>() & 0x0F) << 2);
-	}
-
-	return result;
+	// Some more random padding.
+	return result + ((base::RandomValue<uchar>() & 0x0F) << 2);
 }
 
 } // namespace
@@ -93,19 +91,14 @@ void SerializedRequest::setSeqNo(uint32 seqNo) {
 	(*_data)[kSeqNoPosition] = mtpPrime(seqNo);
 }
 
-uint32 SerializedRequest::getSeqNo() const {
-	Expects(_data != nullptr);
-	Expects(_data->size() > kMessageBodyPosition);
-
-	return uint32((*_data)[kSeqNoPosition]);
-}
-
-void SerializedRequest::addPadding(bool extended, bool old) {
+void SerializedRequest::addPadding(bool forAuthKeyInner) {
 	Expects(_data != nullptr);
 	Expects(_data->size() > kMessageBodyPosition);
 
 	const auto requestSize = (tl::count_length(*this) >> 2);
-	const auto padding = CountPaddingPrimesCount(requestSize, extended, old);
+	const auto padding = CountPaddingPrimesCount(
+		requestSize,
+		forAuthKeyInner);
 	const auto fullSize = kMessageBodyPosition + requestSize + padding;
 	if (uint32(_data->size()) != fullSize) {
 		_data->resize(fullSize);

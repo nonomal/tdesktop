@@ -11,6 +11,8 @@ sys.dont_write_bytecode = True
 scriptPath = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(scriptPath + '/../cmake')
 import run_cmake
+sys.path.append(scriptPath + '/build')
+import qt_version
 
 executePath = os.getcwd()
 def finish(code):
@@ -22,11 +24,9 @@ def error(message):
     print('[ERROR] ' + message)
     finish(1)
 
-if sys.platform == 'win32' and not 'COMSPEC' in os.environ:
+if sys.platform == 'win32' and 'COMSPEC' not in os.environ:
     error('COMSPEC environment variable is not set.')
 
-executePath = os.getcwd()
-scriptPath = os.path.dirname(os.path.realpath(__file__))
 scriptName = os.path.basename(scriptPath)
 
 arguments = sys.argv[1:]
@@ -39,16 +39,25 @@ if os.path.isfile(officialTargetFile):
             officialTarget = line.strip()
 
 arch = ''
-if officialTarget == 'win' or officialTarget == 'uwp':
+if officialTarget in ['win', 'uwp']:
     arch = 'x86'
-elif officialTarget == 'win64' or officialTarget == 'uwp64':
+elif officialTarget in ['win64', 'uwp64']:
     arch = 'x64'
+elif officialTarget in ['winarm', 'uwparm']:
+    arch = 'arm'
+if not qt_version.resolve(arch):
+    error('Unsupported platform.')
+
+if 'qt6' in arguments:
+    arguments.remove('qt6')
+
+if 'qt5' in arguments:
+    arguments.remove('qt5')
 
 if officialTarget != '':
     officialApiIdFile = scriptPath + '/../../DesktopPrivate/custom_api_id.h'
     if not os.path.isfile(officialApiIdFile):
-        print("[ERROR] DesktopPrivate/custom_api_id.h not found.")
-        finish(1)
+        error('DesktopPrivate/custom_api_id.h not found.')
     with open(officialApiIdFile, 'r') as f:
         for line in f:
             apiIdMatch = re.search(r'ApiId\s+=\s+(\d+)', line)
@@ -59,9 +68,5 @@ if officialTarget != '':
                 arguments.append('-DTDESKTOP_API_HASH=' + apiHashMatch.group(1))
     if arch != '':
         arguments.append(arch)
-    finish(run_cmake.run(scriptName, arguments))
-elif 'linux' in sys.platform:
-    debugCode = run_cmake.run(scriptName, arguments, "Debug")
-    finish(debugCode if debugCode else run_cmake.run(scriptName, arguments, "Release"))
-else:
-    finish(run_cmake.run(scriptName, arguments))
+
+finish(run_cmake.run(scriptName, arguments))

@@ -5,8 +5,10 @@ the official desktop application for the Telegram messaging service.
 For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
+#include "base/options.h"
 #include "mtproto/session_private.h"
 
+#include "core/version.h"
 #include "mtproto/details/mtproto_bound_key_creator.h"
 #include "mtproto/details/mtproto_dcenter.h"
 #include "mtproto/details/mtproto_dump_to_text.h"
@@ -15,12 +17,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/mtproto_response.h"
 #include "mtproto/mtproto_dc_options.h"
 #include "mtproto/connection_abstract.h"
-#include "platform/platform_specific.h"
-#include "base/openssl_help.h"
+#include "base/random.h"
 #include "base/qthelp_url.h"
+#include "base/openssl_help.h"
 #include "base/unixtime.h"
 #include "base/platform/base_platform_info.h"
-#include "zlib.h"
+
+#include <ksandbox.h>
+#include <zlib.h>
 
 namespace MTP {
 namespace details {
@@ -38,8 +42,6 @@ constexpr auto kPingSendAfter = 30 * crl::time(1000);
 constexpr auto kPingSendAfterForce = 45 * crl::time(1000);
 constexpr auto kTemporaryExpiresIn = TimeId(86400);
 constexpr auto kBindKeyAdditionalExpiresTimeout = TimeId(30);
-constexpr auto kTestModeDcIdShift = 10000;
-constexpr auto kCheckSentRequestsEach = 1 * crl::time(1000);
 constexpr auto kKeyOldEnoughForDestroy = 60 * crl::time(1000);
 constexpr auto kSentContainerLives = 600 * crl::time(1000);
 constexpr auto kFastRequestDuration = crl::time(500);
@@ -49,6 +51,9 @@ constexpr auto kRequestConfigTimeout = 8 * crl::time(1000);
 
 // Don't try to handle messages larger than this size.
 constexpr auto kMaxMessageLength = 16 * 1024 * 1024;
+constexpr auto kMaxUnpackedMessageLength = 32 * 1024 * 1024;
+constexpr auto kUnpackedChunkSize = 1024 * 1024;
+constexpr auto kMaxGzipNesting = 64;
 
 // How much time passed from send till we resend request or check its state.
 constexpr auto kCheckSentRequestTimeout = 10 * crl::time(1000);
@@ -59,6 +64,8 @@ constexpr auto kSendStateRequestWaiting = crl::time(1000);
 
 // How much time to wait for some more requests, when sending msg acks.
 constexpr auto kAckSendWaiting = 10 * crl::time(1000);
+
+constexpr auto kCutContainerOnSize = 16 * 1024;
 
 auto SyncTimeRequestDuration = kFastRequestDuration;
 
@@ -73,31 +80,26 @@ using namespace details;
 	return idsStr + "]";
 }
 
-[[nodiscard]] QString LogIds(const QVector<uint64> &ids) {
-	if (!ids.size()) return "[]";
-	auto idsStr = QString("[%1").arg(*ids.cbegin());
-	for (const auto id : ids) {
-		idsStr += QString(", %2").arg(id);
-	}
-	return idsStr + "]";
-}
-
 [[nodiscard]] QString ComputeAppVersion() {
-	return QString::fromLatin1(AppVersionStr) + ([] {
+#if defined Q_OS_WIN && defined Q_PROCESSOR_X86_64
+	const auto arch = u" x64"_q;
+#elif (defined Q_OS_WIN && defined Q_PROCESSOR_X86_32) || defined Q_PROCESSOR_X86_64
+	const auto arch = QString();
+#else
+	const auto arch = ' ' + QSysInfo::buildCpuArchitecture();
+#endif
+	return QString::fromLatin1(AppVersionStr) + arch + ([] {
 #if defined OS_MAC_STORE
 		return u" Mac App Store"_q;
 #elif defined OS_WIN_STORE // OS_MAC_STORE
-		return (Platform::IsWindows64Bit() ? u" x64"_q : QString())
-			+ u" Microsoft Store"_q;
-#elif defined Q_OS_UNIX && !defined Q_OS_MAC // OS_MAC_STORE || OS_WIN_STORE
-		return Platform::InFlatpak()
+		return u" Microsoft Store"_q;
+#else // OS_MAC_STORE || OS_WIN_STORE
+		return KSandbox::isFlatpak()
 			? u" Flatpak"_q
-			: Platform::InSnap()
+			: KSandbox::isSnap()
 			? u" Snap"_q
 			: QString();
-#else // OS_MAC_STORE || OS_WIN_STORE || (defined Q_OS_UNIX && !defined Q_OS_MAC)
-		return Platform::IsWindows64Bit() ? u" x64"_q : QString();
-#endif // OS_MAC_STORE || OS_WIN_STORE || (defined Q_OS_UNIX && !defined Q_OS_MAC)
+#endif // OS_MAC_STORE || OS_WIN_STORE
 	})();
 }
 
@@ -141,7 +143,15 @@ void WrapInvokeAfter(
 	return different;
 }
 
+base::options::toggle OptionPreferIPv6({
+	.id = kOptionPreferIPv6,
+	.name = "Prefer IPv6",
+	.description = "Prefer IPv6 if it is available. Require \"Try connecting through IPv6\" to be enabled",
+});
+
 } // namespace
+
+const char kOptionPreferIPv6[] = "prefer-ipv6";
 
 SessionPrivate::SessionPrivate(
 	not_null<Instance*> instance,
@@ -163,13 +173,14 @@ SessionPrivate::SessionPrivate(
 , _waitForConnected(kMinConnectedTimeout)
 , _pingSender(thread, [=] { sendPingByTimer(); })
 , _checkSentRequestsTimer(thread, [=] { checkSentRequests(); })
+, _clearOldContainersTimer(thread, [=] { clearOldContainers(); })
 , _sessionData(std::move(data)) {
 	Expects(_shiftedDcId != 0);
 
 	moveToThread(thread);
 
 	InvokeQueued(this, [=] {
-		_checkSentRequestsTimer.callEach(kCheckSentRequestsEach);
+		_clearOldContainersTimer.callEach(kSentContainerLives);
 		connectToServer();
 	});
 }
@@ -189,7 +200,7 @@ void SessionPrivate::appendTestConnection(
 		const bytes::vector &protocolSecret) {
 	QWriteLocker lock(&_stateMutex);
 
-	const auto priority = (qthelp::is_ipv6(ip) ? 0 : 1)
+	const auto priority = (qthelp::is_ipv6(ip) ? (OptionPreferIPv6.value() ? 2 : 0) : 1)
 		+ (protocol == DcOptions::Variants::Tcp ? 1 : 0)
 		+ (protocolSecret.empty() ? 0 : 1);
 	_testConnections.push_back({
@@ -226,9 +237,17 @@ void SessionPrivate::appendTestConnection(
 		});
 	});
 
+	const auto protocolForFiles = isMediaClusterDcId(_shiftedDcId)
+		//|| isUploadDcId(_shiftedDcId)
+		|| (_realDcType == DcType::Cdn);
 	const auto protocolDcId = getProtocolDcId();
 	InvokeQueued(_testConnections.back().data, [=] {
-		weak->connectToServer(ip, port, protocolSecret, protocolDcId);
+		weak->connectToServer(
+			ip,
+			port,
+			protocolSecret,
+			protocolDcId,
+			protocolForFiles);
 	});
 }
 
@@ -246,41 +265,47 @@ int16 SessionPrivate::getProtocolDcId() const {
 }
 
 void SessionPrivate::checkSentRequests() {
-	clearOldContainers();
-
 	const auto now = crl::now();
-	if (_bindMsgId && _bindMessageSent + kCheckSentRequestTimeout < now) {
+	const auto checkTime = now - kCheckSentRequestTimeout;
+	if (_bindMsgId && _bindMessageSent < checkTime) {
 		DEBUG_LOG(("MTP Info: "
 			"Request state while key is not bound, restarting."));
 		restart();
+		_checkSentRequestsTimer.callOnce(kCheckSentRequestTimeout);
 		return;
 	}
 	auto requesting = false;
+	auto nextTimeout = kCheckSentRequestTimeout;
 	{
 		QReadLocker locker(_sessionData->haveSentMutex());
-		auto &haveSent = _sessionData->haveSentMap();
-		const auto haveSentCount = haveSent.size();
-		const auto checkAfter = kCheckSentRequestTimeout;
+		const auto &haveSent = _sessionData->haveSentMap();
 		for (const auto &[msgId, request] : haveSent) {
-			if (request->lastSentTime + checkAfter < now) {
+			if (request->lastSentTime <= checkTime) {
 				// Need to check state.
 				request->lastSentTime = now;
 				if (_stateRequestData.emplace(msgId).second) {
 					requesting = true;
 				}
+			} else {
+				nextTimeout = std::min(request->lastSentTime - checkTime, nextTimeout);
 			}
 		}
 	}
 	if (requesting) {
 		_sessionData->queueSendAnything(kSendStateRequestWaiting);
 	}
+	if (nextTimeout < kCheckSentRequestTimeout) {
+		_checkSentRequestsTimer.callOnce(nextTimeout);
+	}
 }
 
 void SessionPrivate::clearOldContainers() {
 	auto resent = false;
+	auto nextTimeout = kSentContainerLives;
 	const auto now = crl::now();
+	const auto checkTime = now - kSentContainerLives;
 	for (auto i = _sentContainers.begin(); i != _sentContainers.end();) {
-		if (now > i->second.sent + kSentContainerLives) {
+		if (i->second.sent <= checkTime) {
 			DEBUG_LOG(("MTP Info: Removing old container with resending %1, "
 				"sent: %2, now: %3, current unixtime: %4"
 				).arg(i->first
@@ -293,14 +318,20 @@ void SessionPrivate::clearOldContainers() {
 
 			resent = resent || !ids.empty();
 			for (const auto innerMsgId : ids) {
-				resend(innerMsgId, -1, true);
+				resend(innerMsgId, -1);
 			}
 		} else {
+			nextTimeout = std::min(i->second.sent - checkTime, nextTimeout);
 			++i;
 		}
 	}
 	if (resent) {
 		_sessionData->queueNeedToResumeAndSend();
+	}
+	if (nextTimeout < kSentContainerLives) {
+		_clearOldContainersTimer.callOnce(nextTimeout);
+	} else if (!_clearOldContainersTimer.isActive()) {
+		_clearOldContainersTimer.callEach(nextTimeout);
 	}
 }
 
@@ -315,10 +346,6 @@ void SessionPrivate::destroyAllConnections() {
 
 void SessionPrivate::cdnConfigChanged() {
 	connectToServer(true);
-}
-
-int32 SessionPrivate::getShiftedDcId() const {
-	return _shiftedDcId;
 }
 
 void SessionPrivate::dcOptionsChanged() {
@@ -387,7 +414,7 @@ void SessionPrivate::resetSession() {
 void SessionPrivate::changeSessionId() {
 	auto sessionId = _sessionId;
 	do {
-		sessionId = openssl::RandomValue<uint64>();
+		sessionId = base::RandomValue<uint64>();
 	} while (_sessionId == sessionId);
 
 	DEBUG_LOG(("MTP Info: setting server_session: %1").arg(sessionId));
@@ -523,7 +550,7 @@ MTPVector<MTPJSONObjectValue> SessionPrivate::prepareInitParams() {
 	const auto local = QDateTime::currentDateTime();
 	const auto utc = QDateTime(local.date(), local.time(), Qt::UTC);
 	const auto shift = base::unixtime::now() - (TimeId)::time(nullptr);
-	const auto delta = int(utc.toTime_t()) - int(local.toTime_t()) - shift;
+	const auto delta = int(utc.toSecsSinceEpoch()) - int(local.toSecsSinceEpoch()) - shift;
 	auto sliced = delta;
 	while (sliced < -12 * 3600) {
 		sliced += 24 * 3600;
@@ -532,7 +559,9 @@ MTPVector<MTPJSONObjectValue> SessionPrivate::prepareInitParams() {
 		sliced -= 24 * 3600;
 	}
 	const auto sign = (sliced < 0) ? -1 : 1;
-	const auto rounded = std::round(std::abs(sliced) / 900.) * 900 * sign;
+	const auto rounded = base::SafeRound(std::abs(sliced) / 900.)
+		* 900
+		* sign;
 	return MTP_vector<MTPJSONObjectValue>(
 		1,
 		MTP_jsonObjectValue(
@@ -563,7 +592,7 @@ void SessionPrivate::tryToSend() {
 		&& !_pingIdToSend
 		&& !_pingId
 		&& _pingSendAt <= crl::now()) {
-		_pingIdToSend = openssl::RandomValue<mtpPingId>();
+		_pingIdToSend = base::RandomValue<mtpPingId>();
 	}
 	const auto forceNewMsgId = sendAll && markSessionAsStarted();
 	if (forceNewMsgId && _keyCreator) {
@@ -654,7 +683,8 @@ void SessionPrivate::tryToSend() {
 			: _instance->systemVersion();
 		const auto appVersion = ComputeAppVersion();
 		const auto proxyType = _options->proxy.type;
-		const auto mtprotoProxy = (proxyType == ProxyData::Type::Mtproto);
+		const auto mtprotoProxy = (proxyType == ProxyData::Type::Mtproto)
+			|| (proxyType == ProxyData::Type::Web);
 		const auto clientProxyFields = mtprotoProxy
 			? MTP_inputClientProxy(
 				MTP_string(_options->proxy.host),
@@ -678,10 +708,13 @@ void SessionPrivate::tryToSend() {
 		initSize = initSizeInInts * sizeof(mtpPrime);
 	}
 
-	bool needAnyResponse = false;
+	auto needAnyResponse = false;
+	auto someSkipped = false;
 	SerializedRequest toSendRequest;
 	{
 		QWriteLocker locker1(_sessionData->toSendMutex());
+
+		auto scheduleCheckSentRequests = false;
 
 		auto toSendDummy = base::flat_map<mtpRequestId, SerializedRequest>();
 		auto &toSend = sendAll
@@ -691,15 +724,33 @@ void SessionPrivate::tryToSend() {
 			locker1.unlock();
 		}
 
-		uint32 toSendCount = toSend.size();
-		if (pingRequest) ++toSendCount;
-		if (ackRequest) ++toSendCount;
-		if (resendRequest) ++toSendCount;
-		if (stateRequest) ++toSendCount;
-		if (httpWaitRequest) ++toSendCount;
-		if (bindDcKeyRequest) ++toSendCount;
+		auto totalSending = int(toSend.size());
+		auto sendingFrom = begin(toSend);
+		auto sendingTill = end(toSend);
+		auto combinedLength = 0;
+		for (auto i = sendingFrom; i != sendingTill; ++i) {
+			combinedLength += i->second->size();
+			if (combinedLength >= kCutContainerOnSize) {
+				++i;
+				if (const auto skipping = int(sendingTill - i)) {
+					sendingTill = i;
+					totalSending -= skipping;
+					Assert(totalSending > 0);
+					someSkipped = true;
+				}
+				break;
+			}
+		}
+		auto sendingRange = ranges::make_subrange(sendingFrom, sendingTill);
+		const auto sendingCount = totalSending;
+		if (pingRequest) ++totalSending;
+		if (ackRequest) ++totalSending;
+		if (resendRequest) ++totalSending;
+		if (stateRequest) ++totalSending;
+		if (httpWaitRequest) ++totalSending;
+		if (bindDcKeyRequest) ++totalSending;
 
-		if (!toSendCount) {
+		if (!totalSending) {
 			return; // nothing to send
 		}
 
@@ -715,11 +766,11 @@ void SessionPrivate::tryToSend() {
 			? httpWaitRequest
 			: bindDcKeyRequest
 			? bindDcKeyRequest
-			: toSend.begin()->second;
-		if (toSendCount == 1 && !first->forceSendInContainer) {
+			: sendingRange.begin()->second;
+		if (totalSending == 1 && !first->forceSendInContainer) {
 			toSendRequest = first;
 			if (sendAll) {
-				toSend.clear();
+				toSend.erase(sendingFrom, sendingTill);
 				locker1.unlock();
 			}
 
@@ -748,6 +799,7 @@ void SessionPrivate::tryToSend() {
 					QWriteLocker locker2(_sessionData->haveSentMutex());
 					auto &haveSent = _sessionData->haveSentMap();
 					haveSent.emplace(msgId, toSendRequest);
+					scheduleCheckSentRequests = true;
 
 					const auto wrapLayer = needsLayer && toSendRequest->needsLayer;
 					if (toSendRequest->after) {
@@ -787,7 +839,7 @@ void SessionPrivate::tryToSend() {
 			if (stateRequest) containerSize += stateRequest.messageSize();
 			if (httpWaitRequest) containerSize += httpWaitRequest.messageSize();
 			if (bindDcKeyRequest) containerSize += bindDcKeyRequest.messageSize();
-			for (const auto &[requestId, request] : toSend) {
+			for (const auto &[requestId, request] : sendingRange) {
 				containerSize += request.messageSize();
 				if (needsLayer && request->needsLayer) {
 					containerSize += initSizeInInts;
@@ -804,9 +856,9 @@ void SessionPrivate::tryToSend() {
 			// prepare container + each in invoke after
 			toSendRequest = SerializedRequest::Prepare(
 				containerSize,
-				containerSize + 3 * toSend.size());
+				containerSize + 3 * sendingCount);
 			toSendRequest->push_back(mtpc_msg_container);
-			toSendRequest->push_back(toSendCount);
+			toSendRequest->push_back(totalSending);
 
 			// check for a valid container
 			auto bigMsgId = base::unixtime::mtproto_msg_id();
@@ -818,7 +870,7 @@ void SessionPrivate::tryToSend() {
 			// prepare sent container
 			auto sentIdsWrap = SentContainer();
 			sentIdsWrap.sent = crl::now();
-			sentIdsWrap.messages.reserve(toSendCount);
+			sentIdsWrap.messages.reserve(totalSending);
 
 			if (bindDcKeyRequest) {
 				_bindMsgId = placeToContainer(
@@ -827,6 +879,7 @@ void SessionPrivate::tryToSend() {
 					false,
 					bindDcKeyRequest);
 				_bindMessageSent = crl::now();
+				sentIdsWrap.messages.push_back(_bindMsgId);
 				needAnyResponse = true;
 			}
 			if (pingRequest) {
@@ -835,10 +888,11 @@ void SessionPrivate::tryToSend() {
 					bigMsgId,
 					forceNewMsgId,
 					pingRequest);
+				sentIdsWrap.messages.push_back(_pingMsgId);
 				needAnyResponse = true;
 			}
 
-			for (auto &[requestId, request] : toSend) {
+			for (auto &[requestId, request] : sendingRange) {
 				const auto msgId = prepareToSend(
 					request,
 					bigMsgId,
@@ -871,6 +925,7 @@ void SessionPrivate::tryToSend() {
 						//Assert(!haveSent.contains(msgId));
 						haveSent.emplace(msgId, request);
 						sentIdsWrap.messages.push_back(msgId);
+						scheduleCheckSentRequests = true;
 						needAnyResponse = true;
 					} else {
 						_ackedIds.emplace(msgId, request->requestId);
@@ -882,7 +937,7 @@ void SessionPrivate::tryToSend() {
 					memcpy(toSendRequest->data() + from, request->constData() + 4, len * sizeof(mtpPrime));
 				}
 			}
-			toSend.clear();
+			toSend.erase(sendingFrom, sendingTill);
 
 			if (stateRequest) {
 				const auto msgId = placeToContainer(
@@ -922,9 +977,18 @@ void SessionPrivate::tryToSend() {
 				bigMsgId,
 				forceNewMsgId);
 			_sentContainers.emplace(containerMsgId, std::move(sentIdsWrap));
+
+			if (scheduleCheckSentRequests && !_checkSentRequestsTimer.isActive()) {
+				_checkSentRequestsTimer.callOnce(kCheckSentRequestTimeout);
+			}
 		}
 	}
 	sendSecureRequest(std::move(toSendRequest), needAnyResponse);
+	if (someSkipped) {
+		InvokeQueued(this, [=] {
+			tryToSend();
+		});
+	}
 }
 
 void SessionPrivate::retryByTimer() {
@@ -967,7 +1031,8 @@ void SessionPrivate::connectToServer(bool afterConfig) {
 			return;
 		}
 	}
-	if (_options->proxy.type == ProxyData::Type::Mtproto) {
+	if (_options->proxy.type == ProxyData::Type::Mtproto
+		|| _options->proxy.type == ProxyData::Type::Web) {
 		// host, port, secret for mtproto proxy are taken from proxy.
 		appendTestConnection(DcOptions::Variants::Tcp, {}, 0, {});
 	} else {
@@ -1072,6 +1137,8 @@ void SessionPrivate::onSentSome(uint64 size) {
 	if (!_waitForReceivedTimer.isActive()) {
 		auto remain = static_cast<uint64>(_waitForReceived);
 		if (!_oldConnection) {
+			Assert(remain <= kMaxReceiveTimeout);
+
 			// 8kb / sec, so 512 kb give 64 sec
 			auto remainBySize = size * _waitForReceived / 8192;
 			remain = std::clamp(
@@ -1081,9 +1148,6 @@ void SessionPrivate::onSentSome(uint64 size) {
 			if (remain != _waitForReceived) {
 				DEBUG_LOG(("Checking connect for request with size %1 bytes, delay will be %2").arg(size).arg(remain));
 			}
-		}
-		if (isUploadDcId(_shiftedDcId)) {
-			remain *= kUploadSessionsCount;
 		}
 		_waitForReceivedTimer.callOnce(remain);
 	}
@@ -1106,7 +1170,7 @@ void SessionPrivate::onReceivedSome() {
 			).arg(_waitForReceived));
 
 		if (ms > 0 && ms * 2 < _waitForReceived) {
-			_waitForReceived = qMax(ms * 2, kMinReceiveTimeout);
+			_waitForReceived = std::max(ms * 2, kMinReceiveTimeout);
 		}
 		_firstSentAt = -1;
 	}
@@ -1152,7 +1216,9 @@ void SessionPrivate::waitReceivedFailed() {
 
 	DEBUG_LOG(("MTP Info: bad connection, _waitForReceived: %1ms").arg(_waitForReceived));
 	if (_waitForReceived < kMaxReceiveTimeout) {
-		_waitForReceived *= 2;
+		_waitForReceived = std::min(
+			_waitForReceived * 2,
+			kMaxReceiveTimeout);
 	}
 	doDisconnect();
 	if (_retryTimer.isActive()) {
@@ -1224,16 +1290,15 @@ void SessionPrivate::handleReceived() {
 		auto ints = intsBuffer.constData();
 		if ((intsCount < kMinimalIntsCount) || (intsCount > kMaxMessageLength / kIntSize)) {
 			LOG(("TCP Error: bad message received, len %1").arg(intsCount * kIntSize));
-			TCP_LOG(("TCP Error: bad message %1").arg(Logs::mb(ints, intsCount * kIntSize).str()));
-
 			return restart();
 		}
 		if (_keyId != *(uint64*)ints) {
 			LOG(("TCP Error: bad auth_key_id %1 instead of %2 received").arg(_keyId).arg(*(uint64*)ints));
-			TCP_LOG(("TCP Error: bad message %1").arg(Logs::mb(ints, intsCount * kIntSize).str()));
-
 			return restart();
 		}
+
+		constexpr auto kMinPaddingSize = 12U;
+		constexpr auto kMaxPaddingSize = 1024U;
 
 		auto encryptedInts = ints + kExternalHeaderIntsCount;
 		auto encryptedIntsCount = (intsCount - kExternalHeaderIntsCount) & ~0x03U;
@@ -1241,11 +1306,7 @@ void SessionPrivate::handleReceived() {
 		auto decryptedBuffer = QByteArray(encryptedBytesCount, Qt::Uninitialized);
 		auto msgKey = *(MTPint128*)(ints + 2);
 
-#ifdef TDESKTOP_MTPROTO_OLD
-		aesIgeDecrypt_oldmtp(encryptedInts, decryptedBuffer.data(), encryptedBytesCount, _encryptionKey, msgKey);
-#else // TDESKTOP_MTPROTO_OLD
 		aesIgeDecrypt(encryptedInts, decryptedBuffer.data(), encryptedBytesCount, _encryptionKey, msgKey);
-#endif // TDESKTOP_MTPROTO_OLD
 
 		auto decryptedInts = reinterpret_cast<const mtpPrime*>(decryptedBuffer.constData());
 		auto serverSalt = *(uint64*)&decryptedInts[0];
@@ -1253,39 +1314,11 @@ void SessionPrivate::handleReceived() {
 		auto msgId = *(uint64*)&decryptedInts[4];
 		auto seqNo = *(uint32*)&decryptedInts[6];
 		auto needAck = ((seqNo & 0x01) != 0);
-
 		auto messageLength = *(uint32*)&decryptedInts[7];
-		if (messageLength > kMaxMessageLength) {
-			LOG(("TCP Error: bad messageLength %1").arg(messageLength));
-			TCP_LOG(("TCP Error: bad message %1").arg(Logs::mb(ints, intsCount * kIntSize).str()));
-
-			return restart();
-
-		}
 		auto fullDataLength = kEncryptedHeaderIntsCount * kIntSize + messageLength; // Without padding.
 
 		// Can underflow, but it is an unsigned type, so we just check the range later.
 		auto paddingSize = static_cast<uint32>(encryptedBytesCount) - static_cast<uint32>(fullDataLength);
-
-#ifdef TDESKTOP_MTPROTO_OLD
-		constexpr auto kMinPaddingSize_oldmtp = 0U;
-		constexpr auto kMaxPaddingSize_oldmtp = 15U;
-		auto badMessageLength = (/*paddingSize < kMinPaddingSize_oldmtp || */paddingSize > kMaxPaddingSize_oldmtp);
-
-		auto hashedDataLength = badMessageLength ? encryptedBytesCount : fullDataLength;
-		auto sha1ForMsgKeyCheck = hashSha1(decryptedInts, hashedDataLength);
-
-		constexpr auto kMsgKeyShift_oldmtp = 4U;
-		if (ConstTimeIsDifferent(&msgKey, sha1ForMsgKeyCheck.data() + kMsgKeyShift_oldmtp, sizeof(msgKey))) {
-			LOG(("TCP Error: bad SHA1 hash after aesDecrypt in message."));
-			TCP_LOG(("TCP Error: bad message %1").arg(Logs::mb(encryptedInts, encryptedBytesCount).str()));
-
-			return restart();
-		}
-#else // TDESKTOP_MTPROTO_OLD
-		constexpr auto kMinPaddingSize = 12U;
-		constexpr auto kMaxPaddingSize = 1024U;
-		auto badMessageLength = (paddingSize < kMinPaddingSize || paddingSize > kMaxPaddingSize);
 
 		std::array<uchar, 32> sha256Buffer = { { 0 } };
 
@@ -1298,25 +1331,28 @@ void SessionPrivate::handleReceived() {
 		constexpr auto kMsgKeyShift = 8U;
 		if (ConstTimeIsDifferent(&msgKey, sha256Buffer.data() + kMsgKeyShift, sizeof(msgKey))) {
 			LOG(("TCP Error: bad SHA256 hash after aesDecrypt in message"));
-			TCP_LOG(("TCP Error: bad message %1").arg(Logs::mb(encryptedInts, encryptedBytesCount).str()));
-
 			return restart();
 		}
-#endif // TDESKTOP_MTPROTO_OLD
 
-		if (badMessageLength || (messageLength & 0x03)) {
+		if ((messageLength < kIntSize)
+			|| (messageLength > kMaxMessageLength)
+			|| (messageLength & 0x03)
+			|| (paddingSize < kMinPaddingSize)
+			|| (paddingSize > kMaxPaddingSize)) {
 			LOG(("TCP Error: bad msg_len received %1, data size: %2").arg(messageLength).arg(encryptedBytesCount));
-			TCP_LOG(("TCP Error: bad message %1").arg(Logs::mb(encryptedInts, encryptedBytesCount).str()));
-
 			return restart();
 		}
 
-		TCP_LOG(("TCP Info: decrypted message %1,%2,%3 is %4 len").arg(msgId).arg(seqNo).arg(Logs::b(needAck)).arg(fullDataLength));
+		if (Logs::DebugEnabled()) {
+			_connection->logInfo(u"Decrypted message %1,%2,%3 is %4 len"_q
+				.arg(msgId)
+				.arg(seqNo)
+				.arg(Logs::b(needAck))
+				.arg(fullDataLength));
+		}
 
 		if (session != _sessionId) {
 			LOG(("MTP Error: bad server session received"));
-			TCP_LOG(("MTP Error: bad server session %1 instead of %2 in message received").arg(session).arg(_sessionId));
-
 			return restart();
 		}
 
@@ -1359,17 +1395,24 @@ void SessionPrivate::handleReceived() {
 		auto sfrom = decryptedInts + 4U; // msg_id + seq_no + length + message
 		MTP_LOG(_shiftedDcId, ("Recv: ")
 			+ DumpToText(sfrom, end)
-			+ QString(" (protocolDcId:%1,key:%2)"
-			).arg(getProtocolDcId()
-			).arg(_encryptionKey->keyId()));
+			+ QString(" (dc:%1,key:%2,session:%3)"
+			).arg(AbstractConnection::ProtocolDcDebugId(getProtocolDcId())
+			).arg(_encryptionKey->keyId()
+			).arg(_sessionId));
 
-		if (_receivedMessageIds.registerMsgId(msgId, needAck)) {
+		const auto registered = _receivedMessageIds.registerMsgId(
+			msgId,
+			needAck);
+		if (registered == ReceivedIdsManager::Result::Success) {
+			auto unpackedBudget = kMaxUnpackedMessageLength;
 			res = handleOneReceived(from, end, msgId, {
 				.outerMsgId = msgId,
 				.serverSalt = serverSalt,
 				.serverTime = serverTime,
 				.badTime = badTime,
-			});
+			}, unpackedBudget, 0);
+		} else if (registered == ReceivedIdsManager::Result::TooOld) {
+			res = HandleResult::ResetSession;
 		}
 		_receivedMessageIds.shrink();
 
@@ -1415,18 +1458,35 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 		const mtpPrime *from,
 		const mtpPrime *end,
 		uint64 msgId,
-		OuterInfo info) {
+		OuterInfo info,
+		int &unpackedBudget,
+		int gzipDepth) {
 	Expects(from < end);
 
 	switch (mtpTypeId(*from)) {
 
 	case mtpc_gzip_packed: {
 		DEBUG_LOG(("Message Info: gzip container"));
-		mtpBuffer response = ungzip(++from, end);
+		if (gzipDepth >= kMaxGzipNesting) {
+			LOG(("RPC Error: gzip nesting exceeds %1."
+				).arg(kMaxGzipNesting));
+			return HandleResult::RestartConnection;
+		}
+		auto response = ungzip(
+			++from,
+			end,
+			unpackedBudget);
 		if (response.empty()) {
 			return HandleResult::RestartConnection;
 		}
-		return handleOneReceived(response.data(), response.data() + response.size(), msgId, info);
+		unpackedBudget -= int(response.size() * sizeof(mtpPrime));
+		return handleOneReceived(
+			response.data(),
+			response.data() + response.size(),
+			msgId,
+			info,
+			unpackedBudget,
+			gzipDepth + 1);
 	}
 
 	case mtpc_msg_container: {
@@ -1477,9 +1537,20 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 			}
 
 			auto res = HandleResult::Success; // if no need to handle, then succeed
-			if (_receivedMessageIds.registerMsgId(inMsgId.v, needAck)) {
-				res = handleOneReceived(from, otherEnd, inMsgId.v, info);
+			const auto registered = _receivedMessageIds.registerMsgId(
+				inMsgId.v,
+				needAck);
+			if (registered == ReceivedIdsManager::Result::Success) {
+				res = handleOneReceived(
+					from,
+					otherEnd,
+					inMsgId.v,
+					info,
+					unpackedBudget,
+					gzipDepth);
 				info.badTime = false;
+			} else if (registered == ReceivedIdsManager::Result::TooOld) {
+				res = HandleResult::ResetSession;
 			}
 			if (res != HandleResult::Success) {
 				return res;
@@ -1563,7 +1634,7 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 
 				DEBUG_LOG(("Message Info: unixtime updated, now %1, resending in container...").arg(info.serverTime));
 
-				resend(resendId, 0, true);
+				resend(resendId);
 			} else { // must create new session, because msg_id and msg_seqno are inconsistent
 				if (info.badTime) {
 					if (info.serverSalt) {
@@ -1572,13 +1643,22 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 					correctUnixtimeWithBadLocal(info.serverTime);
 					info.badTime = false;
 				}
+				if (_bindMsgId) {
+					LOG(("Message Info: bad message notification received"
+						" while binding temp key, restarting."));
+					return HandleResult::RestartConnection;
+				}
 				LOG(("Message Info: bad message notification received, msgId %1, error_code %2").arg(data.vbad_msg_id().v).arg(errorCode));
 				return HandleResult::ResetSession;
 			}
 		} else { // fatal (except 48, but it must not get here)
 			const auto badMsgId = mtpMsgId(data.vbad_msg_id().v);
 			const auto requestId = wasSent(resendId);
-			if (requestId) {
+			if (_bindMsgId) {
+				LOG(("Message Error: fatal bad message notification received"
+					" while binding temp key, restarting."));
+				return HandleResult::RestartConnection;
+			} else if (requestId) {
 				LOG(("Message Error: "
 					"fatal bad message notification received, "
 					"msgId %1, error_code %2, requestId: %3"
@@ -1623,7 +1703,14 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 		}
 
 		_sessionSalt = data.vnew_server_salt().v;
-		correctUnixtimeWithBadLocal(info.serverTime);
+
+		// Don't force time update here.
+		base::unixtime::update(info.serverTime);
+
+		if (_bindMsgId) {
+			LOG(("Message Info: bad_server_salt received while binding temp key, restarting."));
+			return HandleResult::RestartConnection;
+		}
 
 		if (setState(ConnectedState, ConnectingState)) {
 			resendAll();
@@ -1761,7 +1848,7 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 	} return HandleResult::Success;
 
 	case mtpc_rpc_result: {
-		if (from + 3 > end) {
+		if (end - from < 4) {
 			return HandleResult::ParseError;
 		}
 		auto response = mtpBuffer();
@@ -1787,10 +1874,19 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 		mtpTypeId typeId = from[0];
 		if (typeId == mtpc_gzip_packed) {
 			DEBUG_LOG(("RPC Info: gzip container"));
-			response = ungzip(++from, end);
+			if (gzipDepth >= kMaxGzipNesting) {
+				LOG(("RPC Error: gzip nesting exceeds %1."
+					).arg(kMaxGzipNesting));
+				return HandleResult::RestartConnection;
+			}
+			response = ungzip(
+				++from,
+				end,
+				unpackedBudget);
 			if (response.empty()) {
 				return HandleResult::RestartConnection;
 			}
+			unpackedBudget -= int(response.size() * sizeof(mtpPrime));
 			typeId = response[0];
 		} else {
 			response.resize(end - from);
@@ -1861,7 +1957,7 @@ SessionPrivate::HandleResult SessionPrivate::handleOneReceived(
 			}
 		}
 		for (const auto msgId : toResend) {
-			resend(msgId, 10, true);
+			resend(msgId, 10);
 		}
 
 		mtpBuffer update(from - start);
@@ -1961,52 +2057,74 @@ SessionPrivate::HandleResult SessionPrivate::handleBindResponse(
 	Unexpected("Result of BoundKeyCreator::handleBindResponse.");
 }
 
-mtpBuffer SessionPrivate::ungzip(const mtpPrime *from, const mtpPrime *end) const {
-	mtpBuffer result; // * 4 because of mtpPrime type
-	result.resize(0);
-
+mtpBuffer SessionPrivate::ungzip(
+		const mtpPrime *from,
+		const mtpPrime *end,
+		int sizeLimit) const {
+	if (sizeLimit <= 0) {
+		LOG(("RPC Error: unpacked gzip data exceeds %1 bytes."
+			).arg(kMaxUnpackedMessageLength));
+		return {};
+	}
 	MTPstring packed;
 	if (!packed.read(from, end)) { // read packed string as serialized mtp string type
 		LOG(("RPC Error: could not read gziped bytes."));
-		return result;
+		return {};
 	}
-	uint32 packedLen = packed.v.size(), unpackedChunk = packedLen, unpackedLen = 0;
+	const auto packedLen = uint32(packed.v.size());
 
-	z_stream stream;
-	stream.zalloc = 0;
-	stream.zfree = 0;
-	stream.opaque = 0;
-	stream.avail_in = 0;
-	stream.next_in = 0;
-	int res = inflateInit2(&stream, 16 + MAX_WBITS);
+	auto stream = z_stream{};
+	const auto res = inflateInit2(&stream, 16 + MAX_WBITS);
 	if (res != Z_OK) {
 		LOG(("RPC Error: could not init zlib stream, code: %1").arg(res));
-		return result;
+		return {};
 	}
+	const auto guard = gsl::finally([&] { inflateEnd(&stream); });
 	stream.avail_in = packedLen;
 	stream.next_in = reinterpret_cast<Bytef*>(packed.v.data());
 
-	stream.avail_out = 0;
-	while (!stream.avail_out) {
-		result.resize(result.size() + unpackedChunk);
-		stream.avail_out = unpackedChunk * sizeof(mtpPrime);
-		stream.next_out = (Bytef*)&result[result.size() - unpackedChunk];
-		int res = inflate(&stream, Z_NO_FLUSH);
+	auto result = mtpBuffer();
+	while (true) {
+		const auto unpackedLength = int(
+			result.size() * sizeof(mtpPrime));
+		if (unpackedLength >= sizeLimit) {
+			auto extra = Bytef();
+			stream.avail_out = 1;
+			stream.next_out = &extra;
+			const auto res = inflate(&stream, Z_NO_FLUSH);
+			if (res == Z_STREAM_END && stream.avail_out == 1) {
+				stream.avail_out = 0;
+				break;
+			}
+			LOG(("RPC Error: unpacked gzip data exceeds %1 bytes."
+				).arg(kMaxUnpackedMessageLength));
+			return {};
+		}
+		const auto chunkSize = std::min(
+			kUnpackedChunkSize,
+			sizeLimit - unpackedLength);
+		const auto oldSize = result.size();
+		result.resize(oldSize + chunkSize / sizeof(mtpPrime));
+		stream.avail_out = static_cast<uInt>(chunkSize);
+		stream.next_out = reinterpret_cast<Bytef*>(result.data() + oldSize);
+		const auto res = inflate(&stream, Z_NO_FLUSH);
 		if (res != Z_OK && res != Z_STREAM_END) {
-			inflateEnd(&stream);
 			LOG(("RPC Error: could not unpack gziped data, code: %1").arg(res));
-			DEBUG_LOG(("RPC Error: bad gzip: %1").arg(Logs::mb(packed.v.constData(), packedLen).str()));
-			return mtpBuffer();
+			return {};
+		} else if (res == Z_STREAM_END) {
+			break;
+		} else if (stream.avail_out) {
+			LOG(("RPC Error: incomplete gzip data."));
+			return {};
 		}
 	}
 	if (stream.avail_out & 0x03) {
-		uint32 badSize = result.size() * sizeof(mtpPrime) - stream.avail_out;
+		const auto badSize = result.size() * sizeof(mtpPrime)
+			- stream.avail_out;
 		LOG(("RPC Error: bad length of unpacked data %1").arg(badSize));
-		DEBUG_LOG(("RPC Error: bad unpacked data %1").arg(Logs::mb(result.data(), badSize).str()));
-		return mtpBuffer();
+		return {};
 	}
 	result.resize(result.size() - (stream.avail_out >> 2));
-	inflateEnd(&stream);
 	if (!result.size()) {
 		LOG(("RPC Error: bad length of unpacked data 0"));
 	}
@@ -2046,7 +2164,7 @@ void SessionPrivate::correctUnixtimeByFastRequest(
 		locker.unlock();
 
 		SyncTimeRequestDuration = duration;
-		base::unixtime::update(serverTime, true);
+		base::unixtime::update(serverTime);
 		return;
 	}
 }
@@ -2057,8 +2175,6 @@ void SessionPrivate::correctUnixtimeWithBadLocal(TimeId serverTime) {
 }
 
 void SessionPrivate::requestsAcked(const QVector<MTPlong> &ids, bool byResponse) {
-	uint32 idsCount = ids.size();
-
 	DEBUG_LOG(("Message Info: requests acked, ids %1").arg(LogIdsVector(ids)));
 
 	QVector<MTPlong> toAckMore;
@@ -2175,7 +2291,7 @@ void SessionPrivate::handleMsgsStates(const QVector<MTPlong> &ids, const QByteAr
 		}
 		if ((state & 0x07) != 0x04) { // was received
 			DEBUG_LOG(("Message Info: state was received for msgId %1, state %2, resending in container").arg(requestMsgId).arg((int32)state));
-			resend(requestMsgId, 10, true);
+			resend(requestMsgId, 10);
 		} else {
 			DEBUG_LOG(("Message Info: state was received for msgId %1, state %2, ack").arg(requestMsgId).arg((int32)state));
 			acked.push_back(MTP_long(requestMsgId));
@@ -2193,10 +2309,7 @@ void SessionPrivate::clearSpecialMsgId(mtpMsgId msgId) {
 	}
 }
 
-void SessionPrivate::resend(
-		mtpMsgId msgId,
-		crl::time msCanWait,
-		bool forceContainer) {
+void SessionPrivate::resend(mtpMsgId msgId, crl::time msCanWait) {
 	const auto guard = gsl::finally([&] {
 		clearSpecialMsgId(msgId);
 		if (msCanWait >= 0) {
@@ -2210,7 +2323,7 @@ void SessionPrivate::resend(
 		_sentContainers.erase(i);
 
 		for (const auto innerMsgId : ids) {
-			resend(innerMsgId, -1, true);
+			resend(innerMsgId, -1);
 		}
 		return;
 	}
@@ -2225,7 +2338,7 @@ void SessionPrivate::resend(
 	lock.unlock();
 
 	request->lastSentTime = crl::now();
-	request->forceSendInContainer = forceContainer;
+	request->forceSendInContainer = true;
 	_resendingIds.emplace(msgId, request->requestId);
 	{
 		QWriteLocker locker(_sessionData->toSendMutex());
@@ -2541,7 +2654,7 @@ void SessionPrivate::authKeyChecked() {
 		resendAll();
 	} // else receive salt in bad_server_salt first, then try to send all the requests
 
-	_pingIdToSend = openssl::RandomValue<uint64>(); // get server_salt
+	_pingIdToSend = base::RandomValue<uint64>(); // get server_salt
 	_sessionData->queueNeedToResumeAndSend();
 }
 
@@ -2552,9 +2665,13 @@ void SessionPrivate::onError(
 		LOG(("Protocol Error: -429 flood code returned!"));
 	} else if (errorCode == -444) {
 		LOG(("Protocol Error: -444 bad dc_id code returned!"));
-		InvokeQueued(_instance, [instance = _instance] {
-			instance->badConfigurationError();
-		});
+		const auto &proxy = _options->proxy;
+		if (proxy.type == ProxyData::Type::Mtproto
+			|| proxy.type == ProxyData::Type::Web) {
+			InvokeQueued(_instance, [instance = _instance, proxy] {
+				instance->badConfigurationError(proxy);
+			});
+		}
 	}
 	removeTestConnection(connection);
 
@@ -2595,12 +2712,7 @@ void SessionPrivate::destroyTemporaryKey() {
 bool SessionPrivate::sendSecureRequest(
 		SerializedRequest &&request,
 		bool needAnyResponse) {
-#ifdef TDESKTOP_MTPROTO_OLD
-	const auto oldPadding = true;
-#else // TDESKTOP_MTPROTO_OLD
-	const auto oldPadding = false;
-#endif // TDESKTOP_MTPROTO_OLD
-	request.addPadding(_connection->requiresExtendedPadding(), oldPadding);
+	request.addPadding(false);
 
 	uint32 fullSize = request->size();
 	if (fullSize < 9) {
@@ -2618,31 +2730,11 @@ bool SessionPrivate::sendSecureRequest(
 	auto from = request->constData() + 4;
 	MTP_LOG(_shiftedDcId, ("Send: ")
 		+ DumpToText(from, from + messageSize)
-		+ QString(" (protocolDcId:%1,key:%2)"
-		).arg(getProtocolDcId()
-		).arg(_encryptionKey->keyId()));
+		+ QString(" (dc:%1,key:%2,session:%3)"
+		).arg(AbstractConnection::ProtocolDcDebugId(getProtocolDcId())
+		).arg(_encryptionKey->keyId()
+		).arg(_sessionId));
 
-#ifdef TDESKTOP_MTPROTO_OLD
-	uint32 padding = fullSize - 4 - messageSize;
-
-	uchar encryptedSHA[20];
-	MTPint128 &msgKey(*(MTPint128*)(encryptedSHA + 4));
-	hashSha1(
-		request->constData(),
-		(fullSize - padding) * sizeof(mtpPrime),
-		encryptedSHA);
-
-	auto packet = _connection->prepareSecurePacket(_keyId, msgKey, fullSize);
-	const auto prefix = packet.size();
-	packet.resize(prefix + fullSize);
-
-	aesIgeEncrypt_oldmtp(
-		request->constData(),
-		&packet[prefix],
-		fullSize * sizeof(mtpPrime),
-		_encryptionKey,
-		msgKey);
-#else // TDESKTOP_MTPROTO_OLD
 	uchar encryptedSHA256[32];
 	MTPint128 &msgKey(*(MTPint128*)(encryptedSHA256 + 8));
 
@@ -2662,7 +2754,6 @@ bool SessionPrivate::sendSecureRequest(
 		fullSize * sizeof(mtpPrime),
 		_encryptionKey,
 		msgKey);
-#endif // TDESKTOP_MTPROTO_OLD
 
 	DEBUG_LOG(("MTP Info: sending request, size: %1, num: %2, time: %3").arg(fullSize + 6).arg((*request)[4]).arg((*request)[5]));
 

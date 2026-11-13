@@ -7,13 +7,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "mtproto/config_loader.h"
 
-#include "base/openssl_help.h"
+#include "base/random.h"
 #include "mtproto/special_config_request.h"
 #include "mtproto/facade.h"
 #include "mtproto/mtproto_dc_options.h"
 #include "mtproto/mtproto_config.h"
 #include "mtproto/mtp_instance.h"
-#include "facades.h"
 
 namespace MTP {
 namespace details {
@@ -28,9 +27,11 @@ ConfigLoader::ConfigLoader(
 	not_null<Instance*> instance,
 	const QString &phone,
 	Fn<void(const MTPConfig &result)> onDone,
-	FailHandler onFail)
+	FailHandler onFail,
+	bool proxyEnabled)
 : _instance(instance)
 , _phone(phone)
+, _proxyEnabled(proxyEnabled)
 , _doneHandler(onDone)
 , _failHandler(onFail) {
 	_enumDCTimer.setCallback([this] { enumerate(); });
@@ -115,7 +116,7 @@ void ConfigLoader::enumerate() {
 }
 
 void ConfigLoader::refreshSpecialLoader() {
-	if (Global::ProxySettings() == ProxyData::Settings::Enabled) {
+	if (_proxyEnabled || _instance->isKeysDestroyer()) {
 		_specialLoader.reset();
 		return;
 	}
@@ -135,6 +136,7 @@ void ConfigLoader::setPhone(const QString &phone) {
 }
 
 void ConfigLoader::createSpecialLoader() {
+	const auto testMode = _instance->isTestMode();
 	_triedSpecialEndpoints.clear();
 	_specialLoader = std::make_unique<SpecialConfigRequest>([=](
 			DcId dcId,
@@ -146,7 +148,7 @@ void ConfigLoader::createSpecialLoader() {
 		} else {
 			addSpecialEndpoint(dcId, ip, port, secret);
 		}
-	}, _instance->configValues().txtDomainString, _phone);
+	}, testMode, _instance->configValues().txtDomainString, _phone);
 }
 
 void ConfigLoader::addSpecialEndpoint(
@@ -174,7 +176,7 @@ void ConfigLoader::addSpecialEndpoint(
 
 void ConfigLoader::sendSpecialRequest() {
 	terminateSpecialRequest();
-	if (Global::ProxySettings() == ProxyData::Settings::Enabled) {
+	if (_proxyEnabled) {
 		_specialLoader.reset();
 		return;
 	}
@@ -184,8 +186,7 @@ void ConfigLoader::sendSpecialRequest() {
 	}
 
 	const auto weak = base::make_weak(this);
-	const auto index = openssl::RandomValue<uint32>()
-		% _specialEndpoints.size();
+	const auto index = base::RandomValue<uint32>() % _specialEndpoints.size();
 	const auto endpoint = _specialEndpoints.begin() + index;
 	_specialEnumCurrent = specialToRealDcId(endpoint->dcId);
 
@@ -231,6 +232,10 @@ void ConfigLoader::specialConfigLoaded(const MTPConfig &result) {
 	// We use special config only for dc options.
 	// For everything else we wait for normal config from main dc.
 	_instance->dcOptions().setFromList(data.vdc_options());
+}
+
+void ConfigLoader::setProxyEnabled(bool value) {
+	_proxyEnabled = value;
 }
 
 } // namespace details

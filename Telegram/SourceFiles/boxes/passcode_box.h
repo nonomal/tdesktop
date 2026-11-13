@@ -7,9 +7,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "boxes/abstract_box.h"
+#include "ui/layers/box_content.h"
 #include "mtproto/sender.h"
 #include "core/core_cloud_password.h"
+
+namespace MTP {
+class Instance;
+} // namespace MTP
 
 namespace Main {
 class Session;
@@ -19,6 +23,7 @@ namespace Ui {
 class InputField;
 class PasswordInput;
 class LinkButton;
+class VerticalLayout;
 } // namespace Ui
 
 namespace Core {
@@ -32,20 +37,46 @@ public:
 	struct CloudFields {
 		static CloudFields From(const Core::CloudPasswordState &current);
 
-		Core::CloudPasswordCheckRequest curRequest;
-		Core::CloudPasswordAlgo newAlgo;
+		struct Mtp {
+			Core::CloudPasswordCheckRequest curRequest;
+			Core::CloudPasswordAlgo newAlgo;
+			Core::SecureSecretAlgo newSecureSecretAlgo;
+		};
+		Mtp mtp;
+		bool hasPassword = false;
 		bool hasRecovery = false;
+		QString fromRecoveryCode;
 		bool notEmptyPassport = false;
 		QString hint;
-		Core::SecureSecretAlgo newSecureSecretAlgo;
 		bool turningOff = false;
+		TimeId pendingResetDate = 0;
 
 		// Check cloud password for some action.
-		Fn<void(const Core::CloudPasswordResult &)> customCheckCallback;
+		using CustomCheck = Fn<void(
+			const Core::CloudPasswordResult &,
+			base::weak_qptr<PasscodeBox>)>;
+		CustomCheck customCheckCallback;
 		rpl::producer<QString> customTitle;
 		std::optional<QString> customDescription;
 		rpl::producer<QString> customSubmitButton;
+		std::shared_ptr<Ui::Show> customShow;
+
+		// Check-only skin: a lottie played once when the box is shown, a
+		// centered title and a gray description stand in for the box title.
+		struct CustomHeader {
+			QString lottie;
+			int lottieSize = 0;
+			style::margins lottieMargin;
+			rpl::producer<QString> title;
+			rpl::producer<QString> description;
+		};
+		std::optional<CustomHeader> customHeader;
 	};
+	PasscodeBox(
+		QWidget*,
+		not_null<MTP::Instance*> mtp,
+		Main::Session *session,
+		const CloudFields &fields);
 	PasscodeBox(
 		QWidget*,
 		not_null<Main::Session*> session,
@@ -55,11 +86,15 @@ public:
 	rpl::producer<> passwordReloadNeeded() const;
 	rpl::producer<> clearUnconfirmedPassword() const;
 
+	rpl::producer<MTPauth_Authorization> newAuthorization() const;
+
 	bool handleCustomCheckError(const MTP::Error &error);
+	bool handleCustomCheckError(const QString &type);
 
 protected:
 	void prepare() override;
 	void setInnerFocus() override;
+	void showFinished() override;
 
 	void paintEvent(QPaintEvent *e) override;
 	void resizeEvent(QResizeEvent *e) override;
@@ -68,11 +103,11 @@ private:
 	using CheckPasswordCallback = Fn<void(
 		const Core::CloudPasswordResult &check)>;
 
+	void setupHeader(CloudFields::CustomHeader &header);
 	void submit();
 	void closeReplacedBy();
 	void oldChanged();
 	void newChanged();
-	void emailChanged();
 	void save(bool force = false);
 	void badOldPasscode();
 	void recoverByEmail();
@@ -81,7 +116,10 @@ private:
 	bool onlyCheckCurrent() const;
 
 	void setPasswordDone(const QByteArray &newPasswordBytes);
-	void setPasswordFail(const MTP::Error &error);
+	void recoverPasswordDone(
+		const QByteArray &newPasswordBytes,
+		const MTPauth_Authorization &result);
+	void setPasswordFail(const QString &type);
 	void setPasswordFail(
 		const QByteArray &newPasswordBytes,
 		const QString &email,
@@ -129,12 +167,13 @@ private:
 	void passwordChecked();
 	void serverError();
 
-	const not_null<Main::Session*> _session;
+	Main::Session *_session = nullptr;
 	MTP::Sender _api;
+	const int _textWidth;
 
 	QString _pattern;
 
-	QPointer<Ui::BoxContent> _replacedBy;
+	base::weak_qptr<Ui::BoxContent> _replacedBy;
 	bool _turningOff = false;
 	bool _cloudPwd = false;
 	CloudFields _cloudFields;
@@ -149,16 +188,22 @@ private:
 
 	Ui::Text::String _about, _hintText;
 
+	object_ptr<Ui::VerticalLayout> _header = { nullptr };
+	Fn<void()> _headerAnimate;
+	int _headerHeight = 0;
+
 	object_ptr<Ui::PasswordInput> _oldPasscode;
 	object_ptr<Ui::PasswordInput> _newPasscode;
 	object_ptr<Ui::PasswordInput> _reenterPasscode;
 	object_ptr<Ui::InputField> _passwordHint;
 	object_ptr<Ui::InputField> _recoverEmail;
 	object_ptr<Ui::LinkButton> _recover;
+	bool _showRecoverLink = false;
 
 	QString _oldError, _newError, _emailError;
 
 	rpl::event_stream<QByteArray> _newPasswordSet;
+	rpl::event_stream<MTPauth_Authorization> _newAuthorization;
 	rpl::event_stream<> _passwordReloadNeeded;
 	rpl::event_stream<> _clearUnconfirmedPassword;
 
@@ -168,12 +213,14 @@ class RecoverBox final : public Ui::BoxContent {
 public:
 	RecoverBox(
 		QWidget*,
-		not_null<Main::Session*> session,
+		not_null<MTP::Instance*> mtp,
+		Main::Session *session,
 		const QString &pattern,
-		bool notEmptyPassport);
+		const PasscodeBox::CloudFields &fields,
+		Fn<void()> closeParent = nullptr);
 
-	rpl::producer<> passwordCleared() const;
-	rpl::producer<> recoveryExpired() const;
+	[[nodiscard]] rpl::producer<QByteArray> newPasswordSet() const;
+	[[nodiscard]] rpl::producer<> recoveryExpired() const;
 
 	//void reloadPassword();
 	//void recoveryExpired();
@@ -188,20 +235,27 @@ protected:
 private:
 	void submit();
 	void codeChanged();
-	void codeSubmitDone(const MTPauth_Authorization &result);
-	void codeSubmitFail(const MTP::Error &error);
+	void proceedToClear();
+	void proceedToChange(const QString &code);
+	void checkSubmitFail(const MTP::Error &error);
+	void setError(const QString &error);
+	void updateHeight();
 
+	Main::Session *_session = nullptr;
 	MTP::Sender _api;
+	const int _textWidth;
 	mtpRequestId _submitRequest = 0;
 
-	QString _pattern;
-	bool _notEmptyPassport = false;
+	PasscodeBox::CloudFields _cloudFields;
 
 	object_ptr<Ui::InputField> _recoverCode;
+	object_ptr<Ui::LinkButton> _noEmailAccess;
+	object_ptr<Ui::FlatLabel> _patternLabel;
+	Fn<void()> _closeParent;
 
 	QString _error;
 
-	rpl::event_stream<> _passwordCleared;
+	rpl::event_stream<QByteArray> _newPasswordSet;
 	rpl::event_stream<> _recoveryExpired;
 
 };
@@ -216,6 +270,7 @@ struct RecoveryEmailValidation {
 	const QString &pattern);
 
 [[nodiscard]] object_ptr<Ui::GenericBox> PrePasswordErrorBox(
-	const MTP::Error &error,
+	const QString &error,
 	not_null<Main::Session*> session,
-	TextWithEntities &&about);
+	TextWithEntities &&about,
+	std::shared_ptr<Ui::Show> show = nullptr);

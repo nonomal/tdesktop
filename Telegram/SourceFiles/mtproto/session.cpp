@@ -10,9 +10,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/details/mtproto_dcenter.h"
 #include "mtproto/session_private.h"
 #include "mtproto/mtproto_auth_key.h"
+#include "core/application.h"
+#include "core/core_settings.h"
 #include "base/unixtime.h"
-#include "base/openssl_help.h"
-#include "facades.h"
+#include "test/test_l10n_seams.h"
 
 namespace MTP {
 namespace details {
@@ -162,7 +163,6 @@ Session::Session(
 , _data(std::make_shared<SessionData>(this))
 , _thread(thread)
 , _sender([=] { needToResumeAndSend(); }) {
-	_timeouter.callEach(1000);
 	refreshOptions();
 	watchDcKeyChanges();
 	watchDcOptionsChanges();
@@ -181,7 +181,7 @@ void Session::watchDcKeyChanges() {
 	_instance->dcTemporaryKeyChanged(
 	) | rpl::filter([=](DcId dcId) {
 		return (dcId == _shiftedDcId) || (dcId == BareDcId(_shiftedDcId));
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		DEBUG_LOG(("AuthKey Info: dcTemporaryKeyChanged in Session %1"
 			).arg(_shiftedDcId));
 		if (const auto captured = _private) {
@@ -198,22 +198,21 @@ void Session::watchDcOptionsChanges() {
 	_instance->dcOptions().changed(
 	) | rpl::filter([=](DcId dcId) {
 		return (BareDcId(_shiftedDcId) == dcId) && (_private != nullptr);
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		InvokeQueued(_private, [captured = _private] {
 			captured->dcOptionsChanged();
 		});
 	}, _lifetime);
 
-	if (_instance->dcOptions().dcType(_shiftedDcId) == DcType::Cdn) {
-		_instance->dcOptions().cdnConfigChanged(
-		) | rpl::filter([=] {
-			return (_private != nullptr);
-		}) | rpl::start_with_next([=] {
-			InvokeQueued(_private, [captured = _private] {
-				captured->cdnConfigChanged();
-			});
-		}, _lifetime);
-	}
+	_instance->dcOptions().cdnConfigChanged(
+	) | rpl::filter([=] {
+		return (_private != nullptr)
+			&& (_instance->dcOptions().dcType(_shiftedDcId) == DcType::Cdn);
+	}) | rpl::on_next([=] {
+		InvokeQueued(_private, [captured = _private] {
+			captured->cdnConfigChanged();
+		});
+	}, _lifetime);
 }
 
 void Session::start() {
@@ -239,22 +238,20 @@ void Session::restart() {
 }
 
 void Session::refreshOptions() {
-	const auto &proxy = Global::SelectedProxy();
-	const auto proxyType =
-		(Global::ProxySettings() == ProxyData::Settings::Enabled
-			? proxy.type
-			: ProxyData::Type::None);
+	const auto &settings = Core::App().settings().proxy();
+	const auto &proxy = settings.selected();
+	const auto isEnabled = settings.isEnabled();
+	const auto proxyType = (isEnabled ? proxy.type : ProxyData::Type::None);
 	const auto useTcp = (proxyType != ProxyData::Type::Http);
-	const auto useHttp = (proxyType != ProxyData::Type::Mtproto);
+	const auto useHttp = (proxyType != ProxyData::Type::Mtproto)
+		&& (proxyType != ProxyData::Type::Web);
 	const auto useIPv4 = true;
-	const auto useIPv6 = Global::TryIPv6();
+	const auto useIPv6 = settings.tryIPv6();
 	_data->setOptions(SessionOptions(
 		_instance->systemLangCode(),
 		_instance->cloudLangCode(),
 		_instance->langPackName(),
-		(Global::ProxySettings() == ProxyData::Settings::Enabled
-			? proxy
-			: ProxyData()),
+		(isEnabled ? proxy : ProxyData()),
 		useIPv4,
 		useIPv6,
 		useHttp,
@@ -262,8 +259,12 @@ void Session::refreshOptions() {
 }
 
 void Session::reInitConnection() {
-	_dc->setConnectionInited(false);
+	setConnectionNotInited();
 	restart();
+}
+
+void Session::setConnectionNotInited() {
+	_dc->setConnectionInited(false);
 }
 
 void Session::stop() {
@@ -400,12 +401,10 @@ int32 Session::getState() const {
 
 	if (_private) {
 		const auto s = _private->getState();
-		if (s == ConnectedState) {
+		if (s == ConnectedState
+			|| s == ConnectingState
+			|| s == DisconnectedState) {
 			return s;
-		} else if (s == ConnectingState || s == DisconnectedState) {
-			if (result < 0) {
-				return s;
-			}
 		} else if (s < 0) {
 			if (result < 0 && s > result) {
 				result = s;
@@ -425,6 +424,9 @@ QString Session::transport() const {
 void Session::sendPrepared(
 		const SerializedRequest &request,
 		crl::time msCanWait) {
+	if (Test::HoldRequest(_instance, request)) {
+		return;
+	}
 	DEBUG_LOG(("MTP Info: adding request to toSendMap, msCanWait %1"
 		).arg(msCanWait));
 	{
@@ -558,13 +560,22 @@ void Session::tryToReceive() {
 		if (messages.empty()) {
 			break;
 		}
+		const auto guard = QPointer<Session>(this);
+		const auto instance = QPointer<Instance>(_instance);
+		const auto main = (_shiftedDcId == BareDcId(_shiftedDcId));
 		for (const auto &message : messages) {
 			if (message.requestId) {
-				_instance->processCallback(message);
-			} else if (_shiftedDcId == BareDcId(_shiftedDcId)) {
+				instance->processCallback(message);
+			} else if (main) {
 				// Process updates only in main session.
-				_instance->processUpdate(message);
+				instance->processUpdate(message);
 			}
+			if (!instance) {
+				return;
+			}
+		}
+		if (!guard) {
+			break;
 		}
 	}
 }

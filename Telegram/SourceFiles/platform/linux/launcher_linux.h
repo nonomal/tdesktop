@@ -15,9 +15,15 @@ class Launcher : public Core::Launcher {
 public:
 	Launcher(int argc, char *argv[]);
 
+	int exec() override;
+
 private:
-	void initHook() override;
 	bool launchUpdater(UpdaterLaunch action) override;
+	bool installProtectedUpdate();
+	bool relaunchAfterUpdate(bool installed);
+
+	bool _updating = false;
+	bool _updateFailed = false;
 
 };
 

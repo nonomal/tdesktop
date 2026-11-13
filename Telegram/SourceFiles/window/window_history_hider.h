@@ -10,39 +10,23 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/rp_widget.h"
 #include "ui/effects/animations.h"
 
+namespace Data {
+class Thread;
+} // namespace Data
+
 namespace Ui {
 class RoundButton;
 } // namespace Ui
 
 namespace Window {
 
-class HistoryHider : public Ui::RpWidget, private base::Subscriber {
+class HistoryHider final : public Ui::RpWidget {
 public:
-	// Forward messages (via drag-n-drop)
-	HistoryHider(QWidget *parent, MessageIdsList &&items);
-
-	// Send path from command line argument.
-	HistoryHider(QWidget *parent);
-
-	// Share url.
-	HistoryHider(QWidget *parent, const QString &url, const QString &text);
-
-	// Inline switch button handler.
-	HistoryHider(QWidget *parent, const QString &botAndQuery);
-
-	HistoryHider(
-		QWidget *parent,
-		const QString &text,
-		Fn<bool(PeerId)> confirm);
-
-	void offerPeer(PeerId peer);
+	HistoryHider(QWidget *parent, const QString &text);
+	~HistoryHider();
 
 	void startHide();
-	void confirm();
-	rpl::producer<> confirmed() const;
-	rpl::producer<> hidden() const;
-
-	~HistoryHider();
+	[[nodiscard]] rpl::producer<> hidden() const;
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -56,7 +40,6 @@ private:
 	void animationCallback();
 
 	QString _text;
-	Fn<bool(PeerId)> _confirm;
 	Ui::Animations::Simple _a_opacity;
 
 	QRect _box;
@@ -64,7 +47,6 @@ private:
 
 	int _chooseWidth = 0;
 
-	rpl::event_stream<> _confirmed;
 	rpl::event_stream<> _hidden;
 
 };

@@ -10,84 +10,34 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/platform_main_window.h"
 #include "base/unique_qptr.h"
 
+class QMenuBar;
+
 namespace Ui {
 class PopupMenu;
 } // namespace Ui
-
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-class QTemporaryFile;
-class DBusMenuExporter;
-class StatusNotifierItem;
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 
 namespace Platform {
 
 class MainWindow : public Window::MainWindow {
 public:
 	explicit MainWindow(not_null<Window::Controller*> controller);
-
-	virtual QImage iconWithCounter(
-		int size,
-		int count,
-		style::color bg,
-		style::color fg,
-		bool smallIcon) = 0;
-
-	void psShowTrayMenu();
-
-	bool trayAvailable() {
-		return _sniAvailable || QSystemTrayIcon::isSystemTrayAvailable();
-	}
-
-	bool isActiveForTrayMenu() override;
-
 	~MainWindow();
 
+	void updateWindowIcon() override;
+
 protected:
-	void initHook() override;
+	bool eventFilter(QObject *obj, QEvent *evt) override;
+
 	void unreadCounterChangedHook() override;
 	void updateGlobalMenuHook() override;
-	void handleVisibleChangedHook(bool visible) override;
 
-	void initTrayMenuHook() override;
-	bool hasTrayIcon() const override;
-
-	void workmodeUpdated(DBIWorkMode mode) override;
+	void workmodeUpdated(Core::Settings::WorkMode mode) override;
 	void createGlobalMenu() override;
 
-	QSystemTrayIcon *trayIcon = nullptr;
-	QMenu *trayIconMenu = nullptr;
-
-	void psTrayMenuUpdated();
-	void psSetupTrayIcon();
-
-	virtual void placeSmallCounter(
-		QImage &img,
-		int size,
-		int count,
-		style::color bg,
-		const QPoint &shift,
-		style::color color) = 0;
-
 private:
-	class Private;
-	const std::unique_ptr<Private> _private;
-	bool _sniAvailable = false;
-	base::unique_qptr<Ui::PopupMenu> _trayIconMenuXEmbed;
+	void updateUnityCounter();
 
-	void updateIconCounters();
-
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	StatusNotifierItem *_sniTrayIcon = nullptr;
-	uint _sniRegisteredSignalId = 0;
-	uint _sniWatcherId = 0;
-	uint _appMenuWatcherId = 0;
-	std::unique_ptr<QTemporaryFile> _trayIconFile;
-
-	bool _appMenuSupported = false;
-	DBusMenuExporter *_mainMenuExporter = nullptr;
-
-	QMenu *psMainMenu = nullptr;
+	QMenuBar *psMainMenu = nullptr;
 	QAction *psLogout = nullptr;
 	QAction *psUndo = nullptr;
 	QAction *psRedo = nullptr;
@@ -105,39 +55,19 @@ private:
 	QAction *psItalic = nullptr;
 	QAction *psUnderline = nullptr;
 	QAction *psStrikeOut = nullptr;
+	QAction *psBlockquote = nullptr;
 	QAction *psMonospace = nullptr;
 	QAction *psClearFormat = nullptr;
 
-	void setSNITrayIcon(int counter, bool muted);
-	void attachToSNITrayIcon();
-	void handleSNIHostRegistered();
-
-	void handleSNIOwnerChanged(
-		const QString &service,
-		const QString &oldOwner,
-		const QString &newOwner);
-
-	void handleAppMenuOwnerChanged(
-		const QString &service,
-		const QString &oldOwner,
-		const QString &newOwner);
-
-	void psLinuxUndo();
-	void psLinuxRedo();
-	void psLinuxCut();
-	void psLinuxCopy();
-	void psLinuxPaste();
-	void psLinuxDelete();
-	void psLinuxSelectAll();
-
-	void psLinuxBold();
-	void psLinuxItalic();
-	void psLinuxUnderline();
-	void psLinuxStrikeOut();
-	void psLinuxMonospace();
-	void psLinuxClearFormat();
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
+	bool _exposed = false;
 
 };
+
+[[nodiscard]] int32 ScreenNameChecksum(const QString &name);
+[[nodiscard]] int32 ScreenNameChecksum(const QScreen *screen);
+
+[[nodiscard]] QString ScreenDisplayLabel(const QScreen *screen);
+
+[[nodiscard]] QRect ScreenAvailableGeometry(const QScreen *screen);
 
 } // namespace Platform

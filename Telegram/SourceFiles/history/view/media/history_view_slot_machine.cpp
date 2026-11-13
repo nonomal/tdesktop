@@ -14,7 +14,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_item_components.h"
 #include "history/view/history_view_element.h"
 #include "main/main_session.h"
-#include "styles/style_chat.h"
 
 namespace HistoryView {
 namespace {
@@ -37,7 +36,7 @@ const auto &kEmoji = ::Stickers::DicePacks::kSlotString;
 [[nodiscard]] DocumentData *Lookup(
 		not_null<Element*> view,
 		int value) {
-	const auto &session = view->data()->history()->session();
+	const auto &session = view->history()->session();
 	return session.diceStickersPacks().lookup(kEmoji, value);
 }
 
@@ -99,7 +98,8 @@ void SlotMachine::resolve(
 	if (!document) {
 		return;
 	}
-	sticker.emplace(_parent, document);
+	const auto skipPremiumEffect = false;
+	sticker.emplace(_parent, document, skipPremiumEffect);
 	sticker->setDiceIndex(kEmoji, singleTimeIndex);
 	if (initSize) {
 		sticker->initSize();
@@ -138,17 +138,18 @@ bool SlotMachine::isEndResolved() const {
 	return _end[0].has_value() || (_dice->value() != kWinValue);
 }
 
-QSize SlotMachine::size() {
-	return _pull
-		? _pull->size()
-		: Sticker::GetAnimatedEmojiSize(&_parent->history()->session());
+QSize SlotMachine::countOptimalSize() {
+	return _pull ? _pull->countOptimalSize() : Sticker::EmojiSize();
 }
 
 ClickHandlerPtr SlotMachine::link() {
 	return _link;
 }
 
-void SlotMachine::draw(Painter &p, const QRect &r, bool selected) {
+void SlotMachine::draw(
+		Painter &p,
+		const PaintContext &context,
+		const QRect &r) {
 	resolveStarts(true);
 	resolveEnds(_dice->value());
 
@@ -159,16 +160,16 @@ void SlotMachine::draw(Painter &p, const QRect &r, bool selected) {
 	//	}
 	//}
 	auto switchedToEnd = _drawingEnd;
-	const auto pullReady = _pull && _pull->readyToDrawLottie();
+	const auto pullReady = _pull && _pull->readyToDrawAnimationFrame();
 	const auto paintReady = [&] {
 		auto result = pullReady;
 		auto allPlayedEnough = true;
 		for (auto i = 1; i != 4; ++i) {
-			if (!_end[i] || !_end[i]->readyToDrawLottie()) {
+			if (!_end[i] || !_end[i]->readyToDrawAnimationFrame()) {
 				switchedToEnd[i] = false;
 			}
 			if (!switchedToEnd[i]
-				&& (!_start[i] || !_start[i]->readyToDrawLottie())) {
+				&& (!_start[i] || !_start[i]->readyToDrawAnimationFrame())) {
 				result = false;
 			}
 			const auto playedTillFrame = !switchedToEnd[i]
@@ -178,11 +179,13 @@ void SlotMachine::draw(Painter &p, const QRect &r, bool selected) {
 				allPlayedEnough = false;
 			}
 		}
-		if (!_end[0] || !_end[0]->readyToDrawLottie() || !allPlayedEnough) {
+		if (!_end[0]
+			|| !_end[0]->readyToDrawAnimationFrame()
+			|| !allPlayedEnough) {
 			switchedToEnd[0] = false;
 		}
 		if (ranges::contains(switchedToEnd, false)
-			&& (!_start[0] || !_start[0]->readyToDrawLottie())) {
+			&& (!_start[0] || !_start[0]->readyToDrawAnimationFrame())) {
 			result = false;
 		}
 		return result;
@@ -194,17 +197,17 @@ void SlotMachine::draw(Painter &p, const QRect &r, bool selected) {
 
 	for (auto i = 0; i != 4; ++i) {
 		if (switchedToEnd[i]) {
-			_end[i]->draw(p, r, selected);
+			_end[i]->draw(p, context, r);
 		} else {
-			_start[i]->draw(p, r, selected);
+			_start[i]->draw(p, context, r);
 			if (_end[i]
-				&& _end[i]->readyToDrawLottie()
+				&& _end[i]->readyToDrawAnimationFrame()
 				&& _start[i]->atTheEnd()) {
 				_drawingEnd[i] = true;
 			}
 		}
 	}
-	_pull->draw(p, r, selected);
+	_pull->draw(p, context, r);
 }
 
 } // namespace HistoryView

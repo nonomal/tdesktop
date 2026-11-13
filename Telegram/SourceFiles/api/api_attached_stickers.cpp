@@ -8,7 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_attached_stickers.h"
 
 #include "apiwrap.h"
-#include "boxes/confirm_box.h"
+#include "ui/boxes/confirm_box.h"
 #include "boxes/sticker_set_box.h"
 #include "boxes/stickers_box.h"
 #include "data/data_document.h"
@@ -25,7 +25,7 @@ AttachedStickers::AttachedStickers(not_null<ApiWrap*> api)
 void AttachedStickers::request(
 		not_null<Window::SessionController*> controller,
 		MTPmessages_GetAttachedStickers &&mtpRequest) {
-	const auto weak = base::make_weak(controller.get());
+	const auto weak = base::make_weak(controller);
 	_api.request(_requestId).cancel();
 	_requestId = _api.request(
 		std::move(mtpRequest)
@@ -36,28 +36,38 @@ void AttachedStickers::request(
 			return;
 		}
 		if (result.v.isEmpty()) {
-			Ui::show(Box<InformBox>(tr::lng_stickers_not_found(tr::now)));
+			strongController->show(
+				Ui::MakeInformBox(tr::lng_stickers_not_found()));
 			return;
 		} else if (result.v.size() > 1) {
-			Ui::show(Box<StickersBox>(strongController, result));
+			strongController->show(
+				Box<StickersBox>(strongController->uiShow(), result.v));
 			return;
 		}
 		// Single attached sticker pack.
-		const auto setData = result.v.front().match([&](const auto &data) {
-			return data.vset().match([&](const MTPDstickerSet &data) {
-				return &data;
-			});
+		const auto data = result.v.front().match([&](const auto &data) {
+			return &data.vset().data();
 		});
 
-		const auto setId = (setData->vid().v && setData->vaccess_hash().v)
-			? MTP_inputStickerSetID(setData->vid(), setData->vaccess_hash())
-			: MTP_inputStickerSetShortName(setData->vshort_name());
-		Ui::show(
-			Box<StickerSetBox>(strongController, setId),
-			Ui::LayerOption::KeepOther);
-	}).fail([=](const MTP::Error &error) {
+		const auto setId = (data->vid().v && data->vaccess_hash().v)
+			? StickerSetIdentifier{
+				.id = data->vid().v,
+				.accessHash = data->vaccess_hash().v }
+			: StickerSetIdentifier{ .shortName = qs(data->vshort_name()) };
+		strongController->show(Box<StickerSetBox>(
+			strongController->uiShow(),
+			setId,
+			(data->is_emojis()
+				? Data::StickersType::Emoji
+				: data->is_masks()
+				? Data::StickersType::Masks
+				: Data::StickersType::Stickers)));
+	}).fail([=] {
 		_requestId = 0;
-		Ui::show(Box<InformBox>(tr::lng_stickers_not_found(tr::now)));
+		if (const auto strongController = weak.get()) {
+			strongController->show(
+				Ui::MakeInformBox(tr::lng_stickers_not_found()));
+		}
 	}).send();
 }
 

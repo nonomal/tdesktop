@@ -21,8 +21,11 @@ public:
 	SlotMachine(not_null<Element*> parent, not_null<Data::MediaDice*> dice);
 	~SlotMachine();
 
-	QSize size() override;
-	void draw(Painter &p, const QRect &r, bool selected) override;
+	QSize countOptimalSize() override;
+	void draw(
+		Painter &p,
+		const PaintContext &context,
+		const QRect &r) override;
 
 	ClickHandlerPtr link() override;
 
@@ -50,9 +53,6 @@ public:
 				_end[i]->unloadHeavyPart();
 			}
 		}
-	}
-	bool hidesForwardedInfo() override {
-		return false;
 	}
 
 private:

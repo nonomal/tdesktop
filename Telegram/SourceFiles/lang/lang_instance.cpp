@@ -10,17 +10,20 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "core/application.h"
 #include "storage/serialize_common.h"
 #include "storage/localstorage.h"
-#include "boxes/confirm_box.h"
+#include "ui/boxes/confirm_box.h"
 #include "lang/lang_file_parser.h"
+#include "lang/lang_tag.h" // kTextCommandLangTag.
 #include "base/platform/base_platform_info.h"
 #include "base/qthelp_regex.h"
+#include "test/test_l10n_seams.h"
+
+#include "lang_auto_counts.h" // kKeysCount, kTagsCount.
 
 namespace Lang {
 namespace {
 
-const auto kSerializeVersionTag = qsl("#new");
+const auto kSerializeVersionTag = u"#new"_q;
 constexpr auto kSerializeVersion = 1;
-constexpr auto kDefaultLanguage = "en"_cs;
 constexpr auto kCloudLangPackName = "tdesktop"_cs;
 constexpr auto kCustomLanguage = "#custom"_cs;
 constexpr auto kLangValuesLimit = 20000;
@@ -101,7 +104,7 @@ bool ValueParser::readTag() {
 	auto isTagChar = [](QChar ch) {
 		if (ch >= 'a' && ch <= 'z') {
 			return true;
-		} else if (ch >= 'A' && ch <= 'z') {
+		} else if (ch >= 'A' && ch <= 'Z') {
 			return true;
 		} else if (ch >= '0' && ch <= '9') {
 			return true;
@@ -133,8 +136,8 @@ bool ValueParser::readTag() {
 	_tagsUsed.insert(_currentTagIndex);
 
 	if (_currentTagReplacer.isEmpty()) {
-		_currentTagReplacer = QString(4, TextCommand);
-		_currentTagReplacer[1] = TextCommandLangTag;
+		_currentTagReplacer = QString(4, QChar(kTextCommand));
+		_currentTagReplacer[1] = QChar(kTextCommandLangTag);
 	}
 	_currentTagReplacer[2] = QChar(0x0020 + _currentTagIndex);
 
@@ -168,8 +171,10 @@ QString PrepareTestValue(const QString &current, QChar filler) {
 	auto result = QString(size + 1, filler);
 	auto inCommand = false;
 	for (auto i = 0; i != size; ++i) {
-		auto ch = current[i];
-		auto newInCommand = (ch.unicode() == TextCommand) ? (!inCommand) : inCommand;
+		const auto ch = current[i];
+		const auto newInCommand = (ch.unicode() == kTextCommand)
+			? (!inCommand)
+			: inCommand;
 		if (inCommand || newInCommand || ch.isSpace()) {
 			result[i + 1] = ch;
 		}
@@ -212,14 +217,6 @@ void ParseKeyValue(
 
 } // namespace
 
-QString DefaultLanguageId() {
-	return kDefaultLanguage.utf16();
-}
-
-QString LanguageIdOrDefault(const QString &id) {
-	return !id.isEmpty() ? id : DefaultLanguageId();
-}
-
 QString CloudLangPackName() {
 	return kCloudLangPackName.utf16();
 }
@@ -230,11 +227,11 @@ QString CustomLanguageId() {
 
 Language DefaultLanguage() {
 	return Language{
-		qsl("en"),
+		u"en"_q,
 		QString(),
 		QString(),
-		qsl("English"),
-		qsl("English"),
+		u"English"_q,
+		u"English"_q,
 	};
 }
 
@@ -253,7 +250,7 @@ Instance::Instance(not_null<Instance*> derived, const PrivateTag &)
 
 void Instance::switchToId(const Language &data) {
 	reset(data);
-	if (_id == qstr("#TEST_X") || _id == qstr("#TEST_0")) {
+	if (_id == u"#TEST_X"_q || _id == u"#TEST_0"_q) {
 		for (auto &value : _values) {
 			value = PrepareTestValue(value, _id[5]);
 		}
@@ -303,6 +300,7 @@ void Instance::reset(const Language &data) {
 		_values[i] = GetOriginalValue(ushort(i));
 	}
 	ranges::fill(_nonDefaultSet, 0);
+	updateChoosingStickerReplacement();
 
 	_idChanges.fire_copy(_id);
 }
@@ -363,8 +361,8 @@ QString Instance::id(Pack pack) const {
 
 bool Instance::isCustom() const {
 	return (_id == CustomLanguageId())
-		|| (_id == qstr("#TEST_X"))
-		|| (_id == qstr("#TEST_0"));
+		|| (_id == u"#TEST_X"_q)
+		|| (_id == u"#TEST_0"_q);
 }
 
 int Instance::version(Pack pack) const {
@@ -548,6 +546,7 @@ void Instance::fillFromSerialized(
 		applyValue(nonDefaultStrings[i], nonDefaultStrings[i + 1]);
 	}
 	updatePluralRules();
+	updateChoosingStickerReplacement();
 
 	_idChanges.fire_copy(_id);
 }
@@ -572,6 +571,7 @@ void Instance::fillFromCustomContent(
 	_pluralId = PluralCodeForCustom(absolutePath, relativePath);
 	_name = _nativeName = QString();
 	loadFromCustomContent(absolutePath, relativePath, content);
+	updateChoosingStickerReplacement();
 
 	_idChanges.fire_copy(_id);
 }
@@ -600,6 +600,35 @@ bool Instance::loadFromCustomFile(const QString &filePath) {
 		return true;
 	}
 	return false;
+}
+
+void Instance::updateChoosingStickerReplacement() {
+	// A language changing in the runtime is not supported.
+	const auto replacement = kChoosingStickerReplacement.utf8();
+	const auto phrase = tr::lng_send_action_choose_sticker(tr::now);
+	const auto first = phrase.indexOf(replacement);
+	const auto support = (first != -1);
+	const auto phraseNamed = tr::lng_user_action_choose_sticker(
+		tr::now,
+		lt_user,
+		QString());
+	const auto firstNamed = phraseNamed.indexOf(replacement);
+	const auto supportNamed = (firstNamed != -1);
+
+	_choosingStickerReplacement.support = (supportNamed && support);
+	_choosingStickerReplacement.rightIndex = phrase.size() - first;
+	_choosingStickerReplacement.rightIndexNamed = phraseNamed.size()
+		- firstNamed;
+}
+
+bool Instance::supportChoosingStickerReplacement() const {
+	return _choosingStickerReplacement.support;
+}
+
+int Instance::rightIndexChoosingStickerReplacement(bool named) const {
+	return named
+		? _choosingStickerReplacement.rightIndexNamed
+		: _choosingStickerReplacement.rightIndex;
 }
 
 // SetCallback takes two QByteArrays: key, value.
@@ -709,6 +738,14 @@ void Instance::applyValue(const QByteArray &key, const QByteArray &value) {
 		} else if (!_derived->_nonDefaultSet[key]) {
 			_derived->_values[key] = std::move(value);
 		}
+		if (key == tr::lng_send_action_choose_sticker.base
+			|| key == tr::lng_user_action_choose_sticker.base) {
+			if (!_derived) {
+				updateChoosingStickerReplacement();
+			} else {
+				_derived->updateChoosingStickerReplacement();
+			}
+		}
 	});
 }
 
@@ -739,6 +776,14 @@ void Instance::resetValue(const QByteArray &key) {
 		} else if (!_derived->_nonDefaultSet[keyIndex]) {
 			_derived->_values[keyIndex] = GetOriginalValue(keyIndex);
 		}
+		if (keyIndex == tr::lng_send_action_choose_sticker.base
+			|| keyIndex == tr::lng_user_action_choose_sticker.base) {
+			if (!_derived) {
+				updateChoosingStickerReplacement();
+			} else {
+				_derived->updateChoosingStickerReplacement();
+			}
+		}
 	}
 }
 
@@ -761,6 +806,7 @@ QString GetNonDefaultValue(const QByteArray &key) {
 namespace details {
 
 QString Current(ushort key) {
+	Test::NoteLangRead(key);
 	return GetInstance().getValue(key);
 }
 

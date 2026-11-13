@@ -7,17 +7,26 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "window/themes/window_themes_embedded.h"
 
-#include "window/themes/window_theme.h"
+#include "base/platform/base_platform_info.h"
+#include "lang/lang_keys.h"
 #include "storage/serialize_common.h"
 #include "core/application.h"
 #include "core/core_settings.h"
+#include "data/data_wall_paper.h"
+#include "ui/chat/chat_theme.h"
+#include "ui/style/style_palette_colorizer.h"
+#include "window/themes/window_theme.h"
+
+#include <QtGui/QGuiApplication>
+#include <QtGui/QPalette>
 
 namespace Window {
 namespace Theme {
 namespace {
 
-constexpr auto kMaxAccentColors = 3;
-constexpr auto kEnoughLightnessForContrast = 64;
+constexpr auto kMaxAccentColors = 4;
+constexpr auto kDayBaseFile = ":/gui/day-custom-base.tdesktop-theme"_cs;
+constexpr auto kNightBaseFile = ":/gui/night-custom-base.tdesktop-theme"_cs;
 
 const auto kColorizeIgnoredKeys = base::flat_set<QLatin1String>{ {
 	qstr("boxTextFgGood"),
@@ -47,6 +56,14 @@ const auto kColorizeIgnoredKeys = base::flat_set<QLatin1String>{ {
 	qstr("historyPeer8NameFg"),
 	qstr("historyPeer8NameFgSelected"),
 	qstr("historyPeer8UserpicBg"),
+	qstr("historyPeer1UserpicBg2"),
+	qstr("historyPeer2UserpicBg2"),
+	qstr("historyPeer3UserpicBg2"),
+	qstr("historyPeer4UserpicBg2"),
+	qstr("historyPeer5UserpicBg2"),
+	qstr("historyPeer6UserpicBg2"),
+	qstr("historyPeer7UserpicBg2"),
+	qstr("historyPeer8UserpicBg2"),
 	qstr("msgFile1Bg"),
 	qstr("msgFile1BgDark"),
 	qstr("msgFile1BgOver"),
@@ -67,57 +84,156 @@ const auto kColorizeIgnoredKeys = base::flat_set<QLatin1String>{ {
 	qstr("mediaviewFileYellowCornerFg"),
 	qstr("mediaviewFileGreenCornerFg"),
 	qstr("mediaviewFileBlueCornerFg"),
+	qstr("settingsIconBg1"),
+	qstr("settingsIconBg2"),
+	qstr("settingsIconBg3"),
+	qstr("settingsIconBg4"),
+	qstr("settingsIconBg5"),
+	qstr("settingsIconBg6"),
+	qstr("settingsIconBg8"),
+	qstr("settingsIconBgArchive"),
+	qstr("premiumButtonBg1"),
+	qstr("premiumButtonBg2"),
+	qstr("premiumButtonBg3"),
+	qstr("premiumIconBg1"),
+	qstr("premiumIconBg2"),
 } };
 
-QColor qColor(std::string_view hex) {
-	Expects(hex.size() == 6);
-
-	const auto component = [](char a, char b) {
-		const auto convert = [](char ch) {
-			Expects((ch >= '0' && ch <= '9')
-				|| (ch >= 'A' && ch <= 'F')
-				|| (ch >= 'a' && ch <= 'f'));
-
-			return (ch >= '0' && ch <= '9')
-				? int(ch - '0')
-				: int(ch - ((ch >= 'A' && ch <= 'F') ? 'A' : 'a') + 10);
-		};
-		return convert(a) * 16 + convert(b);
-	};
-
-	return QColor(
-		component(hex[0], hex[1]),
-		component(hex[2], hex[3]),
-		component(hex[4], hex[5]));
+// Mirrors kMustBeContrast of the codegen style generator, in its order.
+const auto kContrastPairs = std::array{
+	std::pair(qstr("dialogsMenuIconFg"), qstr("dialogsBg")),
+	std::pair(qstr("windowBoldFg"), qstr("windowBg")),
 };
 
-Colorizer::Color cColor(std::string_view hex) {
-	const auto q = qColor(hex);
+enum class SlotStatus {
+	Initial,
+	Created,
+	Loaded,
+};
+
+struct SlotSource {
+	SlotStatus status = SlotStatus::Initial;
+	int leaf = -1;
+};
+
+struct SourceLeaf {
+	QLatin1String rule;
+	QColor raw;
+	bool dependent = false;
+};
+
+struct PaletteDefault {
+	QLatin1String name;
+	QColor raw;
+	int fallback = -1;
+};
+
+style::colorizer::Color cColor(std::string_view hex) {
+	const auto q = style::ColorFromHex(hex);
 	auto hue = int();
 	auto saturation = int();
 	auto value = int();
 	q.getHsv(&hue, &saturation, &value);
-	return Colorizer::Color{ hue, saturation, value };
+	return style::colorizer::Color{ hue, saturation, value };
+}
+
+[[nodiscard]] EmbeddedScheme EmbeddedSchemeOf(EmbeddedType type) {
+	const auto embedded = EmbeddedThemes();
+	const auto i = ranges::find(embedded, type, &EmbeddedScheme::type);
+	Assert(i != end(embedded));
+	return *i;
+}
+
+[[nodiscard]] int HexDigit(char ch) {
+	return (ch >= '0' && ch <= '9')
+		? (ch - '0')
+		: (ch >= 'a' && ch <= 'f')
+		? (ch - 'a' + 10)
+		: (ch >= 'A' && ch <= 'F')
+		? (ch - 'A' + 10)
+		: -1;
+}
+
+[[nodiscard]] bool IsHexValue(QLatin1String value) {
+	return (value.size() == 7 || value.size() == 9)
+		&& (value.data()[0] == '#');
+}
+
+[[nodiscard]] std::optional<QColor> ParseHexValue(QLatin1String value) {
+	auto parts = std::array<int, 4>{ 0, 0, 0, 255 };
+	for (auto i = 0; 2 * i + 1 < value.size(); ++i) {
+		const auto high = HexDigit(value.data()[2 * i + 1]);
+		const auto low = HexDigit(value.data()[2 * i + 2]);
+		if (high < 0 || low < 0) {
+			return std::nullopt;
+		}
+		parts[i] = high * 16 + low;
+	}
+	return QColor(parts[0], parts[1], parts[2], parts[3]);
+}
+
+[[nodiscard]] std::vector<PaletteDefault> PaletteDefaults() {
+	using style::internal::GetPaletteIndex;
+
+	auto result = std::vector<PaletteDefault>(style::palette::kCount);
+	result[0].raw = QColor(255, 255, 255, 0);
+	result[1].raw = QColor(255, 255, 255, 255);
+	for (const auto &row : style::main_palette::data()) {
+		const auto index = GetPaletteIndex(row.name);
+		Assert(index > 1);
+		auto &entry = result[index];
+		entry.name = row.name;
+		if (IsHexValue(row.value)) {
+			const auto raw = ParseHexValue(row.value);
+			Assert(raw.has_value());
+			entry.raw = *raw;
+			entry.fallback = row.fallback.isEmpty()
+				? -1
+				: GetPaletteIndex(row.fallback);
+		} else {
+			entry.fallback = GetPaletteIndex(row.value);
+			Assert(entry.fallback > 1 && entry.fallback < index);
+			entry.raw = result[entry.fallback].raw;
+		}
+	}
+	return result;
+}
+
+[[nodiscard]] bool FollowsAccent(
+		const style::colorizer &colorizer,
+		QLatin1String rule,
+		const QColor &raw) {
+	if (colorizer.ignoreKeys.contains(rule)) {
+		return false;
+	} else if (colorizer.keepContrast.contains(rule)) {
+		return true;
+	}
+	auto hue = 0;
+	auto saturation = 0;
+	auto value = 0;
+	raw.getHsv(&hue, &saturation, &value);
+	return std::abs(hue - colorizer.was.hue) < colorizer.hueThreshold;
 }
 
 } // namespace
 
-Colorizer ColorizerFrom(const EmbeddedScheme &scheme, const QColor &color) {
-	using Color = Colorizer::Color;
+style::colorizer ColorizerFrom(
+		const EmbeddedScheme &scheme,
+		const QColor &color) {
+	using Color = style::colorizer::Color;
 	using Pair = std::pair<Color, Color>;
 
-	auto result = Colorizer();
+	auto result = style::colorizer();
 	result.ignoreKeys = kColorizeIgnoredKeys;
 	result.hueThreshold = 15;
 	scheme.accentColor.getHsv(
 		&result.was.hue,
 		&result.was.saturation,
 		&result.was.value);
-	color.getHsv(
-		&result.now.hue,
-		&result.now.saturation,
-		&result.now.value);
 	switch (scheme.type) {
+	case EmbeddedType::Default:
+		result.lightnessMax = 160;
+		break;
 	case EmbeddedType::DayBlue:
 		result.lightnessMax = 160;
 		break;
@@ -151,26 +267,44 @@ Colorizer ColorizerFrom(const EmbeddedScheme &scheme, const QColor &color) {
 		result.lightnessMin = 64;
 		break;
 	}
+	ApplyColorizerAccent(result, color);
+	return result;
+}
+
+void ApplyColorizerAccent(style::colorizer &colorizer, const QColor &color) {
+	color.getHsv(
+		&colorizer.now.hue,
+		&colorizer.now.saturation,
+		&colorizer.now.value);
 	const auto nowLightness = color.lightness();
 	const auto limitedLightness = std::clamp(
 		nowLightness,
-		result.lightnessMin,
-		result.lightnessMax);
+		colorizer.lightnessMin,
+		colorizer.lightnessMax);
 	if (limitedLightness != nowLightness) {
 		QColor::fromHsl(
 			color.hslHue(),
 			color.hslSaturation(),
 			limitedLightness).getHsv(
-				&result.now.hue,
-				&result.now.saturation,
-				&result.now.value);
+				&colorizer.now.hue,
+				&colorizer.now.saturation,
+				&colorizer.now.value);
 	}
-	return result;
 }
 
-Colorizer ColorizerForTheme(const QString &absolutePath) {
-	if (absolutePath.isEmpty() || !IsEmbeddedTheme(absolutePath)) {
-		return Colorizer();
+std::optional<QColor> SystemAccentColor() {
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+	if (Platform::IsWindows() && Platform::IsWindows8OrGreater()) {
+		return std::nullopt;
+	}
+#endif // Qt < 6.0.0
+	const auto accent = QPalette().color(QPalette::Highlight);
+	return accent.isValid() ? std::make_optional(accent) : std::nullopt;
+}
+
+style::colorizer ColorizerForTheme(const QString &absolutePath) {
+	if (!IsEmbeddedTheme(absolutePath)) {
+		return {};
 	}
 	const auto schemes = EmbeddedThemes();
 	const auto i = ranges::find(
@@ -178,150 +312,22 @@ Colorizer ColorizerForTheme(const QString &absolutePath) {
 		absolutePath,
 		&EmbeddedScheme::path);
 	if (i == end(schemes)) {
-		return Colorizer();
+		return {};
 	}
-	const auto &colors = Core::App().settings().themesAccentColors();
+	const auto &settings = Core::App().settings();
+	if (settings.systemAccentColorEnabled()) {
+		if (const auto accent = SystemAccentColor()) {
+			return ColorizerFrom(*i, *accent);
+		}
+	}
+	const auto &colors = settings.themesAccentColors();
 	if (const auto accent = colors.get(i->type)) {
 		return ColorizerFrom(*i, *accent);
 	}
-	return Colorizer();
+	return {};
 }
 
-[[nodiscard]] std::optional<Colorizer::Color> Colorize(
-		const Colorizer::Color &color,
-		const Colorizer &colorizer) {
-	const auto changeColor = std::abs(color.hue - colorizer.was.hue)
-		< colorizer.hueThreshold;
-	if (!changeColor) {
-		return std::nullopt;
-	}
-	const auto nowHue = color.hue + (colorizer.now.hue - colorizer.was.hue);
-	const auto nowSaturation = ((color.saturation > colorizer.was.saturation)
-		&& (colorizer.now.saturation > colorizer.was.saturation))
-		? (((colorizer.now.saturation * (255 - colorizer.was.saturation))
-			+ ((color.saturation - colorizer.was.saturation)
-				* (255 - colorizer.now.saturation)))
-			/ (255 - colorizer.was.saturation))
-		: ((color.saturation != colorizer.was.saturation)
-			&& (colorizer.was.saturation != 0))
-		? ((color.saturation * colorizer.now.saturation)
-			/ colorizer.was.saturation)
-		: colorizer.now.saturation;
-	const auto nowValue = (color.value > colorizer.was.value)
-		? (((colorizer.now.value * (255 - colorizer.was.value))
-			+ ((color.value - colorizer.was.value)
-				* (255 - colorizer.now.value)))
-			/ (255 - colorizer.was.value))
-		: (color.value < colorizer.was.value)
-		? ((color.value * colorizer.now.value)
-			/ colorizer.was.value)
-		: colorizer.now.value;
-	return Colorizer::Color{
-		((nowHue + 360) % 360),
-		nowSaturation,
-		nowValue
-	};
-}
-
-[[nodiscard]] std::optional<QColor> Colorize(
-		const QColor &color,
-		const Colorizer &colorizer) {
-	auto hue = 0;
-	auto saturation = 0;
-	auto lightness = 0;
-	color.getHsv(&hue, &saturation, &lightness);
-	const auto result = Colorize(
-		Colorizer::Color{ hue, saturation, lightness },
-		colorizer);
-	if (!result) {
-		return std::nullopt;
-	}
-	const auto &fields = *result;
-	return QColor::fromHsv(fields.hue, fields.saturation, fields.value);
-}
-
-void FillColorizeResult(uchar &r, uchar &g, uchar &b, const QColor &color) {
-	auto nowR = 0;
-	auto nowG = 0;
-	auto nowB = 0;
-	color.getRgb(&nowR, &nowG, &nowB);
-	r = uchar(nowR);
-	g = uchar(nowG);
-	b = uchar(nowB);
-}
-
-void Colorize(uchar &r, uchar &g, uchar &b, const Colorizer &colorizer) {
-	const auto changed = Colorize(QColor(int(r), int(g), int(b)), colorizer);
-	if (changed) {
-		FillColorizeResult(r, g, b, *changed);
-	}
-}
-
-void Colorize(
-		QLatin1String name,
-		uchar &r,
-		uchar &g,
-		uchar &b,
-		const Colorizer &colorizer) {
-	if (colorizer.ignoreKeys.contains(name)) {
-		return;
-	}
-
-	const auto i = colorizer.keepContrast.find(name);
-	if (i == end(colorizer.keepContrast)) {
-		Colorize(r, g, b, colorizer);
-		return;
-	}
-	const auto check = i->second.first;
-	const auto rgb = QColor(int(r), int(g), int(b));
-	const auto changed = Colorize(rgb, colorizer);
-	const auto checked = Colorize(check, colorizer).value_or(check);
-	const auto lightness = [](QColor hsv) {
-		return hsv.value() - (hsv.value() * hsv.saturation()) / 511;
-	};
-	const auto changedLightness = lightness(changed.value_or(rgb).toHsv());
-	const auto checkedLightness = lightness(
-		QColor::fromHsv(checked.hue, checked.saturation, checked.value));
-	const auto delta = std::abs(changedLightness - checkedLightness);
-	if (delta >= kEnoughLightnessForContrast) {
-		if (changed) {
-			FillColorizeResult(r, g, b, *changed);
-		}
-		return;
-	}
-	const auto replace = i->second.second;
-	const auto result = Colorize(replace, colorizer).value_or(replace);
-	FillColorizeResult(
-		r,
-		g,
-		b,
-		QColor::fromHsv(result.hue, result.saturation, result.value));
-}
-
-void Colorize(uint32 &pixel, const Colorizer &colorizer) {
-	const auto chars = reinterpret_cast<uchar*>(&pixel);
-	Colorize(
-		chars[2],
-		chars[1],
-		chars[0],
-		colorizer);
-}
-
-void Colorize(QImage &image, const Colorizer &colorizer) {
-	image = std::move(image).convertToFormat(QImage::Format_ARGB32);
-	const auto bytes = image.bits();
-	const auto bytesPerLine = image.bytesPerLine();
-	for (auto line = 0; line != image.height(); ++line) {
-		const auto ints = reinterpret_cast<uint32*>(
-			bytes + line * bytesPerLine);
-		const auto end = ints + image.width();
-		for (auto p = ints; p != end; ++p) {
-			Colorize(*p, colorizer);
-		}
-	}
-}
-
-void Colorize(EmbeddedScheme &scheme, const Colorizer &colorizer) {
+void Colorize(EmbeddedScheme &scheme, const style::colorizer &colorizer) {
 	const auto colors = {
 		&EmbeddedScheme::background,
 		&EmbeddedScheme::sent,
@@ -330,45 +336,19 @@ void Colorize(EmbeddedScheme &scheme, const Colorizer &colorizer) {
 		&EmbeddedScheme::radiobuttonInactive
 	};
 	for (const auto color : colors) {
-		if (const auto changed = Colorize(scheme.*color, colorizer)) {
+		if (const auto changed = style::colorize(scheme.*color, colorizer)) {
 			scheme.*color = changed->toRgb();
 		}
 	}
 }
 
-QByteArray Colorize(
-		QLatin1String hexColor,
-		const Colorizer &colorizer) {
-	Expects(hexColor.size() == 7 || hexColor.size() == 9);
-
-	auto color = qColor(std::string_view(hexColor.data() + 1, 6));
-	const auto changed = Colorize(color, colorizer).value_or(color).toRgb();
-
-	auto result = QByteArray();
-	result.reserve(hexColor.size());
-	result.append(hexColor.data()[0]);
-	const auto addHex = [&](int code) {
-		if (code >= 0 && code < 10) {
-			result.append('0' + code);
-		} else if (code >= 10 && code < 16) {
-			result.append('a' + (code - 10));
-		}
-	};
-	const auto addValue = [&](int code) {
-		addHex(code / 16);
-		addHex(code % 16);
-	};
-	addValue(changed.red());
-	addValue(changed.green());
-	addValue(changed.blue());
-	if (hexColor.size() == 9) {
-		result.append(hexColor.data()[7]);
-		result.append(hexColor.data()[8]);
-	}
-	return result;
-}
-
 std::vector<EmbeddedScheme> EmbeddedThemes() {
+	const auto qColor = [](auto hex) {
+		return style::ColorFromHex(hex);
+	};
+	const auto name = [](auto key) {
+		return rpl::deferred([=] { return key(); });
+	};
 	return {
 		EmbeddedScheme{
 			EmbeddedType::Default,
@@ -377,8 +357,9 @@ std::vector<EmbeddedScheme> EmbeddedThemes() {
 			qColor("ffffff"),
 			qColor("eaffdc"),
 			qColor("ffffff"),
-			tr::lng_settings_theme_classic,
-			QString()
+			name(tr::lng_settings_theme_classic),
+			QString(),
+			qColor("40a7e3")
 		},
 		EmbeddedScheme{
 			EmbeddedType::DayBlue,
@@ -387,7 +368,7 @@ std::vector<EmbeddedScheme> EmbeddedThemes() {
 			qColor("ffffff"),
 			qColor("d7f0ff"),
 			qColor("ffffff"),
-			tr::lng_settings_theme_day,
+			name(tr::lng_settings_theme_day),
 			":/gui/day-blue.tdesktop-theme",
 			qColor("40a7e3")
 		},
@@ -398,7 +379,7 @@ std::vector<EmbeddedScheme> EmbeddedThemes() {
 			qColor("6b808d"),
 			qColor("6b808d"),
 			qColor("5ca7d4"),
-			tr::lng_settings_theme_tinted,
+			name(tr::lng_settings_theme_tinted),
 			":/gui/night.tdesktop-theme",
 			qColor("5288c1")
 		},
@@ -409,7 +390,7 @@ std::vector<EmbeddedScheme> EmbeddedThemes() {
 			qColor("6b808d"),
 			qColor("6b808d"),
 			qColor("75bfb5"),
-			tr::lng_settings_theme_night,
+			name(tr::lng_settings_theme_night),
 			":/gui/night-green.tdesktop-theme",
 			qColor("3fc1b0")
 		},
@@ -417,6 +398,9 @@ std::vector<EmbeddedScheme> EmbeddedThemes() {
 }
 
 std::vector<QColor> DefaultAccentColors(EmbeddedType type) {
+	const auto qColor = [](auto hex) {
+		return style::ColorFromHex(hex);
+	};
 	switch (type) {
 	case EmbeddedType::DayBlue:
 		return {
@@ -430,7 +414,16 @@ std::vector<QColor> DefaultAccentColors(EmbeddedType type) {
 			qColor("dea922"),
 		};
 	case EmbeddedType::Default:
-		return {};
+		return {
+			qColor("45bce7"),
+			qColor("52b440"),
+			qColor("d46c99"),
+			qColor("df8a49"),
+			qColor("9978c8"),
+			qColor("c55245"),
+			qColor("687b98"),
+			qColor("dea922"),
+		};
 	case EmbeddedType::Night:
 		return {
 			qColor("58bfe8"),
@@ -455,6 +448,257 @@ std::vector<QColor> DefaultAccentColors(EmbeddedType type) {
 		};
 	}
 	Unexpected("Type in Window::Theme::AccentColors.");
+}
+
+Fn<void(style::palette&)> PreparePaletteCallback(
+		bool dark,
+		std::optional<QColor> accent) {
+	return [=](style::palette &palette) {
+		using namespace Theme;
+		const auto &embedded = EmbeddedThemes();
+		const auto i = ranges::find(
+			embedded,
+			dark ? EmbeddedType::Night : EmbeddedType::Default,
+			&EmbeddedScheme::type);
+		Assert(i != end(embedded));
+		const auto colorizer = accent
+			? ColorizerFrom(*i, *accent)
+			: style::colorizer();
+
+		auto instance = Instance();
+		const auto loaded = LoadFromFile(
+			(dark ? kNightBaseFile : kDayBaseFile).utf16(),
+			&instance,
+			nullptr,
+			nullptr,
+			colorizer);
+		Assert(loaded);
+		palette.finalize();
+		palette = instance.palette;
+	};
+}
+
+Fn<void(style::palette&)> PrepareCurrentPaletteCallback() {
+	return [=, data = style::main_palette::save()](style::palette &palette) {
+		palette.load(data);
+	};
+}
+
+std::unique_ptr<style::palette> PrepareEmbeddedPalette(
+		EmbeddedType type,
+		std::optional<QColor> accent) {
+	const auto embedded = EmbeddedThemes();
+	const auto i = ranges::find(embedded, type, &EmbeddedScheme::type);
+	Assert(i != end(embedded));
+	const auto colorizer = accent
+		? ColorizerFrom(*i, *accent)
+		: style::colorizer();
+
+	auto result = std::make_unique<style::palette>();
+	if (i->path.isEmpty()) {
+		result->reset(colorizer);
+		return result;
+	}
+	auto instance = Instance();
+	const auto loaded = LoadFromFile(
+		i->path,
+		&instance,
+		nullptr,
+		nullptr,
+		colorizer);
+	Assert(loaded);
+	result->finalize();
+	*result = instance.palette;
+	return result;
+}
+
+EmbeddedAccentRecipe::EmbeddedAccentRecipe(EmbeddedType type)
+: _scheme(EmbeddedSchemeOf(type)) {
+	using style::internal::GetPaletteIndex;
+
+	const auto colorizer = ColorizerFrom(_scheme, _scheme.accentColor);
+	const auto defaults = PaletteDefaults();
+	auto leaves = std::vector<SourceLeaf>();
+	auto slots = std::vector<SlotSource>(style::palette::kCount);
+	const auto add = [&](int index, QLatin1String rule, const QColor &raw) {
+		slots[index].leaf = int(leaves.size());
+		leaves.push_back({
+			.rule = rule,
+			.raw = raw,
+			.dependent = (index > 0) && FollowsAccent(colorizer, rule, raw),
+		});
+	};
+	if (!_scheme.path.isEmpty()) {
+		const auto content = ReadPaletteContent(_scheme.path);
+		Assert(content.has_value());
+		auto unsupported = QMap<QLatin1String, QLatin1String>();
+		const auto read = ReadPaletteValues(*content, [&](
+				QLatin1String name,
+				QLatin1String value) {
+			value = unsupported.value(value, value);
+			const auto index = GetPaletteIndex(name);
+			if (IsHexValue(value)) {
+				const auto raw = ParseHexValue(value);
+				if (!raw) {
+					return true;
+				} else if (index < 0) {
+					unsupported.insert(name, value);
+				} else {
+					slots[index].status = SlotStatus::Loaded;
+					add(index, defaults[index].name, *raw);
+				}
+			} else if (index < 0) {
+				unsupported.insert(name, value);
+			} else {
+				const auto from = GetPaletteIndex(value);
+				if (from >= 0 && slots[from].status == SlotStatus::Loaded) {
+					slots[index] = slots[from];
+				}
+			}
+			return true;
+		});
+		Assert(read);
+	}
+	for (auto index = 0; index != style::palette::kCount; ++index) {
+		auto &slot = slots[index];
+		const auto &entry = defaults[index];
+		if (slot.status != SlotStatus::Initial) {
+			continue;
+		} else if (entry.fallback >= 0
+			&& slots[entry.fallback].status == SlotStatus::Loaded) {
+			slot = slots[entry.fallback];
+		} else {
+			slot.status = (!index || colorizer.ignoreKeys.contains(entry.name))
+				? SlotStatus::Created
+				: SlotStatus::Loaded;
+			add(index, entry.name, entry.raw);
+		}
+	}
+
+	auto compact = std::vector<int>(leaves.size(), -1);
+	const auto leafOf = [&](int index) {
+		const auto leaf = slots[index].leaf;
+		if (compact[leaf] < 0 && leaves[leaf].dependent) {
+			compact[leaf] = int(_leaves.size());
+			_leaves.push_back({ leaves[leaf].rule, leaves[leaf].raw });
+		}
+		return compact[leaf];
+	};
+	const auto operand = [&](int index) {
+		const auto leaf = leafOf(index);
+		return (leaf >= 0)
+			? Operand{ .leaf = leaf }
+			: Operand{ .fixed = leaves[slots[index].leaf].raw };
+	};
+	for (const auto &[over, under] : kContrastPairs) {
+		const auto overIndex = GetPaletteIndex(over);
+		const auto underIndex = GetPaletteIndex(under);
+		Assert(overIndex > 1 && underIndex > 1);
+		const auto pair = Contrast{
+			.name = over,
+			.index = overIndex,
+			.over = operand(overIndex),
+			.under = operand(underIndex),
+		};
+		if (pair.over.leaf >= 0 || pair.under.leaf >= 0) {
+			_contrast.push_back(pair);
+		}
+	}
+	for (auto index = 0; index != style::palette::kCount; ++index) {
+		const auto leaf = leafOf(index);
+		if (leaf < 0
+			|| ranges::contains(_contrast, index, &Contrast::index)) {
+			continue;
+		}
+		Assert(index > 1);
+		_keys.push_back({
+			.name = defaults[index].name,
+			.index = index,
+			.leaf = leaf,
+		});
+	}
+}
+
+bool EmbeddedAccentRecipe::apply(
+		style::palette &palette,
+		const QColor &accent) const {
+	const auto colorizer = ColorizerFrom(_scheme, accent);
+	auto values = std::vector<QColor>();
+	values.reserve(_leaves.size());
+	for (const auto &leaf : _leaves) {
+		auto r = uchar(leaf.raw.red());
+		auto g = uchar(leaf.raw.green());
+		auto b = uchar(leaf.raw.blue());
+		style::colorize(leaf.rule, r, g, b, colorizer);
+		values.push_back(QColor(r, g, b, leaf.raw.alpha()));
+	}
+	const auto value = [&](const Operand &operand) {
+		return (operand.leaf >= 0) ? values[operand.leaf] : operand.fixed;
+	};
+	auto written = false;
+	const auto write = [&](QLatin1String name, int index, QColor color) {
+		if (palette.colorAtIndex(index)->c.rgba() != color.rgba()) {
+			palette.setColor(name, color);
+			written = true;
+		}
+	};
+	for (const auto &key : _keys) {
+		write(key.name, key.index, values[key.leaf]);
+	}
+	for (const auto &pair : _contrast) {
+		write(
+			pair.name,
+			pair.index,
+			style::internal::EnsureContrast(
+				value(pair.over),
+				value(pair.under)));
+	}
+	return written;
+}
+
+const EmbeddedAccentRecipe &AccentRecipe(EmbeddedType type) {
+	static auto cache = base::flat_map<
+		EmbeddedType,
+		std::unique_ptr<EmbeddedAccentRecipe>>();
+	const auto i = cache.find(type);
+	if (i != end(cache)) {
+		return *i->second;
+	}
+	return *cache.emplace(
+		type,
+		std::make_unique<EmbeddedAccentRecipe>(type)).first->second;
+}
+
+Ui::ChatThemeBackground PrepareDefaultBackground(bool dark) {
+	if (!dark) {
+		const auto paper = Data::DefaultWallPaper();
+		return Ui::PrepareBackgroundImage({
+			.path = u":/gui/art/background.tgv"_q,
+			.gzipSvg = true,
+			.colors = paper.backgroundColors(),
+			.isPattern = true,
+			.patternOpacity = paper.patternOpacity(),
+			.generateGradient = true,
+			.gradientRotation = paper.gradientRotation(),
+		});
+	}
+	auto instance = Instance();
+	const auto loaded = LoadFromFile(
+		kNightBaseFile.utf16(),
+		&instance,
+		nullptr,
+		nullptr,
+		style::colorizer());
+	Assert(loaded);
+	auto prepared = Ui::PreprocessBackgroundImage(
+		std::move(instance.background));
+	prepared.setDevicePixelRatio(style::DevicePixelRatio());
+	return {
+		.prepared = prepared,
+		.preparedForTiled = Ui::PrepareImageForTiled(prepared),
+		.colorForFill = Ui::CalculateImageMonoColor(prepared),
+		.tile = instance.tiled,
+	};
 }
 
 QByteArray AccentColors::serialize() const {
@@ -503,6 +747,7 @@ bool AccentColors::setFromSerialized(const QByteArray &serialized) {
 		const auto color = Serialize::readColor(stream);
 		const auto uncheckedType = static_cast<EmbeddedType>(type);
 		switch (uncheckedType) {
+		case EmbeddedType::Default:
 		case EmbeddedType::DayBlue:
 		case EmbeddedType::Night:
 		case EmbeddedType::NightGreen:

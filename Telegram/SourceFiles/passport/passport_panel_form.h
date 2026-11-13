@@ -13,11 +13,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 namespace Ui {
 class BoxContentDivider;
 class ScrollArea;
-class FadeShadow;
 class RoundButton;
 class FlatLabel;
 class UserpicButton;
 } // namespace Ui
+
+namespace Passport::Ui {
+using namespace ::Ui;
+class FormRow;
+} // namespace Passport::Ui
 
 namespace Passport {
 
@@ -33,7 +37,7 @@ protected:
 	void resizeEvent(QResizeEvent *e) override;
 
 private:
-	class Row;
+	using Row = Ui::FormRow;
 
 	void setupControls();
 	not_null<Ui::RpWidget*> setupContent();
@@ -42,8 +46,6 @@ private:
 	not_null<PanelController*> _controller;
 
 	object_ptr<Ui::ScrollArea> _scroll;
-	object_ptr<Ui::FadeShadow> _topShadow;
-	object_ptr<Ui::FadeShadow> _bottomShadow;
 	object_ptr<Ui::RoundButton> _submit;
 
 	QPointer<Ui::UserpicButton> _userpic;

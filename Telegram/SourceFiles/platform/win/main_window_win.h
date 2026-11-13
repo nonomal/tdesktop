@@ -8,11 +8,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "platform/platform_main_window.h"
-#include "ui/platform/win/ui_window_shadow_win.h"
-#include "base/platform/win/base_windows_h.h"
 #include "base/flags.h"
 
-#include <QtCore/QTimer>
+#include <windows.h>
 
 namespace Ui {
 class PopupMenu;
@@ -24,110 +22,94 @@ class MainWindow : public Window::MainWindow {
 public:
 	explicit MainWindow(not_null<Window::Controller*> controller);
 
-	void showFromTrayMenu() override;
-
 	HWND psHwnd() const;
-	HMENU psMenu() const;
-
-	void psInitSysMenu();
-	void updateSystemMenu(Qt::WindowState state);
-	void updateCustomMargins();
 
 	void updateWindowIcon() override;
 	bool isActiveForTrayMenu() override;
 
-	void psRefreshTaskbarIcon();
-
-	virtual QImage iconWithCounter(int size, int count, style::color bg, style::color fg, bool smallIcon) = 0;
-
-	[[nodiscard]] static uint32 TaskbarCreatedMsgId();
-	static void TaskbarCreated();
-
 	// Custom shadows.
 	void shadowsActivate();
 	void shadowsDeactivate();
-	void shadowsUpdate(
-		Ui::Platform::WindowShadow::Changes changes,
-		WINDOWPOS *position = nullptr);
-
-	int deltaLeft() const {
-		return _deltaLeft;
-	}
-	int deltaTop() const {
-		return _deltaTop;
-	}
 
 	[[nodiscard]] bool hasTabletView() const;
 
-	void psShowTrayMenu();
+	void destroyedFromSystem();
+
+	bool setDwmThumbnail(QSize size);
+	bool setDwmPreview(QSize size, int radius);
 
 	~MainWindow();
 
 protected:
 	void initHook() override;
-	int32 screenNameChecksum(const QString &name) const override;
 	void unreadCounterChangedHook() override;
 
-	void initShadows() override;
-	void firstShadowsUpdate() override;
-	void stateChangedHook(Qt::WindowState state) override;
+	void workmodeUpdated(Core::Settings::WorkMode mode) override;
 
-	bool hasTrayIcon() const override {
-		return trayIcon;
-	}
+	bool initGeometryFromSystem() override;
 
-	QSystemTrayIcon *trayIcon = nullptr;
-	Ui::PopupMenu *trayIconMenu = nullptr;
-
-	void psTrayMenuUpdated();
-	void psSetupTrayIcon();
-	virtual void placeSmallCounter(QImage &img, int size, int count, style::color bg, const QPoint &shift, style::color color) = 0;
-
-	void showTrayTooltip() override;
-
-	void workmodeUpdated(DBIWorkMode mode) override;
-
-	bool initSizeFromSystem() override;
-
-	QRect computeDesktopRect() const override;
-
-	QTimer psUpdatedPositionTimer;
+	bool nativeEvent(
+		const QByteArray &eventType,
+		void *message,
+		native_event_filter_result *result) override;
 
 private:
 	struct Private;
 
+	class BitmapPointer {
+	public:
+		BitmapPointer(HBITMAP value = nullptr);
+		BitmapPointer(BitmapPointer &&other);
+		BitmapPointer& operator=(BitmapPointer &&other);
+		~BitmapPointer();
+
+		[[nodiscard]] HBITMAP get() const;
+		[[nodiscard]] explicit operator bool() const;
+
+		void release();
+		void reset(HBITMAP value = nullptr);
+
+	private:
+		HBITMAP _value = nullptr;
+
+	};
+
 	void setupNativeWindowFrame();
-	void updateIconCounters();
-	QMargins computeCustomMargins();
+	void setupPreviewPasscodeLock();
+	void updateTaskbarAndIconCounters();
 	void validateWindowTheme(bool native, bool night);
-	void psDestroyIcons();
-	void fixMaximizedWindow();
+
+	void forceIconRefresh();
+	void destroyCachedIcons();
+	void validateDwmPreviewColors();
 
 	const std::unique_ptr<Private> _private;
+	const std::unique_ptr<QWindow> _taskbarHiderWindow;
 
-	std::optional<Ui::Platform::WindowShadow> _shadow;
+	HWND _hWnd = nullptr;
+	HICON _iconBig = nullptr;
+	HICON _iconSmall = nullptr;
+	HICON _iconOverlay = nullptr;
 
-	bool _themeInited = false;
-	bool _inUpdateMargins = false;
-	bool _wasNativeFrame = false;
-	bool _hasActiveFrame = false;
+	BitmapPointer _dwmThumbnail;
+	BitmapPointer _dwmPreview;
+	QSize _dwmThumbnailSize;
+	QSize _dwmPreviewSize;
+	QColor _dwmBackground;
+	int _dwmPreviewRadius = 0;
 
 	// Workarounds for activation from tray icon.
 	crl::time _lastDeactivateTime = 0;
-	rpl::lifetime _showFromTrayLifetime;
 
-	HWND ps_hWnd = nullptr;
-	HWND ps_tbHider_hWnd = nullptr;
-	HMENU ps_menu = nullptr;
-	HICON ps_iconBig = nullptr;
-	HICON ps_iconSmall = nullptr;
-	HICON ps_iconOverlay = nullptr;
-
-	int _deltaLeft = 0;
-	int _deltaTop = 0;
-	int _deltaRight = 0;
-	int _deltaBottom = 0;
+	bool _hasActiveFrame = false;
 
 };
+
+[[nodiscard]] int32 ScreenNameChecksum(const QString &name);
+[[nodiscard]] int32 ScreenNameChecksum(const QScreen *screen);
+
+[[nodiscard]] QString ScreenDisplayLabel(const QScreen *screen);
+
+[[nodiscard]] QRect ScreenAvailableGeometry(const QScreen *screen);
 
 } // namespace Platform

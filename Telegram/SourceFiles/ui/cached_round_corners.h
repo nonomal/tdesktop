@@ -9,65 +9,72 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/rect_part.h"
 
-class Painter;
-
 enum class ImageRoundRadius;
 
 namespace Ui {
 
-enum CachedRoundCorners : int {
-	SmallMaskCorners = 0x00, // for images
-	LargeMaskCorners,
+struct CornersPixmaps {
+	QPixmap p[4];
+};
 
+enum CachedRoundCorners : int {
 	BoxCorners,
 	MenuCorners,
-	BotKbOverCorners,
-	StickerCorners,
-	StickerSelectedCorners,
-	SelectedOverlaySmallCorners,
-	SelectedOverlayLargeCorners,
 	DateCorners,
-	DateSelectedCorners,
 	OverviewVideoCorners,
 	OverviewVideoSelectedCorners,
 	ForwardCorners,
 	MediaviewSaveCorners,
-	EmojiHoverCorners,
 	StickerHoverCorners,
 	BotKeyboardCorners,
-	PhotoSelectOverlayCorners,
 
 	Doc1Corners,
 	Doc2Corners,
 	Doc3Corners,
 	Doc4Corners,
 
-	InShadowCorners, // for photos without bg
-	InSelectedShadowCorners,
-
-	MessageInCorners, // with shadow
-	MessageInSelectedCorners,
-	MessageOutCorners,
-	MessageOutSelectedCorners,
-
 	RoundCornersCount
 };
 
-void FillComplexOverlayRect(Painter &p, QRect rect, ImageRoundRadius radius, RectParts corners);
-void FillComplexLocationRect(Painter &p, QRect rect, ImageRoundRadius radius, RectParts corners);
+void FillRoundRect(QPainter &p, int x, int y, int w, int h, style::color bg, CachedRoundCorners index);
+inline void FillRoundRect(QPainter &p, const QRect &rect, style::color bg, CachedRoundCorners index) {
+	FillRoundRect(p, rect.x(), rect.y(), rect.width(), rect.height(), bg, index);
+}
 
-void FillRoundRect(Painter &p, int32 x, int32 y, int32 w, int32 h, style::color bg, CachedRoundCorners index, const style::color *shadow = nullptr, RectParts parts = RectPart::Full);
-inline void FillRoundRect(Painter &p, const QRect &rect, style::color bg, CachedRoundCorners index, const style::color *shadow = nullptr, RectParts parts = RectPart::Full) {
-	return FillRoundRect(p, rect.x(), rect.y(), rect.width(), rect.height(), bg, index, shadow, parts);
+[[nodiscard]] const CornersPixmaps &CachedCornerPixmaps(CachedRoundCorners index);
+[[nodiscard]] CornersPixmaps PrepareCornerPixmaps(
+	int radius,
+	style::color bg,
+	const style::color *sh = nullptr);
+[[nodiscard]] CornersPixmaps PrepareCornerPixmaps(
+	ImageRoundRadius radius,
+	style::color bg,
+	const style::color *sh = nullptr);
+[[nodiscard]] CornersPixmaps PrepareInvertedCornerPixmaps(
+	int radius,
+	style::color bg);
+void FillRoundRect(QPainter &p, int x, int y, int w, int h, style::color bg, const CornersPixmaps &corners);
+inline void FillRoundRect(QPainter &p, const QRect &rect, style::color bg, const CornersPixmaps &corners) {
+	return FillRoundRect(p, rect.x(), rect.y(), rect.width(), rect.height(), bg, corners);
 }
-void FillRoundShadow(Painter &p, int32 x, int32 y, int32 w, int32 h, style::color shadow, CachedRoundCorners index, RectParts parts = RectPart::Full);
-inline void FillRoundShadow(Painter &p, const QRect &rect, style::color shadow, CachedRoundCorners index, RectParts parts = RectPart::Full) {
-	return FillRoundShadow(p, rect.x(), rect.y(), rect.width(), rect.height(), shadow, index, parts);
+void FillRoundShadow(QPainter &p, int x, int y, int w, int h, style::color shadow, const CornersPixmaps &corners);
+inline void FillRoundShadow(QPainter &p, const QRect &rect, style::color shadow, const CornersPixmaps &corners) {
+	FillRoundShadow(p, rect.x(), rect.y(), rect.width(), rect.height(), shadow, corners);
 }
-void FillRoundRect(Painter &p, int32 x, int32 y, int32 w, int32 h, style::color bg, ImageRoundRadius radius, RectParts parts = RectPart::Full);
-inline void FillRoundRect(Painter &p, const QRect &rect, style::color bg, ImageRoundRadius radius, RectParts parts = RectPart::Full) {
-	return FillRoundRect(p, rect.x(), rect.y(), rect.width(), rect.height(), bg, radius, parts);
-}
+
+enum class CachedCornerRadius {
+	Small,
+	ThumbSmall,
+	ThumbLarge,
+	BubbleSmall,
+	BubbleLarge,
+
+	kCount,
+};
+[[nodiscard]] int CachedCornerRadiusValue(CachedCornerRadius tag);
+
+[[nodiscard]] const std::array<QImage, 4> &CachedCornersMasks(
+	CachedCornerRadius radius);
 
 void StartCachedCorners();
 void FinishCachedCorners();

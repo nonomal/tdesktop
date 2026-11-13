@@ -9,11 +9,23 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "history/history_location_manager.h"
 
+#include <memory>
+
+struct HistoryItemCommonFields;
+
+namespace Data {
+struct SendError;
+} // namespace Data
+
 namespace Main {
 class Session;
 } // namespace Main
 
 class History;
+
+namespace Iv {
+struct RichPage;
+} // namespace Iv
 
 namespace InlineBots {
 
@@ -38,19 +50,11 @@ public:
 
 	virtual bool isValid() const = 0;
 
-	virtual void addToHistory(
+	virtual not_null<HistoryItem*> makeMessage(
 		const Result *owner,
 		not_null<History*> history,
-		MTPDmessage::Flags flags,
-		MTPDmessage_ClientFlags clientFlags,
-		MsgId msgId,
-		PeerId fromId,
-		MTPint mtpDate,
-		UserId viaBotId,
-		MsgId replyToId,
-		const QString &postAuthor,
-		const MTPReplyMarkup &markup) const = 0;
-	virtual QString getErrorOnSend(
+		HistoryItemCommonFields &&fields) const = 0;
+	virtual Data::SendError getErrorOnSend(
 		const Result *owner,
 		not_null<History*> history) const = 0;
 
@@ -75,27 +79,18 @@ class SendDataCommon : public SendData {
 public:
 	using SendData::SendData;
 
-	struct SentMTPMessageFields {
-		MTPString text = MTP_string();
-		MTPVector<MTPMessageEntity> entities = MTP_vector<MTPMessageEntity>();
+	struct SentMessageFields {
+		TextWithEntities text;
 		MTPMessageMedia media = MTP_messageMediaEmpty();
 	};
-	virtual SentMTPMessageFields getSentMessageFields() const = 0;
+	virtual SentMessageFields getSentMessageFields() const = 0;
 
-	void addToHistory(
+	not_null<HistoryItem*> makeMessage(
 		const Result *owner,
 		not_null<History*> history,
-		MTPDmessage::Flags flags,
-		MTPDmessage_ClientFlags clientFlags,
-		MsgId msgId,
-		PeerId fromId,
-		MTPint mtpDate,
-		UserId viaBotId,
-		MsgId replyToId,
-		const QString &postAuthor,
-		const MTPReplyMarkup &markup) const override;
+		HistoryItemCommonFields &&fields) const override;
 
-	QString getErrorOnSend(
+	Data::SendError getErrorOnSend(
 		const Result *owner,
 		not_null<History*> history) const override;
 
@@ -118,11 +113,36 @@ public:
 		return !_message.isEmpty();
 	}
 
-	SentMTPMessageFields getSentMessageFields() const override;
+	SentMessageFields getSentMessageFields() const override;
 
 private:
 	QString _message;
 	EntitiesInText _entities;
+
+};
+
+class SendRichMessage final : public SendData {
+public:
+	SendRichMessage(
+		not_null<Main::Session*> session,
+		const MTPRichMessage &message);
+
+	bool isValid() const override;
+
+	not_null<HistoryItem*> makeMessage(
+		const Result *owner,
+		not_null<History*> history,
+		HistoryItemCommonFields &&fields) const override;
+
+	Data::SendError getErrorOnSend(
+		const Result *owner,
+		not_null<History*> history) const override;
+
+	QString getLayoutDescription(const Result *owner) const override;
+
+private:
+	std::shared_ptr<const Iv::RichPage> _page;
+	TextWithEntities _summary;
 
 };
 
@@ -133,14 +153,32 @@ public:
 		not_null<Main::Session*> session,
 		const MTPDgeoPoint &point)
 	: SendDataCommon(session)
-	, _location(point) {
+	, _location(Data::LocationPoint::FromCoordinates(
+		point.vlat().v,
+		point.vlong().v,
+		point.vaccess_hash().v)) {
+	}
+	SendGeo(
+		not_null<Main::Session*> session,
+		const MTPDgeoPoint &point,
+		int period,
+		std::optional<int> heading,
+		std::optional<int> proximityNotificationRadius)
+	: SendDataCommon(session)
+	, _location(Data::LocationPoint::FromCoordinates(
+		point.vlat().v,
+		point.vlong().v,
+		point.vaccess_hash().v))
+	, _period(period)
+	, _heading(heading)
+	, _proximityNotificationRadius(proximityNotificationRadius){
 	}
 
 	bool isValid() const override {
-		return true;
+		return _location.has_value();
 	}
 
-	SentMTPMessageFields getSentMessageFields() const override;
+	SentMessageFields getSentMessageFields() const override;
 
 	bool hasLocationCoords() const override {
 		return true;
@@ -150,7 +188,10 @@ public:
 	}
 
 private:
-	Data::LocationPoint _location;
+	std::optional<Data::LocationPoint> _location;
+	std::optional<int> _period;
+	std::optional<int> _heading;
+	std::optional<int> _proximityNotificationRadius;
 
 };
 
@@ -165,7 +206,10 @@ public:
 		const QString &title,
 		const QString &address)
 	: SendDataCommon(session)
-	, _location(point)
+	, _location(Data::LocationPoint::FromCoordinates(
+		point.vlat().v,
+		point.vlong().v,
+		point.vaccess_hash().v))
 	, _venueId(venueId)
 	, _provider(provider)
 	, _title(title)
@@ -173,10 +217,10 @@ public:
 	}
 
 	bool isValid() const override {
-		return true;
+		return _location.has_value();
 	}
 
-	SentMTPMessageFields getSentMessageFields() const override;
+	SentMessageFields getSentMessageFields() const override;
 
 	bool hasLocationCoords() const override {
 		return true;
@@ -186,7 +230,7 @@ public:
 	}
 
 private:
-	Data::LocationPoint _location;
+	std::optional<Data::LocationPoint> _location;
 	QString _venueId, _provider, _title, _address;
 
 };
@@ -209,7 +253,7 @@ public:
 		return (!_firstName.isEmpty() || !_lastName.isEmpty()) && !_phoneNumber.isEmpty();
 	}
 
-	SentMTPMessageFields getSentMessageFields() const override;
+	SentMessageFields getSentMessageFields() const override;
 
 	QString getLayoutDescription(const Result *owner) const override;
 
@@ -236,20 +280,12 @@ public:
 		return _photo != nullptr;
 	}
 
-	void addToHistory(
+	not_null<HistoryItem*> makeMessage(
 		const Result *owner,
 		not_null<History*> history,
-		MTPDmessage::Flags flags,
-		MTPDmessage_ClientFlags clientFlags,
-		MsgId msgId,
-		PeerId fromId,
-		MTPint mtpDate,
-		UserId viaBotId,
-		MsgId replyToId,
-		const QString &postAuthor,
-		const MTPReplyMarkup &markup) const override;
+		HistoryItemCommonFields &&fields) const override;
 
-	QString getErrorOnSend(
+	Data::SendError getErrorOnSend(
 		const Result *owner,
 		not_null<History*> history) const override;
 
@@ -278,20 +314,12 @@ public:
 		return _document != nullptr;
 	}
 
-	void addToHistory(
+	not_null<HistoryItem*> makeMessage(
 		const Result *owner,
 		not_null<History*> history,
-		MTPDmessage::Flags flags,
-		MTPDmessage_ClientFlags clientFlags,
-		MsgId msgId,
-		PeerId fromId,
-		MTPint mtpDate,
-		UserId viaBotId,
-		MsgId replyToId,
-		const QString &postAuthor,
-		const MTPReplyMarkup &markup) const override;
+		HistoryItemCommonFields &&fields) const override;
 
-	QString getErrorOnSend(
+	Data::SendError getErrorOnSend(
 		const Result *owner,
 		not_null<History*> history) const override;
 
@@ -314,25 +342,61 @@ public:
 		return _game != nullptr;
 	}
 
-	void addToHistory(
+	not_null<HistoryItem*> makeMessage(
 		const Result *owner,
 		not_null<History*> history,
-		MTPDmessage::Flags flags,
-		MTPDmessage_ClientFlags clientFlags,
-		MsgId msgId,
-		PeerId fromId,
-		MTPint mtpDate,
-		UserId viaBotId,
-		MsgId replyToId,
-		const QString &postAuthor,
-		const MTPReplyMarkup &markup) const override;
+		HistoryItemCommonFields &&fields) const override;
 
-	QString getErrorOnSend(
+	Data::SendError getErrorOnSend(
 		const Result *owner,
 		not_null<History*> history) const override;
 
 private:
 	GameData *_game;
+
+};
+
+class SendInvoice : public SendDataCommon {
+public:
+	SendInvoice(
+		not_null<Main::Session*> session,
+		MTPMessageMedia media)
+	: SendDataCommon(session)
+	, _media(media) {
+	}
+
+	bool isValid() const override {
+		return true;
+	}
+
+	SentMessageFields getSentMessageFields() const override;
+
+	QString getLayoutDescription(const Result *owner) const override;
+
+private:
+	MTPMessageMedia _media;
+
+};
+
+class SendWidget final : public SendDataCommon {
+public:
+	SendWidget(
+		not_null<Main::Session*> session,
+		const MTPDbotInlineMessageWidget &data);
+
+	bool isValid() const override;
+
+	SentMessageFields getSentMessageFields() const override;
+
+	not_null<HistoryItem*> makeMessage(
+		const Result *owner,
+		not_null<History*> history,
+		HistoryItemCommonFields &&fields) const override;
+
+private:
+	MTPMessageMedia _media;
+	TextWithEntities _caption;
+	bool _invertMedia = false;
 
 };
 

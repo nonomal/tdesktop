@@ -9,31 +9,24 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/basic_types.h"
 #include "base/assertion.h"
-
-namespace Core {
-class Launcher;
-} // namespace Core
+#include "base/debug_log.h"
 
 namespace Logs {
 
 void SetDebugEnabled(bool enabled);
 bool DebugEnabled();
+[[nodiscard]] bool WritingEntry();
 
-QString ProfilePrefix();
-
-void start(not_null<Core::Launcher*> launcher);
+void start();
 bool started();
 void finish();
 
 bool instanceChecked();
-void multipleInstances();
 
 void closeMain();
 
 void writeMain(const QString &v);
-
-void writeDebug(const char *file, int32 line, const QString &v);
-void writeTcp(const QString &v);
+void writeDebug(const QString &v);
 void writeMtp(int32 dc, const QString &v);
 
 QString full();
@@ -69,25 +62,6 @@ inline MemoryBuffer mb(const void *ptr, uint32 size) {
 }
 
 } // namespace Logs
-
-#define LOG(msg) (Logs::writeMain(QString msg))
-//usage LOG(("log: %1 %2").arg(1).arg(2))
-
-#define PROFILE_LOG(msg) (Logs::writeMain(Logs::ProfilePrefix() + QString msg))
-
-#define DEBUG_LOG(msg) {\
-	if (Logs::DebugEnabled() || !Logs::started()) {\
-		Logs::writeDebug(SOURCE_FILE_BASENAME, __LINE__, QString msg);\
-	}\
-}
-//usage DEBUG_LOG(("log: %1 %2").arg(1).arg(2))
-
-#define TCP_LOG(msg) {\
-	if (Logs::DebugEnabled() || !Logs::started()) {\
-		Logs::writeTcp(QString msg);\
-	}\
-}
-//usage TCP_LOG(("log: %1 %2").arg(1).arg(2))
 
 #define MTP_LOG(dc, msg) {\
 	if (Logs::DebugEnabled() || !Logs::started()) {\

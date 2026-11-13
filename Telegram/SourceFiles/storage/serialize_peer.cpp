@@ -14,12 +14,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "data/data_session.h"
 #include "ui/image/image.h"
-#include "app.h"
+#include "ui/text/format_values.h" // Ui::FormatPhone
 
 namespace Serialize {
 namespace {
 
 constexpr auto kModernImageLocationTag = std::numeric_limits<qint32>::min();
+constexpr auto kVersionTag = uint64(0x77FF'FFFF'FFFF'FFFFULL);
+constexpr auto kVersion = 3;
 
 } // namespace
 
@@ -43,7 +45,7 @@ std::optional<StorageImageLocation> readLegacyStorageImageLocationOrTag(
 	return StorageImageLocation(
 		StorageFileLocation(
 			dc,
-			UserId(0),
+			UserId(0), // self
 			MTP_inputFileLocation(
 				MTP_long(volume),
 				MTP_int(local),
@@ -51,33 +53,6 @@ std::optional<StorageImageLocation> readLegacyStorageImageLocationOrTag(
 				MTP_bytes(fileReference))),
 		width,
 		height);
-}
-
-int storageImageLocationSize(const StorageImageLocation &location) {
-	// Modern image location tag + (size + content) of the serialization.
-	return sizeof(qint32) * 2 + location.serializeSize();
-}
-
-void writeStorageImageLocation(
-		QDataStream &stream,
-		const StorageImageLocation &location) {
-	stream << kModernImageLocationTag << location.serialize();
-}
-
-std::optional<StorageImageLocation> readStorageImageLocation(
-		int streamAppVersion,
-		QDataStream &stream) {
-	const auto legacy = readLegacyStorageImageLocationOrTag(
-		streamAppVersion,
-		stream);
-	if (legacy) {
-		return legacy;
-	}
-	auto serialized = QByteArray();
-	stream >> serialized;
-	return (stream.status() == QDataStream::Ok)
-		? StorageImageLocation::FromSerialized(serialized)
-		: std::nullopt;
 }
 
 int imageLocationSize(const ImageLocation &location) {
@@ -109,75 +84,92 @@ std::optional<ImageLocation> readImageLocation(
 }
 
 uint32 peerSize(not_null<PeerData*> peer) {
-	uint32 result = sizeof(quint64)
-		+ sizeof(quint64)
-		+ imageLocationSize(peer->userpicLocation());
-	if (peer->isUser()) {
-		UserData *user = peer->asUser();
-
-		// first + last + phone + username + access
-		result += stringSize(user->firstName) + stringSize(user->lastName) + stringSize(user->phone()) + stringSize(user->username) + sizeof(quint64);
-
-		// flags
-		if (AppVersion >= 9012) {
-			result += sizeof(qint32);
-		}
-
-		// onlineTill + contact + botInfoVersion
-		result += sizeof(qint32) + sizeof(qint32) + sizeof(qint32);
-	} else if (peer->isChat()) {
-		ChatData *chat = peer->asChat();
-
-		// name + count + date + version + admin + old forbidden + left + inviteLink
-		result += stringSize(chat->name) + sizeof(qint32) + sizeof(qint32) + sizeof(qint32) + sizeof(qint32) + sizeof(qint32) + sizeof(quint32) + stringSize(chat->inviteLink());
-	} else if (peer->isChannel()) {
-		ChannelData *channel = peer->asChannel();
-
-		// name + access + date + version + old forbidden + flags + inviteLink
-		result += stringSize(channel->name) + sizeof(quint64) + sizeof(qint32) + sizeof(qint32) + sizeof(qint32) + sizeof(quint32) + stringSize(channel->inviteLink());
+	uint32 result = sizeof(quint64) // id
+		+ sizeof(quint64) // version tag
+		+ sizeof(qint32) // version
+		+ sizeof(quint64) // userpic photo id
+		+ imageLocationSize(peer->userpicLocation())
+		+ sizeof(qint32); // userpic has video
+	if (const auto user = peer->asUser()) {
+		const auto botInlinePlaceholder = user->isBot()
+			? user->botInfo->inlinePlaceholder
+			: QString();
+		result += stringSize(user->firstName)
+			+ stringSize(user->lastName)
+			+ stringSize(user->phone())
+			+ stringSize(user->username())
+			+ sizeof(quint64) // access
+			+ sizeof(qint32) // flags
+			+ stringSize(botInlinePlaceholder)
+			+ sizeof(quint32) // lastseen
+			+ sizeof(qint32) // contact
+			+ sizeof(qint32) // botInfoVersion
+			+ sizeof(qint32); // supportsGuestChat
+	} else if (const auto chat = peer->asChat()) {
+		result += stringSize(chat->name())
+			+ sizeof(qint32) // count
+			+ sizeof(qint32) // date
+			+ sizeof(qint32) // version
+			+ sizeof(qint32) // creator id 1
+			+ sizeof(qint32) // creator id 2
+			+ sizeof(quint32) // flags
+			+ stringSize(chat->inviteLink());
+	} else if (const auto channel = peer->asChannel()) {
+		result += stringSize(channel->name())
+			+ sizeof(quint64) // access
+			+ sizeof(qint32) // date
+			+ sizeof(qint32) // version
+			+ sizeof(qint32) // old forbidden
+			+ sizeof(quint32) // flags
+			+ stringSize(channel->inviteLink());
 	}
 	return result;
 }
 
-void writePeer(QDataStream &stream, PeerData *peer) {
-	stream << quint64(peer->id) << quint64(peer->userpicPhotoId());
+void writePeer(QDataStream &stream, not_null<PeerData*> peer) {
+	stream
+		<< SerializePeerId(peer->id)
+		<< quint64(kVersionTag)
+		<< qint32(kVersion)
+		<< quint64(peer->userpicPhotoId());
 	writeImageLocation(stream, peer->userpicLocation());
+	stream << qint32(peer->userpicHasVideo() ? 1 : 0);
 	if (const auto user = peer->asUser()) {
+		const auto botInlinePlaceholder = user->isBot()
+			? user->botInfo->inlinePlaceholder
+			: QString();
 		stream
 			<< user->firstName
 			<< user->lastName
 			<< user->phone()
-			<< user->username
-			<< quint64(user->accessHash());
-		if (AppVersion >= 9012) {
-			stream << qint32(user->flags());
-		}
-		if (AppVersion >= 9016) {
-			const auto botInlinePlaceholder = user->isBot()
-				? user->botInfo->inlinePlaceholder
-				: QString();
-			stream << botInlinePlaceholder;
-		}
-		stream
-			<< qint32(user->onlineTill)
+			<< user->username()
+			<< quint64(user->accessHash())
+			<< qint32(user->flags())
+			<< botInlinePlaceholder
+			<< quint32(user->lastseen().serialize())
 			<< qint32(user->isContact() ? 1 : 0)
-			<< qint32(user->isBot() ? user->botInfo->version : -1);
+			<< qint32(user->isBot() ? user->botInfo->version : -1)
+			<< qint32(user->isBot()
+				&& user->botInfo
+				&& user->botInfo->supportsGuestChat);
 	} else if (const auto chat = peer->asChat()) {
+		auto field1 = qint32(uint32(chat->creator.bare & 0xFFFFFFFFULL));
+		auto field2 = qint32(uint32(chat->creator.bare >> 32) << 8);
 		stream
-			<< chat->name
+			<< chat->name()
 			<< qint32(chat->count)
 			<< qint32(chat->date)
 			<< qint32(chat->version())
-			<< qint32(chat->creator)
-			<< qint32(0)
+			<< field1
+			<< field2
 			<< quint32(chat->flags())
 			<< chat->inviteLink();
 	} else if (const auto channel = peer->asChannel()) {
 		stream
-			<< channel->name
-			<< quint64(channel->access)
+			<< channel->name()
+			<< quint64(channel->accessHash())
 			<< qint32(channel->date)
-			<< qint32(channel->version())
+			<< qint32(0) // legacy - version
 			<< qint32(0)
 			<< quint32(channel->flags())
 			<< channel->inviteLink();
@@ -188,10 +180,17 @@ PeerData *readPeer(
 		not_null<Main::Session*> session,
 		int streamAppVersion,
 		QDataStream &stream) {
-	quint64 peerId = 0, photoId = 0;
-	stream >> peerId >> photoId;
+	quint64 peerIdSerialized = 0, versionTag = 0, photoId = 0;
+	qint32 version = 0, photoHasVideo = 0;
+	stream >> peerIdSerialized >> versionTag;
+	const auto peerId = DeserializePeerId(peerIdSerialized);
 	if (!peerId) {
 		return nullptr;
+	}
+	if (versionTag == kVersionTag) {
+		stream >> version >> photoId;
+	} else {
+		photoId = versionTag;
 	}
 
 	const auto userpic = readImageLocation(streamAppVersion, stream);
@@ -199,20 +198,24 @@ PeerData *readPeer(
 	if (!userpic) {
 		return nullptr;
 	}
+	if (version > 0) {
+		stream >> photoHasVideo;
+	}
 
 	const auto selfId = session->userPeerId();
 	const auto loaded = (peerId == selfId)
 		? session->user().get()
 		: session->data().peerLoaded(peerId);
-	const auto apply = !loaded || !loaded->isFullLoaded();
+	const auto apply = !loaded || !loaded->isLoaded();
 	const auto result = loaded ? loaded : session->data().peer(peerId).get();
 	if (apply) {
-		result->setLoadedStatus(PeerData::LoadedStatus::Full);
+		result->setLoadedStatus(PeerData::LoadedStatus::Normal);
 	}
 	if (const auto user = result->asUser()) {
 		QString first, last, phone, username, inlinePlaceholder;
 		quint64 access;
-		qint32 flags = 0, onlineTill, contact, botInfoVersion;
+		qint32 flags = 0, contact, botInfoVersion, supportsGuestChat = 0;
+		quint32 lastseen;
 		stream >> first >> last >> phone >> username >> access;
 		if (streamAppVersion >= 9012) {
 			stream >> flags;
@@ -220,56 +223,81 @@ PeerData *readPeer(
 		if (streamAppVersion >= 9016) {
 			stream >> inlinePlaceholder;
 		}
-		stream >> onlineTill >> contact >> botInfoVersion;
+		stream >> lastseen >> contact >> botInfoVersion;
+		if (version > 2) {
+			stream >> supportsGuestChat;
+		}
 
 		userpicAccessHash = access;
 
-		const auto showPhone = !user->isServiceUser()
-			&& (user->id != selfId)
-			&& (contact <= 0);
-		const auto pname = (showPhone && !phone.isEmpty())
-			? App::formatPhone(phone)
-			: QString();
-
 		if (apply) {
+			const auto showPhone = !user->isServiceUser()
+				&& (user->id != selfId)
+				&& (contact <= 0);
+			const auto pname = (showPhone && !phone.isEmpty())
+				? Ui::FormatPhone(phone)
+				: QString();
+
 			user->setPhone(phone);
 			user->setName(first, last, pname, username);
-
-			user->setFlags(MTPDuser::Flags::from_raw(flags));
+			if (streamAppVersion >= 2008007) {
+				user->setFlags(UserDataFlags::from_raw(flags));
+			} else {
+				using Saved = MTPDuser::Flag;
+				using Flag = UserDataFlag;
+				struct Conversion {
+					Saved saved;
+					Flag flag;
+				};
+				const auto conversions = {
+					Conversion{ Saved::f_deleted, Flag::Deleted },
+					Conversion{ Saved::f_verified, Flag::Verified },
+					Conversion{ Saved::f_scam, Flag::Scam },
+					Conversion{ Saved::f_fake, Flag::Fake },
+					Conversion{ Saved::f_bot_inline_geo, Flag::BotInlineGeo },
+					Conversion{ Saved::f_support, Flag::Support },
+					Conversion{ Saved::f_contact, Flag::Contact },
+					Conversion{ Saved::f_mutual_contact, Flag::MutualContact },
+				};
+				auto flagsMask = Flag() | Flag();
+				auto flagsSet = Flag() | Flag();
+				for (const auto &conversion : conversions) {
+					flagsMask |= conversion.flag;
+					if (flags & int(conversion.saved)) {
+						flagsSet |= conversion.flag;
+					}
+				}
+				user->setFlags((user->flags() & ~flagsMask) | flagsSet);
+			}
 			user->setAccessHash(access);
-			user->onlineTill = onlineTill;
+			user->updateLastseen((version > 1)
+				? Data::LastseenStatus::FromSerialized(lastseen)
+				: Data::LastseenStatus::FromLegacy(lastseen));
 			user->setIsContact(contact == 1);
 			user->setBotInfoVersion(botInfoVersion);
+			if (user->isBot() && user->botInfo) {
+				user->botInfo->supportsGuestChat = (supportsGuestChat == 1);
+			}
 			if (!inlinePlaceholder.isEmpty() && user->isBot()) {
 				user->botInfo->inlinePlaceholder = inlinePlaceholder;
-			}
-
-			if (user->id == selfId) {
-				user->input = MTP_inputPeerSelf();
-				user->inputUser = MTP_inputUserSelf();
-			} else {
-				user->input = MTP_inputPeerUser(MTP_int(peerToUser(user->id)), MTP_long(user->accessHash()));
-				user->inputUser = MTP_inputUser(MTP_int(peerToUser(user->id)), MTP_long(user->accessHash()));
 			}
 		}
 	} else if (const auto chat = result->asChat()) {
 		QString name, inviteLink;
-		qint32 count, date, version, creator, oldForbidden;
-		quint32 flagsData, flags;
-		stream >> name >> count >> date >> version >> creator >> oldForbidden >> flagsData >> inviteLink;
-
-		if (streamAppVersion >= 9012) {
-			flags = flagsData;
-		} else {
-			// flagsData was haveLeft
-			flags = (flagsData == 1)
-				? MTPDchat::Flags(MTPDchat::Flag::f_left)
-				: MTPDchat::Flags(0);
-		}
-		if (oldForbidden) {
-			flags |= quint32(MTPDchat_ClientFlag::f_forbidden);
-		}
+		qint32 count, date, version, field1, field2;
+		quint32 flags;
+		stream
+			>> name
+			>> count
+			>> date
+			>> version
+			>> field1
+			>> field2
+			>> flags
+			>> inviteLink;
 		if (apply) {
+			const auto creator = UserId(
+				BareId(uint32(field1)) | (BareId(uint32(field2) >> 8) << 32));
 			chat->setName(name);
 			chat->count = count;
 			chat->date = date;
@@ -278,61 +306,145 @@ PeerData *readPeer(
 			// So we don't restore the version field, info is still unknown.
 			chat->setVersion(0);
 
-			chat->creator = creator;
-			chat->setFlags(MTPDchat::Flags::from_raw(flags));
-			chat->setInviteLink(inviteLink);
+			if (streamAppVersion >= 2008007) {
+				chat->setFlags(ChatDataFlags::from_raw(flags));
+			} else {
+				const auto oldForbidden = ((uint32(field2) & 0xFF) == 1);
 
-			chat->input = MTP_inputPeerChat(MTP_int(peerToChat(chat->id)));
+				using Saved = MTPDchat::Flag;
+				using Flag = ChatDataFlag;
+				struct Conversion {
+					Saved saved;
+					Flag flag;
+				};
+				const auto conversions = {
+					Conversion{ Saved::f_left, Flag::Left },
+					Conversion{ Saved::f_creator, Flag::Creator },
+					Conversion{ Saved::f_deactivated, Flag::Deactivated },
+					Conversion{ Saved(1U << 31), Flag::Forbidden },
+					Conversion{ Saved::f_call_active, Flag::CallActive },
+					Conversion{ Saved::f_call_not_empty, Flag::CallNotEmpty },
+				};
+				auto flagsMask = Flag() | Flag();
+				auto flagsSet = Flag() | Flag();
+				if (streamAppVersion >= 9012) {
+					for (const auto &conversion : conversions) {
+						flagsMask |= conversion.flag;
+						if (flags & int(conversion.saved)) {
+							flagsSet |= conversion.flag;
+						}
+					}
+				} else {
+					// flags was haveLeft
+					if (flags == 1) {
+						flagsSet |= Flag::Left;
+					}
+				}
+				if (oldForbidden) {
+					flagsSet |= Flag::Forbidden;
+				}
+				chat->setFlags((chat->flags() & ~flagsMask) | flagsSet);
+			}
+
+			chat->creator = creator;
+			chat->setInviteLink(inviteLink);
 		}
 	} else if (const auto channel = result->asChannel()) {
 		QString name, inviteLink;
 		quint64 access;
 		qint32 date, version, oldForbidden;
 		quint32 flags;
-		stream >> name >> access >> date >> version >> oldForbidden >> flags >> inviteLink;
+		stream
+			>> name
+			>> access
+			>> date
+			>> version
+			>> oldForbidden
+			>> flags
+			>> inviteLink;
 
 		userpicAccessHash = access;
 
-		if (oldForbidden) {
-			flags |= quint32(MTPDchannel_ClientFlag::f_forbidden);
-		}
 		if (apply) {
 			channel->setName(name, QString());
-			channel->access = access;
+			channel->setAccessHash(access);
 			channel->date = date;
 
-			// We don't save participants, admin status and banned rights.
-			// So we don't restore the version field, info is still unknown.
-			channel->setVersion(0);
+			if (streamAppVersion >= 2008007) {
+				channel->setFlags(ChannelDataFlags::from_raw(flags));
+			} else {
+				using Saved = MTPDchannel::Flag;
+				using Flag = ChannelDataFlag;
+				struct Conversion {
+					Saved saved;
+					Flag flag;
+				};
+				const auto conversions = {
+					Conversion{ Saved::f_broadcast, Flag::Broadcast },
+					Conversion{ Saved::f_verified, Flag::Verified},
+					Conversion{ Saved::f_scam, Flag::Scam},
+					Conversion{ Saved::f_fake, Flag::Fake},
+					Conversion{ Saved::f_megagroup, Flag::Megagroup},
+					Conversion{ Saved::f_gigagroup, Flag::Gigagroup},
+					Conversion{ Saved::f_username, Flag::Username},
+					Conversion{ Saved::f_signatures, Flag::Signatures},
+					Conversion{ Saved::f_has_link, Flag::HasLink},
+					Conversion{
+						Saved::f_slowmode_enabled,
+						Flag::SlowmodeEnabled },
+					Conversion{ Saved::f_call_active, Flag::CallActive },
+					Conversion{ Saved::f_call_not_empty, Flag::CallNotEmpty },
+					Conversion{ Saved(1U << 31), Flag::Forbidden },
+					Conversion{ Saved::f_left, Flag::Left },
+					Conversion{ Saved::f_creator, Flag::Creator },
+				};
+				auto flagsMask = Flag() | Flag();
+				auto flagsSet = Flag() | Flag();
+				for (const auto &conversion : conversions) {
+					flagsMask |= conversion.flag;
+					if (flags & int(conversion.saved)) {
+						flagsSet |= conversion.flag;
+					}
+				}
+				if (oldForbidden) {
+					flagsSet |= Flag::Forbidden;
+				}
+				channel->setFlags((channel->flags() & ~flagsMask) | flagsSet);
+			}
 
-			channel->setFlags(MTPDchannel::Flags::from_raw(flags));
 			channel->setInviteLink(inviteLink);
-
-			channel->input = MTP_inputPeerChannel(MTP_int(peerToChannel(channel->id)), MTP_long(access));
-			channel->inputChannel = MTP_inputChannel(MTP_int(peerToChannel(channel->id)), MTP_long(access));
 		}
 	}
 	if (apply) {
-		using LocationType = StorageFileLocation::Type;
-		const auto location = (userpic->valid() && userpic->isLegacy())
-			? userpic->convertToModern(
-				LocationType::PeerPhoto,
-				result->id,
-				userpicAccessHash)
-			: *userpic;
-		result->setUserpic(photoId, location);
+		const auto location = userpic->convertToModernPeerPhoto(
+			result->id.value,
+			userpicAccessHash,
+			photoId);
+		result->setUserpic(photoId, location, (photoHasVideo == 1));
 	}
 	return result;
 }
 
 QString peekUserPhone(int streamAppVersion, QDataStream &stream) {
-	quint64 peerId = 0, photoId = 0;
-	stream >> peerId >> photoId;
-	DEBUG_LOG(("peekUserPhone.id: %1").arg(peerId));
-	if (!peerId
-		|| !peerIsUser(peerId)
-		|| !readStorageImageLocation(streamAppVersion, stream)) {
-		return QString();
+	quint64 peerIdSerialized = 0, versionTag = 0, photoId = 0;
+	qint32 version = 0, photoHasVideo = 0;
+	stream >> peerIdSerialized >> versionTag;
+	const auto peerId = DeserializePeerId(peerIdSerialized);
+	DEBUG_LOG(("peekUserPhone.id: %1").arg(peerId.value));
+	if (!peerId || !peerIsUser(peerId)) {
+		return nullptr;
+	}
+	if (versionTag == kVersionTag) {
+		stream >> version >> photoId;
+	} else {
+		photoId = versionTag;
+	}
+
+	if (!readImageLocation(streamAppVersion, stream)) {
+		return nullptr;
+	}
+	if (version > 0) {
+		stream >> photoHasVideo;
 	}
 
 	QString first, last, phone;

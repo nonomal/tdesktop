@@ -7,13 +7,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "export/data/export_data_types.h"
 
+struct GeoPointLocation;
+
 #include "export/export_settings.h"
 #include "export/output/export_output_file.h"
 #include "base/base_file_utilities.h"
 #include "ui/text/format_values.h"
 #include "core/mime_type.h"
 #include "core/utils.h"
+#include "data/data_location.h"
 #include <QtCore/QDateTime>
+#include <QtCore/QTimeZone>
 #include <QtCore/QRegularExpression>
 #include <QtGui/QImageReader>
 #include <range/v3/algorithm/max_element.hpp>
@@ -21,22 +25,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <range/v3/view/transform.hpp>
 #include <range/v3/range/conversion.hpp>
 
-namespace App { // Hackish..
-QString formatPhone(QString phone);
-} // namespace App
-
 namespace Export {
 namespace Data {
 namespace {
 
-constexpr auto kUserPeerIdShift = (1ULL << 32);
-constexpr auto kChatPeerIdShift = (2ULL << 32);
 constexpr auto kMaxImageSize = 10000;
 constexpr auto kMigratedMessagesIdShift = -1'000'000'000;
 
 QString PrepareFileNameDatePart(TimeId date) {
 	return date
-		? ('@' + QString::fromUtf8(FormatDateTime(date, '-', '-', '_')))
+		? ('@' + QString::fromUtf8(FormatDateTime(date, 0, '-', '-', '_')))
 		: QString();
 }
 
@@ -47,28 +45,195 @@ QString PreparePhotoFileName(int index, TimeId date) {
 		+ ".jpg";
 }
 
+QString PrepareStoryFileName(
+		int index,
+		TimeId date,
+		const Utf8String &extension) {
+	return "story_"
+		+ QString::number(index)
+		+ PrepareFileNameDatePart(date)
+		+ extension;
+}
+
+std::vector<std::vector<HistoryMessageMarkupButton>> ButtonRowsFromTL(
+		const MTPDreplyInlineMarkup &data) {
+	const auto &list = data.vrows().v;
+
+	if (list.isEmpty()) {
+		return {};
+	}
+	using Type = HistoryMessageMarkupButton::Type;
+	auto rows = std::vector<std::vector<HistoryMessageMarkupButton>>();
+	rows.reserve(list.size());
+
+	for (const auto &tlRow : list) {
+		auto row = std::vector<HistoryMessageMarkupButton>();
+		row.reserve(tlRow.data().vbuttons().v.size());
+		for (const auto &button : tlRow.data().vbuttons().v) {
+			const auto &fields = button.data();
+			const auto text = qs(fields.vtext());
+			fields.vtype().match([&](const MTPDinlineButtonTypeUrl &data) {
+				row.push_back({
+					Type::Url,
+					text,
+					qba(data.vurl())
+				});
+			}, [&](const MTPDinlineButtonTypeUrlAuth &data) {
+				row.push_back({
+					Type::Auth,
+					text,
+					qba(data.vurl()),
+					qs(data.vfwd_text().value_or_empty()),
+					data.vbutton_id().v,
+				});
+			}, [&](const MTPDinputInlineButtonTypeUrlAuth &) {
+			}, [&](const MTPDinlineButtonTypeWebView &data) {
+				row.push_back({
+					Type::WebView,
+					text,
+					data.vurl().v
+				});
+			}, [&](const MTPDinlineButtonTypeCallback &data) {
+				row.push_back({
+					(data.is_requires_password()
+						? Type::CallbackWithPassword
+						: Type::Callback),
+					text,
+					qba(data.vdata())
+				});
+			}, [&](const MTPDinlineButtonTypeGame &) {
+				row.push_back({ Type::Game, text });
+			}, [&](const MTPDinlineButtonTypeBuy &) {
+				row.push_back({ Type::Buy, text });
+			}, [&](const MTPDinlineButtonTypeSwitchInline &data) {
+				const auto type = data.is_same_peer()
+					? Type::SwitchInlineSame
+					: Type::SwitchInline;
+				row.push_back({ type, text, qba(data.vquery()) });
+			}, [&](const MTPDinlineButtonTypeUserProfile &data) {
+				row.push_back({
+					Type::UserProfile,
+					text,
+					QByteArray::number(data.vuser_id().v)
+				});
+			}, [&](const MTPDinputInlineButtonTypeUserProfile &) {
+			}, [&](const MTPDinlineButtonTypeCopy &data) {
+				row.push_back({
+					Type::CopyText,
+					text,
+					data.vcopy_text().v,
+				});
+			}, [&](const MTPDinlineButtonTypeDisabled &) {
+				row.push_back({ Type::Disabled, text });
+			});
+		}
+		if (!row.empty()) {
+			rows.push_back(std::move(row));
+		}
+	}
+
+	return rows;
+}
+
 } // namespace
 
-PeerId UserPeerId(int32 userId) {
-	return kUserPeerIdShift | uint32(userId);
+Utf8String InlineButtonAction::TypeToString(
+		const InlineButtonAction &action) {
+	using Type = InlineButtonAction::Type;
+	switch (action.type) {
+	case Type::Url: return "url";
+	case Type::Auth: return "auth";
+	case Type::WebView: return "web_view";
+	case Type::Callback: return "callback";
+	case Type::CallbackWithPassword: return "callback_with_password";
+	case Type::Game: return "game";
+	case Type::Buy: return "buy";
+	case Type::SwitchInline: return "switch_inline";
+	case Type::SwitchInlineSame: return "switch_inline_same";
+	case Type::UserProfile: return "user_profile";
+	case Type::CopyText: return "copy_text";
+	case Type::Disabled: return "disabled";
+	}
+	Unexpected("Type in InlineButtonAction::Type.");
 }
 
-PeerId ChatPeerId(int32 chatId) {
-	return kChatPeerIdShift | uint32(chatId);
+Utf8String InlineButtonPeerTypeToString(InlineButtonPeerType type) {
+	using Type = InlineButtonPeerType;
+	switch (type) {
+	case Type::SameBotPM: return "same_bot_pm";
+	case Type::PM: return "pm";
+	case Type::Chat: return "chat";
+	case Type::Megagroup: return "megagroup";
+	case Type::Broadcast: return "broadcast";
+	case Type::BotPM: return "bot_pm";
+	}
+	Unexpected("Type in InlineButtonPeerType.");
 }
 
-int32 BarePeerId(PeerId peerId) {
-	return int32(peerId & 0xFFFFFFFFULL);
+Utf8String RichButtonStyleToString(RichButtonStyle style) {
+	using Style = RichButtonStyle;
+	switch (style) {
+	case Style::Default: return "default";
+	case Style::Primary: return "primary";
+	case Style::Success: return "success";
+	case Style::Danger: return "danger";
+	case Style::Link: return "link";
+	}
+	Unexpected("Style in RichButtonStyle.");
 }
 
-int PeerColorIndex(int32 bareId) {
-	const auto index = std::abs(bareId) % 7;
-	const int map[] = { 0, 7, 4, 1, 6, 3, 5 };
-	return map[index];
+Utf8String RichButtonAlignmentToString(RichButtonAlignment alignment) {
+	using Alignment = RichButtonAlignment;
+	switch (alignment) {
+	case Alignment::Stretch: return "stretch";
+	case Alignment::Left: return "left";
+	case Alignment::Center: return "center";
+	case Alignment::Right: return "right";
+	}
+	Unexpected("Alignment in RichButtonAlignment.");
 }
 
-int StringBarePeerId(const Utf8String &data) {
-	auto result = 0xFF;
+QByteArray HistoryMessageMarkupButton::TypeToString(
+		const HistoryMessageMarkupButton &button) {
+	using Type = HistoryMessageMarkupButton::Type;
+	switch (button.type) {
+	case Type::Default: return "default";
+	case Type::Url: return "url";
+	case Type::Callback: return "callback";
+	case Type::CallbackWithPassword: return "callback_with_password";
+	case Type::RequestPhone: return "request_phone";
+	case Type::RequestLocation: return "request_location";
+	case Type::RequestPoll: return "request_poll";
+	case Type::RequestPeer: return "request_peer";
+	case Type::SwitchInline: return "switch_inline";
+	case Type::SwitchInlineSame: return "switch_inline_same";
+	case Type::Game: return "game";
+	case Type::Buy: return "buy";
+	case Type::Auth: return "auth";
+	case Type::UserProfile: return "user_profile";
+	case Type::WebView: return "web_view";
+	case Type::SimpleWebView: return "simple_web_view";
+	case Type::CopyText: return "copy_text";
+	case Type::Disabled: return "disabled";
+	}
+	Unexpected("Type in HistoryMessageMarkupButton::Type.");
+}
+
+uint8 PeerColorIndex(BareId bareId) {
+	const uint8 map[] = { 0, 7, 4, 1, 6, 3, 5 };
+	return map[bareId % base::array_size(map)];
+}
+
+BareId PeerToBareId(PeerId peerId) {
+	return (peerId.value & PeerId::kChatTypeMask);
+}
+
+uint8 PeerColorIndex(PeerId peerId) {
+	return PeerColorIndex(PeerToBareId(peerId));
+}
+
+BareId StringBarePeerId(const Utf8String &data) {
+	auto result = BareId(0xFF);
 	for (const auto ch : data) {
 		result *= 239;
 		result += ch;
@@ -77,7 +242,7 @@ int StringBarePeerId(const Utf8String &data) {
 	return result;
 }
 
-int ApplicationColorIndex(int applicationId) {
+uint8 ApplicationColorIndex(int applicationId) {
 	static const auto official = std::map<int, int> {
 		{ 1, 0 }, // iOS
 		{ 7, 0 }, // iOS X
@@ -98,22 +263,8 @@ int DomainApplicationId(const Utf8String &data) {
 	return 0x1000 + StringBarePeerId(data);
 }
 
-bool IsChatPeerId(PeerId peerId) {
-	return (peerId & kChatPeerIdShift) == kChatPeerIdShift;
-}
-
-bool IsUserPeerId(PeerId peerId) {
-	return (peerId & kUserPeerIdShift) == kUserPeerIdShift;
-}
-
 PeerId ParsePeerId(const MTPPeer &data) {
-	return data.match([](const MTPDpeerUser &data) {
-		return UserPeerId(data.vuser_id().v);
-	}, [](const MTPDpeerChat &data) {
-		return ChatPeerId(data.vchat_id().v);
-	}, [](const MTPDpeerChannel &data) {
-		return ChatPeerId(data.vchannel_id().v);
-	});
+	return peerFromMTP(data);
 }
 
 Utf8String ParseString(const MTPstring &data) {
@@ -177,7 +328,15 @@ std::vector<TextPart> ParseText(
 			[](const MTPDmessageEntityStrike&) { return Type::Strike; },
 			[](const MTPDmessageEntityBlockquote&) {
 				return Type::Blockquote; },
-			[](const MTPDmessageEntityBankCard&) { return Type::BankCard; });
+			[](const MTPDmessageEntityBankCard&) { return Type::BankCard; },
+			[](const MTPDmessageEntityTonAddress&) {
+				return Type::TonAddress; },
+			[](const MTPDmessageEntitySpoiler&) { return Type::Spoiler; },
+			[](const MTPDmessageEntityCustomEmoji&) { return Type::CustomEmoji; },
+			[](const MTPDmessageEntityFormattedDate&) { return Type::Unknown; },
+			[](const MTPDmessageEntityDiffInsert&) { return Type::Unknown; },
+			[](const MTPDmessageEntityDiffReplace&) { return Type::Unknown; },
+			[](const MTPDmessageEntityDiffDelete&) { return Type::Unknown; });
 		part.text = mid(start, length);
 		part.additional = entity.match(
 		[](const MTPDmessageEntityPre &data) {
@@ -186,6 +345,10 @@ std::vector<TextPart> ParseText(
 			return ParseString(data.vurl());
 		}, [](const MTPDmessageEntityMentionName &data) {
 			return NumberToString(data.vuser_id().v);
+		}, [](const MTPDmessageEntityCustomEmoji &data) {
+			return NumberToString(data.vdocument_id().v);
+		}, [](const MTPDmessageEntityBlockquote &data) {
+			return data.is_collapsed() ? Utf8String("1") : Utf8String();
 		}, [](const auto &) { return Utf8String(); });
 
 		result.push_back(std::move(part));
@@ -195,13 +358,950 @@ std::vector<TextPart> ParseText(
 	return result;
 }
 
+Utf8String Reaction::TypeToString(const Reaction &reaction) {
+	switch (reaction.type) {
+		case Reaction::Type::Empty: return "empty";
+		case Reaction::Type::Emoji: return "emoji";
+		case Reaction::Type::CustomEmoji: return "custom_emoji";
+		case Reaction::Type::Paid: return "paid";
+	}
+	Unexpected("Type in Reaction::Type.");
+}
+
+std::vector<TextPart> ParseText(const MTPTextWithEntities &text) {
+	return ParseText(text.data().vtext(), text.data().ventities().v);
+}
+
+Photo ParsePhoto(const MTPPhoto &data, const QString &suggestedPath);
+
+namespace {
+
+RichText ParseRichText(const MTPRichText &text);
+RichBlock ParseRichBlock(const MTPPageBlock &block);
+std::vector<RichBlock> ParseRichBlocks(
+		const QVector<MTPPageBlock> &blocks);
+
+InlineButtonPeerType ParseInlineButtonPeerType(
+		const MTPInlineQueryPeerType &type) {
+	using Type = InlineButtonPeerType;
+	return type.match(
+		[](const MTPDinlineQueryPeerTypeSameBotPM &) {
+			return Type::SameBotPM;
+		}, [](const MTPDinlineQueryPeerTypePM &) {
+			return Type::PM;
+		}, [](const MTPDinlineQueryPeerTypeChat &) {
+			return Type::Chat;
+		}, [](const MTPDinlineQueryPeerTypeMegagroup &) {
+			return Type::Megagroup;
+		}, [](const MTPDinlineQueryPeerTypeBroadcast &) {
+			return Type::Broadcast;
+		}, [](const MTPDinlineQueryPeerTypeBotPM &) {
+			return Type::BotPM;
+		});
+}
+
+std::optional<InlineButtonAction> ParseInlineButtonAction(
+		const MTPInlineButtonType &type) {
+	using Type = InlineButtonAction::Type;
+	auto result = std::optional<InlineButtonAction>();
+	type.match([&](const MTPDinlineButtonTypeUrl &data) {
+		auto &action = result.emplace();
+		action.type = Type::Url;
+		action.url = ParseString(data.vurl());
+	}, [&](const MTPDinlineButtonTypeUrlAuth &data) {
+		auto &action = result.emplace();
+		action.type = Type::Auth;
+		action.url = ParseString(data.vurl());
+		action.buttonId = data.vbutton_id().v;
+		if (const auto forwardText = data.vfwd_text()) {
+			action.forwardText = ParseString(*forwardText);
+		}
+	}, [&](const MTPDinputInlineButtonTypeUrlAuth &) {
+	}, [&](const MTPDinlineButtonTypeWebView &data) {
+		auto &action = result.emplace();
+		action.type = Type::WebView;
+		action.url = ParseString(data.vurl());
+	}, [&](const MTPDinlineButtonTypeCallback &data) {
+		auto &action = result.emplace();
+		action.requiresPassword = data.is_requires_password();
+		action.type = action.requiresPassword
+			? Type::CallbackWithPassword
+			: Type::Callback;
+		action.callbackData = qba(data.vdata());
+	}, [&](const MTPDinlineButtonTypeGame &) {
+		auto &action = result.emplace();
+		action.type = Type::Game;
+	}, [&](const MTPDinlineButtonTypeBuy &) {
+		auto &action = result.emplace();
+		action.type = Type::Buy;
+	}, [&](const MTPDinlineButtonTypeSwitchInline &data) {
+		auto &action = result.emplace();
+		action.samePeer = data.is_same_peer();
+		action.type = action.samePeer
+			? Type::SwitchInlineSame
+			: Type::SwitchInline;
+		action.query = ParseString(data.vquery());
+		if (const auto peerTypes = data.vpeer_types()) {
+			auto &parsed = action.peerTypes.emplace();
+			parsed.reserve(peerTypes->v.size());
+			for (const auto &peerType : peerTypes->v) {
+				parsed.push_back(ParseInlineButtonPeerType(peerType));
+			}
+		}
+	}, [&](const MTPDinlineButtonTypeUserProfile &data) {
+		auto &action = result.emplace();
+		action.type = Type::UserProfile;
+		action.userId = uint64(data.vuser_id().v);
+	}, [&](const MTPDinputInlineButtonTypeUserProfile &) {
+	}, [&](const MTPDinlineButtonTypeCopy &data) {
+		auto &action = result.emplace();
+		action.type = Type::CopyText;
+		action.copyText = ParseString(data.vcopy_text());
+	}, [&](const MTPDinlineButtonTypeDisabled &) {
+		auto &action = result.emplace();
+		action.type = Type::Disabled;
+	});
+	return result;
+}
+
+bool RichButtonLinkStyleAllowed(InlineButtonAction::Type type) {
+	using Type = InlineButtonAction::Type;
+	return (type == Type::Callback)
+		|| (type == Type::CallbackWithPassword)
+		|| (type == Type::Disabled);
+}
+
+std::optional<RichButtonStyle> ParseRichButtonStyle(
+		const tl::conditional<MTPRichButtonStyle> &style,
+		InlineButtonAction::Type actionType,
+		bool inlineButton) {
+	if (!style) {
+		return std::nullopt;
+	}
+	const auto &data = style->data();
+	if (inlineButton
+		&& data.is_link()
+		&& RichButtonLinkStyleAllowed(actionType)) {
+		return RichButtonStyle::Link;
+	}
+	return data.is_bg_danger()
+		? RichButtonStyle::Danger
+		: data.is_bg_primary()
+		? RichButtonStyle::Primary
+		: data.is_bg_success()
+		? RichButtonStyle::Success
+		: RichButtonStyle::Default;
+}
+
+std::optional<RichText> ParseRichButton(
+		const MTPRichText &text,
+		const MTPInlineButtonType &type,
+		const tl::conditional<MTPRichButtonStyle> &style,
+		bool inlineButton) {
+	auto action = ParseInlineButtonAction(type);
+	if (!action) {
+		return std::nullopt;
+	}
+	auto result = RichText();
+	result.type = RichText::Type::Button;
+	result.children.reserve(1);
+	result.children.push_back(ParseRichText(text));
+	auto buttonStyle = ParseRichButtonStyle(
+		style,
+		action->type,
+		inlineButton);
+	result.button = std::make_unique<RichButtonPayload>(RichButtonPayload{
+		.action = std::move(*action),
+		.style = std::move(buttonStyle),
+	});
+	return result;
+}
+
+RichText ParseRichTextWrapper(
+		RichText::Type type,
+		const MTPRichText &child) {
+	auto result = RichText();
+	result.type = type;
+	result.children.reserve(1);
+	result.children.push_back(ParseRichText(child));
+	return result;
+}
+
+RichText ParseRichText(const MTPRichText &text) {
+	using Type = RichText::Type;
+	return text.match(
+	[](const MTPDtextEmpty &) {
+		auto result = RichText();
+		result.type = Type::Empty;
+		return result;
+	}, [](const MTPDtextPlain &data) {
+		auto result = RichText();
+		result.type = Type::Plain;
+		result.text = ParseString(data.vtext());
+		return result;
+	}, [](const MTPDtextBold &data) {
+		return ParseRichTextWrapper(Type::Bold, data.vtext());
+	}, [](const MTPDtextItalic &data) {
+		return ParseRichTextWrapper(Type::Italic, data.vtext());
+	}, [](const MTPDtextUnderline &data) {
+		return ParseRichTextWrapper(Type::Underline, data.vtext());
+	}, [](const MTPDtextStrike &data) {
+		return ParseRichTextWrapper(Type::Strike, data.vtext());
+	}, [](const MTPDtextFixed &data) {
+		return ParseRichTextWrapper(Type::Fixed, data.vtext());
+	}, [](const MTPDtextUrl &data) {
+		auto result = ParseRichTextWrapper(Type::Url, data.vtext());
+		result.data = ParseString(data.vurl());
+		result.id = uint64(data.vwebpage_id().v);
+		return result;
+	}, [](const MTPDtextEmail &data) {
+		auto result = ParseRichTextWrapper(Type::Email, data.vtext());
+		result.data = ParseString(data.vemail());
+		return result;
+	}, [](const MTPDtextConcat &data) {
+		auto result = RichText();
+		result.type = Type::Concat;
+		const auto &texts = data.vtexts().v;
+		result.children.reserve(texts.size());
+		for (const auto &text : texts) {
+			result.children.push_back(ParseRichText(text));
+		}
+		return result;
+	}, [](const MTPDtextSubscript &data) {
+		return ParseRichTextWrapper(Type::Subscript, data.vtext());
+	}, [](const MTPDtextSuperscript &data) {
+		return ParseRichTextWrapper(Type::Superscript, data.vtext());
+	}, [](const MTPDtextMarked &data) {
+		return ParseRichTextWrapper(Type::Marked, data.vtext());
+	}, [](const MTPDtextPhone &data) {
+		auto result = ParseRichTextWrapper(Type::Phone, data.vtext());
+		result.data = ParseString(data.vphone());
+		return result;
+	}, [](const MTPDtextImage &data) {
+		auto result = RichText();
+		result.type = Type::InlineImage;
+		result.id = uint64(data.vdocument_id().v);
+		result.width = data.vw().v;
+		result.height = data.vh().v;
+		return result;
+	}, [](const MTPDtextAnchor &data) {
+		auto result = ParseRichTextWrapper(Type::Anchor, data.vtext());
+		result.data = ParseString(data.vname());
+		return result;
+	}, [](const MTPDtextMath &data) {
+		auto result = RichText();
+		result.type = Type::Math;
+		result.data = ParseString(data.vsource());
+		return result;
+	}, [](const MTPDtextCustomEmoji &data) {
+		auto result = RichText();
+		result.type = Type::CustomEmoji;
+		result.text = ParseString(data.valt());
+		result.id = uint64(data.vdocument_id().v);
+		result.customEmojiData = NumberToString(result.id);
+		return result;
+	}, [](const MTPDtextSpoiler &data) {
+		return ParseRichTextWrapper(Type::Spoiler, data.vtext());
+	}, [](const MTPDtextMention &data) {
+		return ParseRichTextWrapper(Type::Mention, data.vtext());
+	}, [](const MTPDtextHashtag &data) {
+		return ParseRichTextWrapper(Type::Hashtag, data.vtext());
+	}, [](const MTPDtextBotCommand &data) {
+		return ParseRichTextWrapper(Type::BotCommand, data.vtext());
+	}, [](const MTPDtextCashtag &data) {
+		return ParseRichTextWrapper(Type::Cashtag, data.vtext());
+	}, [](const MTPDtextAutoUrl &data) {
+		return ParseRichTextWrapper(Type::AutoUrl, data.vtext());
+	}, [](const MTPDtextAutoEmail &data) {
+		return ParseRichTextWrapper(Type::AutoEmail, data.vtext());
+	}, [](const MTPDtextAutoPhone &data) {
+		return ParseRichTextWrapper(Type::AutoPhone, data.vtext());
+	}, [](const MTPDtextBankCard &data) {
+		return ParseRichTextWrapper(Type::BankCard, data.vtext());
+	}, [](const MTPDtextTonAddress &data) {
+		return ParseRichTextWrapper(Type::TonAddress, data.vtext());
+	}, [](const MTPDtextMentionName &data) {
+		auto result = ParseRichTextWrapper(Type::MentionName, data.vtext());
+		result.id = uint64(data.vuser_id().v);
+		return result;
+	}, [](const MTPDtextDate &data) {
+		auto result = ParseRichTextWrapper(Type::FormattedDate, data.vtext());
+		result.date = data.vdate().v;
+		result.relative = data.is_relative();
+		result.shortTime = data.is_short_time();
+		result.longTime = data.is_long_time();
+		result.shortDate = data.is_short_date();
+		result.longDate = data.is_long_date();
+		result.dayOfWeek = data.is_day_of_week();
+		return result;
+	}, [](const MTPDtextDiff &data) {
+		auto result = RichText();
+		result.type = Type::Diff;
+		result.unsupported = true;
+		result.children.reserve(1);
+		result.children.push_back(ParseRichText(data.vtext()));
+		result.oldChildren.reserve(1);
+		result.oldChildren.push_back(ParseRichText(data.vold_text()));
+		return result;
+	}, [](const MTPDtextButton &data) {
+		if (auto button = ParseRichButton(
+				data.vtext(),
+				data.vtype(),
+				data.vstyle(),
+				true)) {
+			return std::move(*button);
+		}
+		return ParseRichText(data.vtext());
+	});
+}
+
+RichCaption ParseRichCaption(const MTPPageCaption &caption) {
+	const auto &data = caption.data();
+	return {
+		.text = ParseRichText(data.vtext()),
+		.credit = ParseRichText(data.vcredit()),
+	};
+}
+
+RichTaskState ParseRichTaskState(bool checkbox, bool checked) {
+	if (!checkbox) {
+		return RichTaskState::None;
+	}
+	return checked ? RichTaskState::Checked : RichTaskState::Unchecked;
+}
+
+RichListItem ParseRichListItem(const MTPPageListItem &item) {
+	return item.match([](const MTPDpageListItemText &data) {
+		auto result = RichListItem();
+		result.content = RichListItemContent::Text;
+		result.taskState = ParseRichTaskState(
+			data.is_checkbox(),
+			data.is_checked());
+		result.text = ParseRichText(data.vtext());
+		return result;
+	}, [](const MTPDpageListItemBlocks &data) {
+		auto result = RichListItem();
+		result.content = RichListItemContent::Blocks;
+		result.taskState = ParseRichTaskState(
+			data.is_checkbox(),
+			data.is_checked());
+		result.blocks = ParseRichBlocks(data.vblocks().v);
+		return result;
+	});
+}
+
+template <typename Data>
+void FillRichOrderedListItem(
+		RichListItem &result,
+		const Data &data) {
+	result.taskState = ParseRichTaskState(
+		data.is_checkbox(),
+		data.is_checked());
+	if (const auto num = data.vnum()) {
+		result.num = ParseString(*num);
+	}
+	if (const auto value = data.vvalue()) {
+		result.value = value->v;
+	}
+	if (const auto type = data.vtype()) {
+		result.type = ParseString(*type);
+	}
+}
+
+RichListItem ParseRichOrderedListItem(
+		const MTPPageListOrderedItem &item) {
+	return item.match([](const MTPDpageListOrderedItemText &data) {
+		auto result = RichListItem();
+		result.content = RichListItemContent::Text;
+		FillRichOrderedListItem(result, data);
+		result.text = ParseRichText(data.vtext());
+		return result;
+	}, [](const MTPDpageListOrderedItemBlocks &data) {
+		auto result = RichListItem();
+		result.content = RichListItemContent::Blocks;
+		FillRichOrderedListItem(result, data);
+		result.blocks = ParseRichBlocks(data.vblocks().v);
+		return result;
+	});
+}
+
+RichTableAlignment ParseRichTableAlignment(
+		const MTPDpageTableCell &data) {
+	if (data.is_align_right()) {
+		return RichTableAlignment::Right;
+	} else if (data.is_align_center()) {
+		return RichTableAlignment::Center;
+	}
+	return RichTableAlignment::Left;
+}
+
+RichTableVerticalAlignment ParseRichTableVerticalAlignment(
+		const MTPDpageTableCell &data) {
+	if (data.is_valign_bottom()) {
+		return RichTableVerticalAlignment::Bottom;
+	} else if (data.is_valign_middle()) {
+		return RichTableVerticalAlignment::Middle;
+	}
+	return RichTableVerticalAlignment::Top;
+}
+
+RichTableCell ParseRichTableCell(const MTPPageTableCell &cell) {
+	const auto &data = cell.data();
+	auto result = RichTableCell();
+	result.header = data.is_header();
+	result.alignment = ParseRichTableAlignment(data);
+	result.verticalAlignment = ParseRichTableVerticalAlignment(data);
+	if (const auto text = data.vtext()) {
+		result.text = ParseRichText(*text);
+	}
+	if (const auto colspan = data.vcolspan()) {
+		result.colspan = colspan->v;
+	}
+	if (const auto rowspan = data.vrowspan()) {
+		result.rowspan = rowspan->v;
+	}
+	return result;
+}
+
+RichTableRow ParseRichTableRow(const MTPPageTableRow &row) {
+	const auto &cells = row.data().vcells().v;
+	auto result = RichTableRow();
+	result.cells.reserve(cells.size());
+	for (const auto &cell : cells) {
+		result.cells.push_back(ParseRichTableCell(cell));
+	}
+	return result;
+}
+
+RichRelatedArticle ParseRichRelatedArticle(
+		const MTPPageRelatedArticle &article) {
+	const auto &data = article.data();
+	auto result = RichRelatedArticle();
+	result.url = ParseString(data.vurl());
+	result.webpageId = uint64(data.vwebpage_id().v);
+	if (const auto title = data.vtitle()) {
+		result.title = ParseString(*title);
+	}
+	if (const auto description = data.vdescription()) {
+		result.description = ParseString(*description);
+	}
+	if (const auto photoId = data.vphoto_id()) {
+		result.photoId = uint64(photoId->v);
+	}
+	if (const auto author = data.vauthor()) {
+		result.author = ParseString(*author);
+	}
+	if (const auto publishedDate = data.vpublished_date()) {
+		result.publishedDate = publishedDate->v;
+	}
+	return result;
+}
+
+RichChannel ParseRichChannel(const MTPChat &chat) {
+	using Source = RichChannel::Source;
+	return chat.match([](const MTPDchatEmpty &data) {
+		auto result = RichChannel();
+		result.source = Source::ChatEmpty;
+		result.id = uint64(data.vid().v);
+		return result;
+	}, [](const MTPDchat &data) {
+		auto result = RichChannel();
+		result.source = Source::Chat;
+		result.id = uint64(data.vid().v);
+		result.title = ParseString(data.vtitle());
+		return result;
+	}, [](const MTPDchatForbidden &data) {
+		auto result = RichChannel();
+		result.source = Source::ChatForbidden;
+		result.id = uint64(data.vid().v);
+		result.title = ParseString(data.vtitle());
+		return result;
+	}, [](const MTPDchannel &data) {
+		auto result = RichChannel();
+		result.source = Source::Channel;
+		result.id = uint64(data.vid().v);
+		result.title = ParseString(data.vtitle());
+		result.broadcast = data.is_broadcast();
+		result.megagroup = data.is_megagroup();
+		result.monoforum = data.is_monoforum();
+		if (const auto accessHash = data.vaccess_hash()) {
+			result.accessHash = int64(accessHash->v);
+		}
+		if (const auto username = data.vusername()) {
+			result.username = ParseString(*username);
+		}
+		return result;
+	}, [](const MTPDchannelForbidden &data) {
+		auto result = RichChannel();
+		result.source = Source::ChannelForbidden;
+		result.id = uint64(data.vid().v);
+		result.title = ParseString(data.vtitle());
+		result.accessHash = int64(data.vaccess_hash().v);
+		result.broadcast = data.is_broadcast();
+		result.megagroup = data.is_megagroup();
+		result.monoforum = data.is_monoforum();
+		return result;
+	}, [](const MTPDcommunity &data) {
+		auto result = RichChannel();
+		result.source = Source::Community;
+		result.id = uint64(data.vid().v);
+		result.title = ParseString(data.vtitle());
+		if (const auto accessHash = data.vaccess_hash()) {
+			result.accessHash = int64(accessHash->v);
+		}
+		return result;
+	}, [](const MTPDcommunityForbidden &data) {
+		auto result = RichChannel();
+		result.source = Source::CommunityForbidden;
+		result.id = uint64(data.vid().v);
+		result.title = ParseString(data.vtitle());
+		if (const auto accessHash = data.vaccess_hash()) {
+			result.accessHash = int64(accessHash->v);
+		}
+		return result;
+	});
+}
+
+RichMapPoint ParseRichMapPoint(const MTPGeoPoint &point) {
+	using Source = RichMapPoint::Source;
+	return point.match([](const MTPDgeoPointEmpty &) {
+		auto result = RichMapPoint();
+		result.source = Source::GeoPointEmpty;
+		return result;
+	}, [](const MTPDgeoPoint &data) {
+		auto result = RichMapPoint();
+		result.source = Source::GeoPoint;
+		result.latitude = data.vlat().v;
+		result.longitude = data.vlong().v;
+		result.accessHash = int64(data.vaccess_hash().v);
+		if (const auto accuracyRadius = data.vaccuracy_radius()) {
+			result.accuracyRadius = accuracyRadius->v;
+		}
+		return result;
+	});
+}
+
+RichMapPoint ParseRichMapPoint(const MTPInputGeoPoint &point) {
+	using Source = RichMapPoint::Source;
+	return point.match([](const MTPDinputGeoPointEmpty &) {
+		auto result = RichMapPoint();
+		result.source = Source::InputGeoPointEmpty;
+		return result;
+	}, [](const MTPDinputGeoPoint &data) {
+		auto result = RichMapPoint();
+		result.source = Source::InputGeoPoint;
+		result.latitude = data.vlat().v;
+		result.longitude = data.vlong().v;
+		if (const auto accuracyRadius = data.vaccuracy_radius()) {
+			result.accuracyRadius = accuracyRadius->v;
+		}
+		return result;
+	});
+}
+
+RichBlock ParseRichSupportedBlock(RichBlock::Kind kind) {
+	auto result = RichBlock();
+	result.kind = kind;
+	return result;
+}
+
+RichBlock ParseRichTextBlock(
+		RichBlock::Kind kind,
+		const MTPRichText &text) {
+	auto result = RichBlock();
+	result.kind = kind;
+	result.text = ParseRichText(text);
+	return result;
+}
+
+RichBlock ParseRichHeadingBlock(
+		int level,
+		const MTPRichText &text) {
+	auto result = ParseRichTextBlock(RichBlock::Kind::Heading, text);
+	result.headingLevel = level;
+	return result;
+}
+
+RichBlock ParseRichUnsupportedBlock(RichBlock::Kind kind) {
+	auto result = ParseRichSupportedBlock(kind);
+	result.unsupported = true;
+	return result;
+}
+
+RichBlock ParseRichBlock(const MTPPageBlock &block) {
+	using Kind = RichBlock::Kind;
+	return block.match(
+	[](const MTPDpageBlockUnsupported &) {
+		return ParseRichUnsupportedBlock(Kind::Unsupported);
+	}, [](const MTPDpageBlockTitle &data) {
+		return ParseRichHeadingBlock(1, data.vtext());
+	}, [](const MTPDpageBlockSubtitle &data) {
+		return ParseRichHeadingBlock(2, data.vtext());
+	}, [](const MTPDpageBlockAuthorDate &data) {
+		auto result = ParseRichTextBlock(Kind::AuthorDate, data.vauthor());
+		result.date = data.vpublished_date().v;
+		return result;
+	}, [](const MTPDpageBlockHeader &data) {
+		return ParseRichHeadingBlock(3, data.vtext());
+	}, [](const MTPDpageBlockSubheader &data) {
+		return ParseRichHeadingBlock(4, data.vtext());
+	}, [](const MTPDpageBlockParagraph &data) {
+		return ParseRichTextBlock(Kind::Paragraph, data.vtext());
+	}, [](const MTPDpageBlockPreformatted &data) {
+		auto result = ParseRichTextBlock(Kind::Code, data.vtext());
+		result.language = ParseString(data.vlanguage());
+		return result;
+	}, [](const MTPDpageBlockFooter &data) {
+		return ParseRichTextBlock(Kind::Footer, data.vtext());
+	}, [](const MTPDpageBlockDivider &) {
+		auto result = RichBlock();
+		result.kind = Kind::Divider;
+		return result;
+	}, [](const MTPDpageBlockAnchor &data) {
+		auto result = RichBlock();
+		result.kind = Kind::Anchor;
+		result.name = ParseString(data.vname());
+		return result;
+	}, [](const MTPDpageBlockList &data) {
+		auto result = RichBlock();
+		result.kind = Kind::List;
+		result.listKind = RichListKind::Bullet;
+		const auto &items = data.vitems().v;
+		result.listItems.reserve(items.size());
+		for (const auto &item : items) {
+			result.listItems.push_back(ParseRichListItem(item));
+		}
+		return result;
+	}, [](const MTPDpageBlockBlockquote &data) {
+		auto result = ParseRichTextBlock(Kind::Quote, data.vtext());
+		result.quoteContent = RichQuoteContent::Text;
+		result.quoteCaption = ParseRichText(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockPullquote &data) {
+		auto result = ParseRichTextBlock(Kind::Quote, data.vtext());
+		result.quoteContent = RichQuoteContent::Text;
+		result.quoteCaption = ParseRichText(data.vcaption());
+		result.pullquote = true;
+		return result;
+	}, [](const MTPDpageBlockPhoto &data) {
+		auto result = ParseRichSupportedBlock(Kind::Photo);
+		result.photoId = uint64(data.vphoto_id().v);
+		result.caption = ParseRichCaption(data.vcaption());
+		result.spoiler = data.is_spoiler();
+		if (const auto url = data.vurl()) {
+			result.optionalUrl = ParseString(*url);
+		}
+		if (const auto webpageId = data.vwebpage_id()) {
+			result.optionalWebpageId = uint64(webpageId->v);
+		}
+		return result;
+	}, [](const MTPDpageBlockVideo &data) {
+		auto result = ParseRichSupportedBlock(Kind::Video);
+		result.documentId = uint64(data.vvideo_id().v);
+		result.caption = ParseRichCaption(data.vcaption());
+		result.autoplay = data.is_autoplay();
+		result.loop = data.is_loop();
+		result.spoiler = data.is_spoiler();
+		return result;
+	}, [](const MTPDpageBlockCover &data) {
+		auto result = ParseRichSupportedBlock(Kind::Cover);
+		result.blocks.reserve(1);
+		result.blocks.push_back(ParseRichBlock(data.vcover()));
+		return result;
+	}, [](const MTPDpageBlockEmbed &data) {
+		auto result = ParseRichSupportedBlock(Kind::Embed);
+		result.fullWidth = data.is_full_width();
+		result.allowScrolling = data.is_allow_scrolling();
+		result.caption = ParseRichCaption(data.vcaption());
+		if (const auto url = data.vurl()) {
+			result.optionalUrl = ParseString(*url);
+		}
+		if (const auto html = data.vhtml()) {
+			result.html = ParseString(*html);
+		}
+		if (const auto posterPhotoId = data.vposter_photo_id()) {
+			result.posterPhotoId = uint64(posterPhotoId->v);
+		}
+		if (const auto width = data.vw()) {
+			result.width = width->v;
+		}
+		if (const auto height = data.vh()) {
+			result.height = height->v;
+		}
+		return result;
+	}, [](const MTPDpageBlockEmbedPost &data) {
+		auto result = ParseRichSupportedBlock(Kind::EmbedPost);
+		result.url = ParseString(data.vurl());
+		result.webpageId = uint64(data.vwebpage_id().v);
+		result.authorPhotoId = uint64(data.vauthor_photo_id().v);
+		result.author = ParseString(data.vauthor());
+		result.date = data.vdate().v;
+		result.blocks = ParseRichBlocks(data.vblocks().v);
+		result.caption = ParseRichCaption(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockCollage &data) {
+		auto result = ParseRichSupportedBlock(Kind::Collage);
+		result.blocks = ParseRichBlocks(data.vitems().v);
+		result.caption = ParseRichCaption(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockSlideshow &data) {
+		auto result = ParseRichSupportedBlock(Kind::Slideshow);
+		result.blocks = ParseRichBlocks(data.vitems().v);
+		result.caption = ParseRichCaption(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockChannel &data) {
+		auto result = ParseRichSupportedBlock(Kind::Channel);
+		result.channel = ParseRichChannel(data.vchannel());
+		return result;
+	}, [](const MTPDpageBlockAudio &data) {
+		auto result = ParseRichSupportedBlock(Kind::Audio);
+		result.documentId = uint64(data.vaudio_id().v);
+		result.caption = ParseRichCaption(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockKicker &data) {
+		return ParseRichHeadingBlock(5, data.vtext());
+	}, [](const MTPDpageBlockTable &data) {
+		auto result = ParseRichTextBlock(Kind::Table, data.vtitle());
+		result.bordered = data.is_bordered();
+		result.striped = data.is_striped();
+		result.compact = data.is_compact();
+		const auto &rows = data.vrows().v;
+		result.tableRows.reserve(rows.size());
+		for (const auto &row : rows) {
+			result.tableRows.push_back(ParseRichTableRow(row));
+		}
+		return result;
+	}, [](const MTPDpageBlockOrderedList &data) {
+		auto result = RichBlock();
+		result.kind = Kind::List;
+		result.listKind = RichListKind::Ordered;
+		result.orderedList.reversed = data.is_reversed();
+		if (const auto start = data.vstart()) {
+			result.orderedList.start = start->v;
+		}
+		if (const auto type = data.vtype()) {
+			result.orderedList.type = ParseString(*type);
+		}
+		const auto &items = data.vitems().v;
+		result.listItems.reserve(items.size());
+		for (const auto &item : items) {
+			result.listItems.push_back(ParseRichOrderedListItem(item));
+		}
+		return result;
+	}, [](const MTPDpageBlockDetails &data) {
+		auto result = ParseRichTextBlock(Kind::Details, data.vtitle());
+		result.open = data.is_open();
+		result.blocks = ParseRichBlocks(data.vblocks().v);
+		return result;
+	}, [](const MTPDpageBlockRelatedArticles &data) {
+		auto result = ParseRichSupportedBlock(Kind::RelatedArticles);
+		result.text = ParseRichText(data.vtitle());
+		const auto &articles = data.varticles().v;
+		result.relatedArticles.reserve(articles.size());
+		for (const auto &article : articles) {
+			result.relatedArticles.push_back(
+				ParseRichRelatedArticle(article));
+		}
+		return result;
+	}, [](const MTPDpageBlockMap &data) {
+		auto result = ParseRichSupportedBlock(Kind::Map);
+		result.mapPoint = ParseRichMapPoint(data.vgeo());
+		result.zoom = data.vzoom().v;
+		result.mapWidth = data.vw().v;
+		result.mapHeight = data.vh().v;
+		result.caption = ParseRichCaption(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockHeading1 &data) {
+		return ParseRichHeadingBlock(1, data.vtext());
+	}, [](const MTPDpageBlockHeading2 &data) {
+		return ParseRichHeadingBlock(2, data.vtext());
+	}, [](const MTPDpageBlockHeading3 &data) {
+		return ParseRichHeadingBlock(3, data.vtext());
+	}, [](const MTPDpageBlockHeading4 &data) {
+		return ParseRichHeadingBlock(4, data.vtext());
+	}, [](const MTPDpageBlockHeading5 &data) {
+		return ParseRichHeadingBlock(5, data.vtext());
+	}, [](const MTPDpageBlockHeading6 &data) {
+		return ParseRichHeadingBlock(6, data.vtext());
+	}, [](const MTPDpageBlockMath &data) {
+		auto result = RichBlock();
+		result.kind = Kind::Math;
+		result.formula = ParseString(data.vsource());
+		return result;
+	}, [](const MTPDpageBlockThinking &data) {
+		return ParseRichTextBlock(Kind::Thinking, data.vtext());
+	}, [](const MTPDinputPageBlockMap &data) {
+		auto result = ParseRichSupportedBlock(Kind::InputMap);
+		result.mapPoint = ParseRichMapPoint(data.vgeo());
+		result.zoom = data.vzoom().v;
+		result.mapWidth = data.vw().v;
+		result.mapHeight = data.vh().v;
+		result.caption = ParseRichCaption(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockBlockquoteBlocks &data) {
+		auto result = RichBlock();
+		result.kind = Kind::Quote;
+		result.quoteContent = RichQuoteContent::Blocks;
+		result.blocks = ParseRichBlocks(data.vblocks().v);
+		result.quoteCaption = ParseRichText(data.vcaption());
+		return result;
+	}, [](const MTPDpageBlockButtonRow &data) {
+		auto result = ParseRichSupportedBlock(Kind::ButtonRow);
+		result.buttonAlignment = data.is_align_left()
+			? RichButtonAlignment::Left
+			: data.is_align_center()
+			? RichButtonAlignment::Center
+			: data.is_align_right()
+			? RichButtonAlignment::Right
+			: RichButtonAlignment::Stretch;
+		const auto &buttons = data.vbuttons().v;
+		result.buttons.reserve(buttons.size());
+		for (const auto &button : buttons) {
+			const auto &fields = button.data();
+			if (auto parsed = ParseRichButton(
+					fields.vtext(),
+					fields.vtype(),
+					fields.vstyle(),
+					false)) {
+				result.buttons.push_back(std::move(*parsed));
+			}
+		}
+		return result;
+	}, [](const MTPDpageBlockDocument &data) {
+		auto result = ParseRichSupportedBlock(Kind::File);
+		result.documentId = uint64(data.vdocument_id().v);
+		result.caption = ParseRichCaption(data.vcaption());
+		return result;
+	});
+}
+
+std::vector<RichBlock> ParseRichBlocks(
+		const QVector<MTPPageBlock> &blocks) {
+	auto result = std::vector<RichBlock>();
+	result.reserve(blocks.size());
+	for (const auto &block : blocks) {
+		result.push_back(ParseRichBlock(block));
+	}
+	return result;
+}
+
+RichMessage ParseRichMessageRoot(
+		ParseMediaContext &context,
+		const MTPRichMessage &message,
+		const QString &mediaFolder,
+		TimeId messageDate) {
+	const auto &data = message.data();
+	auto result = RichMessage();
+	result.rtl = data.is_rtl();
+	result.part = data.is_part();
+	for (const auto &photo : data.vphotos().v) {
+		++context.photos;
+		auto parsed = ParsePhoto(
+			photo,
+			mediaFolder
+				+ "photos/"
+				+ PreparePhotoFileName(context.photos, messageDate));
+		const auto id = parsed.id;
+		result.photos.insert_or_assign(id, std::move(parsed));
+	}
+	for (const auto &document : data.vdocuments().v) {
+		auto parsed = ParseDocument(
+			context,
+			document,
+			mediaFolder,
+			messageDate);
+		const auto id = parsed.id;
+		result.documents.insert_or_assign(id, std::move(parsed));
+	}
+	result.blocks = ParseRichBlocks(data.vblocks().v);
+	return result;
+}
+
+} // namespace
+
+RichMessage ParseRichMessage(
+		ParseMediaContext &context,
+		const MTPRichMessage &data,
+		const QString &folder,
+		TimeId date) {
+	return ParseRichMessageRoot(context, data, folder, date);
+}
+
+Utf8String Reaction::Id(const Reaction &reaction) {
+	auto id = Utf8String();
+	switch (reaction.type) {
+	case Reaction::Type::Emoji:
+		id = reaction.emoji.toUtf8();
+		break;
+	case Reaction::Type::CustomEmoji:
+		id = reaction.documentId;
+		break;
+	}
+	return Reaction::TypeToString(reaction) + id;
+}
+
+Reaction ParseReaction(const MTPReaction& reaction) {
+	auto result = Reaction();
+	reaction.match([&](const MTPDreactionEmoji &data) {
+		result.type = Reaction::Type::Emoji;
+		result.emoji = qs(data.vemoticon());
+	}, [&](const MTPDreactionCustomEmoji &data) {
+		result.type = Reaction::Type::CustomEmoji;
+		result.documentId = NumberToString(data.vdocument_id().v);
+	}, [&](const MTPDreactionPaid &data) {
+		result.type = Reaction::Type::Paid;
+	}, [&](const MTPDreactionEmpty &data) {
+		result.type = Reaction::Type::Empty;
+	});
+	return result;
+}
+
+std::vector<Reaction> ParseReactions(const MTPMessageReactions &data) {
+	auto reactionsMap = std::map<QString, Reaction>();
+	auto reactionsOrder = std::vector<Utf8String>();
+	for (const auto &single : data.data().vresults().v) {
+		auto reaction = ParseReaction(single.data().vreaction());
+		reaction.count = single.data().vcount().v;
+		const auto id = Reaction::Id(reaction);
+		auto const &[_, inserted] = reactionsMap.try_emplace(
+			id,
+			std::move(reaction));
+		if (inserted) {
+			reactionsOrder.push_back(id);
+		}
+	}
+	if (data.data().vrecent_reactions().has_value()) {
+		if (const auto list = data.data().vrecent_reactions()) {
+			for (const auto &single : list->v) {
+				auto reaction = ParseReaction(single.data().vreaction());
+				const auto id = Reaction::Id(reaction);
+				auto const &[it, inserted] = reactionsMap.try_emplace(
+					id,
+					std::move(reaction));
+				if (inserted) {
+					reactionsOrder.push_back(id);
+				}
+				it->second.recent.push_back({
+					.peerId = ParsePeerId(single.data().vpeer_id()),
+					.date = single.data().vdate().v,
+				});
+			}
+		}
+	}
+	return ranges::views::all(
+		reactionsOrder
+	) | ranges::views::transform([&](const Utf8String &id) {
+		return reactionsMap.at(id);
+	}) | ranges::to_vector;
+}
+
 Utf8String FillLeft(const Utf8String &data, int length, char filler) {
 	if (length <= data.size()) {
 		return data;
 	}
 	auto result = Utf8String();
 	result.reserve(length);
-	for (auto i = 0, count = length - data.size(); i != count; ++i) {
+	for (auto i = 0, count = length - int(data.size()); i != count; ++i) {
 		result.append(filler);
 	}
 	result.append(data);
@@ -303,6 +1403,9 @@ void ParseAttributes(
 		}, [&](const MTPDdocumentAttributeSticker &data) {
 			result.isSticker = true;
 			result.stickerEmoji = ParseString(data.valt());
+		}, [&](const MTPDdocumentAttributeCustomEmoji &data) {
+			result.isSticker = true;
+			result.stickerEmoji = ParseString(data.valt());
 		}, [&](const MTPDdocumentAttributeVideo &data) {
 			if (data.is_round_message()) {
 				result.isVideoMessage = true;
@@ -311,7 +1414,7 @@ void ParseAttributes(
 			}
 			result.width = data.vw().v;
 			result.height = data.vh().v;
-			result.duration = data.vduration().v;
+			result.duration = int(data.vduration().v);
 		}, [&](const MTPDdocumentAttributeAudio &data) {
 			if (data.is_voice()) {
 				result.isVoiceMessage = true;
@@ -341,30 +1444,30 @@ QString ComputeDocumentName(
 	}
 	const auto mimeString = QString::fromUtf8(data.mime);
 	const auto mimeType = Core::MimeTypeForName(mimeString);
-	const auto hasMimeType = [&](QLatin1String mime) {
+	const auto hasMimeType = [&](const auto &mime) {
 		return !mimeString.compare(mime, Qt::CaseInsensitive);
 	};
 	const auto patterns = mimeType.globPatterns();
 	const auto pattern = patterns.isEmpty() ? QString() : patterns.front();
 	if (data.isVoiceMessage) {
-		const auto isMP3 = hasMimeType(qstr("audio/mp3"));
-		return qsl("audio_")
+		const auto isMP3 = hasMimeType(u"audio/mp3"_q);
+		return u"audio_"_q
 			+ QString::number(++context.audios)
 			+ PrepareFileNameDatePart(date)
-			+ (isMP3 ? qsl(".mp3") : qsl(".ogg"));
+			+ (isMP3 ? u".mp3"_q : u".ogg"_q);
 	} else if (data.isVideoFile) {
 		const auto extension = pattern.isEmpty()
-			? qsl(".mov")
+			? u".mov"_q
 			: QString(pattern).replace('*', QString());
-		return qsl("video_")
+		return u"video_"_q
 			+ QString::number(++context.videos)
 			+ PrepareFileNameDatePart(date)
 			+ extension;
 	} else {
 		const auto extension = pattern.isEmpty()
-			? qsl(".unknown")
+			? u".unknown"_q
 			: QString(pattern).replace('*', QString());
-		return qsl("file_")
+		return u"file_"_q
 			+ QString::number(++context.files)
 			+ PrepareFileNameDatePart(date)
 			+ extension;
@@ -501,9 +1604,13 @@ SharedContact ParseSharedContact(
 GeoPoint ParseGeoPoint(const MTPGeoPoint &data) {
 	auto result = GeoPoint();
 	data.match([&](const MTPDgeoPoint &data) {
-		result.latitude = data.vlat().v;
-		result.longitude = data.vlong().v;
-		result.valid = true;
+		const auto latitude = data.vlat().v;
+		const auto longitude = data.vlong().v;
+		if (::Data::ValidGeoCoordinates(latitude, longitude)) {
+			result.latitude = latitude;
+			result.longitude = longitude;
+			result.valid = true;
+		}
 	}, [](const MTPDgeoPointEmpty &data) {});
 	return result;
 }
@@ -516,7 +1623,7 @@ Venue ParseVenue(const MTPDmessageMediaVenue &data) {
 	return result;
 }
 
-Game ParseGame(const MTPGame &data, int32 botId) {
+Game ParseGame(const MTPGame &data, UserId botId) {
 	return data.match([&](const MTPDgame &data) {
 		auto result = Game();
 		result.id = data.vid().v;
@@ -540,21 +1647,44 @@ Invoice ParseInvoice(const MTPDmessageMediaInvoice &data) {
 	return result;
 }
 
+PaidMedia ParsePaidMedia(
+		ParseMediaContext &context,
+		const MTPDmessageMediaPaidMedia &data,
+		const QString &folder,
+		TimeId date) {
+	auto result = PaidMedia();
+	result.stars = data.vstars_amount().v;
+	result.extended.reserve(data.vextended_media().v.size());
+	for (const auto &extended : data.vextended_media().v) {
+		result.extended.push_back(extended.match([](
+			const MTPDmessageExtendedMediaPreview &)
+		-> std::unique_ptr<Media> {
+			return std::unique_ptr<Media>();
+		}, [&](const MTPDmessageExtendedMedia &data)
+		-> std::unique_ptr<Media> {
+			return std::make_unique<Media>(
+				ParseMedia(context, data.vmedia(), folder, date));
+		}));
+	}
+	return result;
+}
+
 Poll ParsePoll(const MTPDmessageMediaPoll &data) {
 	auto result = Poll();
 	data.vpoll().match([&](const MTPDpoll &poll) {
 		result.id = poll.vid().v;
-		result.question = ParseString(poll.vquestion());
+		result.question = ParseText(poll.vquestion());
 		result.closed = poll.is_closed();
 		result.answers = ranges::views::all(
 			poll.vanswers().v
 		) | ranges::views::transform([](const MTPPollAnswer &answer) {
-			return answer.match([](const MTPDpollAnswer &answer) {
-				auto result = Poll::Answer();
-				result.text = ParseString(answer.vtext());
-				result.option = answer.voption().v;
-				return result;
+			auto result = Poll::Answer();
+			answer.match([&](const MTPDpollAnswer &data) {
+				result.text = ParseText(data.vtext());
+				result.option = data.voption().v;
+			}, [](const auto &) {
 			});
+			return result;
 		}) | ranges::to_vector;
 	});
 	data.vresults().match([&](const MTPDpollResults &results) {
@@ -563,23 +1693,93 @@ Poll ParsePoll(const MTPDmessageMediaPoll &data) {
 		}
 		if (const auto resultsList = results.vresults()) {
 			for (const auto &single : resultsList->v) {
-				single.match([&](const MTPDpollAnswerVoters &voters) {
-					const auto &option = voters.voption().v;
-					const auto i = ranges::find(
-						result.answers,
-						voters.voption().v,
-						&Poll::Answer::option);
-					if (i == end(result.answers)) {
-						return;
-					}
-					i->votes = voters.vvoters().v;
-					if (voters.is_chosen()) {
-						i->my = true;
-					}
-				});
+				const auto &voters = single.data();
+				const auto i = ranges::find(
+					result.answers,
+					voters.voption().v,
+					&Poll::Answer::option);
+				if (i == end(result.answers)) {
+					continue;
+				}
+				if (const auto votes = voters.vvoters()) {
+					i->votes = votes->v;
+				}
+				if (voters.is_chosen()) {
+					i->my = true;
+				}
 			}
 		}
 	});
+	return result;
+}
+
+TodoListItem ParseTodoListItem(const MTPTodoItem &item) {
+	const auto &data = item.data();
+	auto result = TodoListItem();
+	result.text = ParseText(data.vtitle());
+	result.id = data.vid().v;
+	return result;
+}
+
+TodoList ParseTodoList(const MTPDmessageMediaToDo &data) {
+	auto result = TodoList();
+	data.vtodo().match([&](const MTPDtodoList &data) {
+		result.title = ParseText(data.vtitle());
+		result.othersCanAppend = data.is_others_can_append();
+		result.othersCanComplete = data.is_others_can_complete();
+		result.items = ranges::views::all(
+			data.vlist().v
+		) | ranges::views::transform(
+			ParseTodoListItem
+		) | ranges::to_vector;
+	});
+	return result;
+}
+
+GiveawayStart ParseGiveaway(const MTPDmessageMediaGiveaway &data) {
+	auto result = GiveawayStart{
+		.untilDate = data.vuntil_date().v,
+		.credits = data.vstars().value_or_empty(),
+		.quantity = data.vquantity().v,
+		.months = data.vmonths().value_or_empty(),
+		.all = !data.is_only_new_subscribers(),
+	};
+	for (const auto &id : data.vchannels().v) {
+		result.channels.push_back(ChannelId(id));
+	}
+	if (const auto countries = data.vcountries_iso2()) {
+		result.countries.reserve(countries->v.size());
+		for (const auto &country : countries->v) {
+			result.countries.push_back(qs(country));
+		}
+	}
+	if (const auto additional = data.vprize_description()) {
+		result.additionalPrize = qs(*additional);
+	}
+	return result;
+}
+
+GiveawayResults ParseGiveaway(const MTPDmessageMediaGiveawayResults &data) {
+	const auto additional = data.vadditional_peers_count();
+	auto result = GiveawayResults{
+		.channel = ChannelId(data.vchannel_id()),
+		.untilDate = data.vuntil_date().v,
+		.launchId = data.vlaunch_msg_id().v,
+		.additionalPeersCount = additional.value_or_empty(),
+		.winnersCount = data.vwinners_count().v,
+		.unclaimedCount = data.vunclaimed_count().v,
+		.months = data.vmonths().value_or_empty(),
+		.credits = data.vstars().value_or_empty(),
+		.refunded = data.is_refunded(),
+		.all = !data.is_only_new_subscribers(),
+	};
+	result.winners.reserve(data.vwinners().v.size());
+	for (const auto &id : data.vwinners().v) {
+		result.winners.push_back(UserId(id));
+	}
+	if (const auto additional = data.vprize_description()) {
+		result.additionalPrize = qs(*additional);
+	}
 	return result;
 }
 
@@ -601,6 +1801,119 @@ UserpicsSlice ParseUserpicsSlice(
 	return result;
 }
 
+[[nodiscard]] ActionStarGift ParseStarGift(const MTPStarGift &gift) {
+	return gift.match([&](const MTPDstarGift &gift) {
+		return ActionStarGift{
+			.giftId = uint64(gift.vid().v),
+			.stars = int64(gift.vstars().v),
+			.limited = gift.is_limited(),
+		};
+	}, [&](const MTPDstarGiftUnique &gift) {
+		return ActionStarGift{
+			.giftId = uint64(gift.vid().v),
+		};
+	});
+}
+
+File &Story::file() {
+	return media.file();
+}
+
+const File &Story::file() const {
+	return media.file();
+}
+
+Image &Story::thumb() {
+	return media.thumb();
+}
+
+const Image &Story::thumb() const {
+	return media.thumb();
+}
+
+StoriesSlice ParseStoriesSlice(
+		const MTPVector<MTPStoryItem> &data,
+		int baseIndex) {
+	const auto &list = data.v;
+	auto result = StoriesSlice();
+	result.list.reserve(list.size());
+	for (const auto &story : list) {
+		result.lastId = story.match([](const auto &data) {
+			return data.vid().v;
+		});
+		++result.skipped;
+		story.match([&](const MTPDstoryItem &data) {
+			const auto date = data.vdate().v;
+			auto media = Media();
+			data.vmedia().match([&](const MTPDmessageMediaPhoto &data) {
+				const auto suggestedPath = "stories/"
+					+ PrepareStoryFileName(
+						++baseIndex,
+						date,
+						".jpg"_q);
+				const auto photo = data.vphoto();
+				auto content = photo
+					? ParsePhoto(*photo, suggestedPath)
+					: Photo();
+				content.spoilered = data.is_spoiler();
+				media.content = content;
+			}, [&](const MTPDmessageMediaDocument &data) {
+				const auto document = data.vdocument();
+				auto fake = ParseMediaContext();
+				auto content = document
+					? ParseDocument(fake, *document, "stories", date)
+					: Document();
+				const auto extension = (content.mime == "image/jpeg")
+					? ".jpg"_q
+					: (content.mime == "image/png")
+					? ".png"_q
+					: [&] {
+						const auto mimeType = Core::MimeTypeForName(
+							content.mime);
+						QStringList patterns = mimeType.globPatterns();
+						if (!patterns.isEmpty()) {
+							return patterns.front().replace(
+								'*',
+								QString()).toUtf8();
+						}
+						return QByteArray();
+					}();
+				const auto path = content.file.suggestedPath = "stories/"
+					+ PrepareStoryFileName(
+						++baseIndex,
+						date,
+						extension);
+				content.thumb.file.suggestedPath = path + "_thumb.jpg";
+				content.spoilered = data.is_spoiler();
+				media.content = content;
+			}, [&](const auto &data) {
+				media.content = UnsupportedMedia();
+			});
+			if (!v::is<UnsupportedMedia>(media.content)) {
+				result.list.push_back(Story{
+					.id = data.vid().v,
+					.date = date,
+					.expires = data.vexpire_date().v,
+					.media = std::move(media),
+					.pinned = data.is_pinned(),
+					.caption = (data.vcaption()
+						? ParseText(
+							*data.vcaption(),
+							data.ventities().value_or_empty())
+						: std::vector<TextPart>()),
+				});
+				--result.skipped;
+			}
+		}, [](const auto &) {});
+	}
+	return result;
+}
+
+bool IsSvgFormat(const QByteArray &format) {
+	const auto lower = format.toLower();
+	return (lower == "svg") || (lower == "svgz");
+}
+
 std::pair<QString, QSize> WriteImageThumb(
 		const QString &basePath,
 		const QString &largePath,
@@ -613,7 +1926,7 @@ std::pair<QString, QSize> WriteImageThumb(
 	}
 	const auto path = basePath + largePath;
 	QImageReader reader(path);
-	if (!reader.canRead()) {
+	if (!reader.canRead() || IsSvgFormat(reader.format())) {
 		return {};
 	}
 	const auto size = reader.size();
@@ -670,6 +1983,17 @@ ContactInfo ParseContactInfo(const MTPUser &data) {
 	auto result = ContactInfo();
 	data.match([&](const MTPDuser &data) {
 		result.userId = data.vid().v;
+		result.colorIndex = PeerColorIndex(result.userId);
+		if (const auto color = data.vcolor()) {
+			color->match([&](const MTPDpeerColor &data) {
+				if (const auto color = data.vcolor()) {
+					result.colorIndex = color->v;
+				}
+			}, [](const MTPDpeerColorCollectible &) {
+				// themes
+			}, [](const MTPDinputPeerColorCollectible &) {
+			});
+		}
 		if (const auto firstName = data.vfirst_name()) {
 			result.firstName = ParseString(*firstName);
 		}
@@ -681,22 +2005,35 @@ ContactInfo ParseContactInfo(const MTPUser &data) {
 		}
 	}, [&](const MTPDuserEmpty &data) {
 		result.userId = data.vid().v;
+		result.colorIndex = PeerColorIndex(result.userId);
 	});
 	return result;
 }
 
-int ContactColorIndex(const ContactInfo &data) {
-	if (data.userId != 0) {
-		return PeerColorIndex(data.userId);
-	}
-	return PeerColorIndex(StringBarePeerId(data.phoneNumber));
+uint8 ContactColorIndex(const ContactInfo &data) {
+	return data.colorIndex;
+}
+
+PeerId User::id() const {
+	return UserId(bareId);
 }
 
 User ParseUser(const MTPUser &data) {
 	auto result = User();
 	result.info = ParseContactInfo(data);
 	data.match([&](const MTPDuser &data) {
-		result.id = data.vid().v;
+		result.bareId = data.vid().v;
+		result.colorIndex = PeerColorIndex(result.bareId);
+		if (const auto color = data.vcolor()) {
+			color->match([&](const MTPDpeerColor &data) {
+				if (const auto color = data.vcolor()) {
+					result.colorIndex = color->v;
+				}
+			}, [](const MTPDpeerColorCollectible &) {
+				// themes
+			}, [](const MTPDinputPeerColorCollectible &) {
+			});
+		}
 		if (const auto username = data.vusername()) {
 			result.username = ParseString(*username);
 		}
@@ -705,6 +2042,10 @@ User ParseUser(const MTPUser &data) {
 		}
 		if (data.is_self()) {
 			result.isSelf = true;
+		} else if (data.vid().v == 1271266957) {
+			result.isReplies = true;
+		} else if (data.vid().v == 489000) {
+			result.isVerifyCodes = true;
 		}
 		result.input = MTP_inputUser(
 			data.vid(),
@@ -715,8 +2056,8 @@ User ParseUser(const MTPUser &data) {
 	return result;
 }
 
-std::map<int32, User> ParseUsersList(const MTPVector<MTPUser> &data) {
-	auto result = std::map<int32, User>();
+std::map<UserId, User> ParseUsersList(const MTPVector<MTPUser> &data) {
+	auto result = std::map<UserId, User>();
 	for (const auto &user : data.v) {
 		auto parsed = ParseUser(user);
 		result.emplace(parsed.info.userId, std::move(parsed));
@@ -724,54 +2065,81 @@ std::map<int32, User> ParseUsersList(const MTPVector<MTPUser> &data) {
 	return result;
 }
 
+PeerId Chat::id() const {
+	return (isBroadcast || isSupergroup)
+		? PeerId(ChannelId(bareId))
+		: ChatId(bareId);
+}
+
 Chat ParseChat(const MTPChat &data) {
 	auto result = Chat();
 	data.match([&](const MTPDchat &data) {
-		result.id = data.vid().v;
+		result.bareId = data.vid().v;
 		result.title = ParseString(data.vtitle());
-		result.input = MTP_inputPeerChat(MTP_int(result.id));
+		result.input = MTP_inputPeerChat(MTP_long(result.bareId));
 		if (const auto migratedTo = data.vmigrated_to()) {
 			result.migratedToChannelId = migratedTo->match(
 			[](const MTPDinputChannel &data) {
 				return data.vchannel_id().v;
-			}, [](auto&&) { return 0; });
+			}, [](auto&&) { return BareId(); });
 		}
 	}, [&](const MTPDchatEmpty &data) {
-		result.id = data.vid().v;
-		result.input = MTP_inputPeerChat(MTP_int(result.id));
+		result.bareId = data.vid().v;
+		result.input = MTP_inputPeerChat(MTP_long(result.bareId));
 	}, [&](const MTPDchatForbidden &data) {
-		result.id = data.vid().v;
+		result.bareId = data.vid().v;
 		result.title = ParseString(data.vtitle());
-		result.input = MTP_inputPeerChat(MTP_int(result.id));
+		result.input = MTP_inputPeerChat(MTP_long(result.bareId));
 	}, [&](const MTPDchannel &data) {
-		result.id = data.vid().v;
+		result.bareId = data.vid().v;
+		result.colorIndex = PeerColorIndex(result.bareId);
+		if (const auto color = data.vcolor()) {
+			color->match([&](const MTPDpeerColor &data) {
+				if (const auto color = data.vcolor()) {
+					result.colorIndex = color->v;
+				}
+			}, [](const MTPDpeerColorCollectible &) {
+			}, [](const MTPDinputPeerColorCollectible &) {
+			});
+		}
+		result.isMonoforum = data.is_monoforum();
 		result.isBroadcast = data.is_broadcast();
 		result.isSupergroup = data.is_megagroup();
+		result.hasMonoforumAdminRights = data.is_broadcast()
+			&& (data.is_creator()
+				|| (data.vadmin_rights()
+					&& data.vadmin_rights()->data().is_manage_direct_messages()));
+		result.monoforumLinkId
+			= data.vlinked_monoforum_id().value_or_empty();
 		result.title = ParseString(data.vtitle());
 		if (const auto username = data.vusername()) {
 			result.username = ParseString(*username);
 		}
 		result.input = MTP_inputPeerChannel(
-			MTP_int(result.id),
+			MTP_long(result.bareId),
 			MTP_long(data.vaccess_hash().value_or_empty()));
 	}, [&](const MTPDchannelForbidden &data) {
-		result.id = data.vid().v;
+		result.bareId = data.vid().v;
 		result.isBroadcast = data.is_broadcast();
 		result.isSupergroup = data.is_megagroup();
+		result.isMonoforum = data.is_monoforum();
 		result.title = ParseString(data.vtitle());
 		result.input = MTP_inputPeerChannel(
-			MTP_int(result.id),
+			MTP_long(result.bareId),
 			data.vaccess_hash());
+	}, [&](const MTPDcommunity &data) {
+		result.bareId = data.vid().v;
+		result.title = ParseString(data.vtitle());
+		result.input = MTP_inputPeerChannel(
+			MTP_long(result.bareId),
+			MTP_long(data.vaccess_hash().value_or_empty()));
+	}, [&](const MTPDcommunityForbidden &data) {
+		result.bareId = data.vid().v;
+		result.title = ParseString(data.vtitle());
+		result.input = MTP_inputPeerChannel(
+			MTP_long(result.bareId),
+			MTP_long(data.vaccess_hash().value_or_empty()));
 	});
-	return result;
-}
-
-std::map<int32, Chat> ParseChatsList(const MTPVector<MTPChat> &data) {
-	auto result = std::map<int32, Chat>();
-	for (const auto &chat : data.v) {
-		auto parsed = ParseChat(chat);
-		result.emplace(parsed.id, std::move(parsed));
-	}
 	return result;
 }
 
@@ -799,9 +2167,9 @@ const Chat *Peer::chat() const {
 
 PeerId Peer::id() const {
 	if (const auto user = this->user()) {
-		return UserPeerId(user->info.userId);
+		return peerFromUser(user->info.userId);
 	} else if (const auto chat = this->chat()) {
-		return ChatPeerId(chat->id);
+		return chat->id();
 	}
 	Unexpected("Variant in Peer::id.");
 }
@@ -828,6 +2196,15 @@ MTPInputPeer Peer::input() const {
 	Unexpected("Variant in Peer::id.");
 }
 
+uint8 Peer::colorIndex() const {
+	if (const auto user = this->user()) {
+		return user->colorIndex;
+	} else if (const auto chat = this->chat()) {
+		return chat->colorIndex;
+	}
+	Unexpected("Variant in Peer::colorIndex.");
+}
+
 std::map<PeerId, Peer> ParsePeersLists(
 		const MTPVector<MTPUser> &users,
 		const MTPVector<MTPChat> &chats) {
@@ -835,29 +2212,45 @@ std::map<PeerId, Peer> ParsePeersLists(
 	for (const auto &user : users.v) {
 		auto parsed = ParseUser(user);
 		result.emplace(
-			UserPeerId(parsed.info.userId),
+			PeerId(parsed.info.userId),
 			Peer{ std::move(parsed) });
 	}
 	for (const auto &chat : chats.v) {
 		auto parsed = ParseChat(chat);
-		result.emplace(ChatPeerId(parsed.id), Peer{ std::move(parsed) });
+		result.emplace(parsed.id(), Peer{ std::move(parsed) });
+	}
+	for (auto &[peerId, parsed] : result) {
+		if (const auto chat = std::get_if<Chat>(&parsed.data)) {
+			if (chat->isMonoforum) {
+				const auto i = result.find(
+					PeerId(ChannelId(chat->monoforumLinkId)));
+				if (i != end(result)) {
+					chat->isMonoforumAdmin
+						= i->second.chat()->hasMonoforumAdminRights;
+					chat->isMonoforumOfPublicBroadcast
+						= !i->second.chat()->username.isEmpty();
+				}
+			}
+		}
 	}
 	return result;
 }
 
-User EmptyUser(int32 userId) {
-	return ParseUser(MTP_userEmpty(MTP_int(userId)));
+User EmptyUser(UserId userId) {
+	return ParseUser(MTP_userEmpty(MTP_long(userId.bare)));
 }
 
-Chat EmptyChat(int32 chatId) {
-	return ParseChat(MTP_chatEmpty(MTP_int(chatId)));
+Chat EmptyChat(ChatId chatId) {
+	return ParseChat(MTP_chatEmpty(MTP_long(chatId.bare)));
 }
 
 Peer EmptyPeer(PeerId peerId) {
-	if (IsUserPeerId(peerId)) {
-		return Peer{ EmptyUser(BarePeerId(peerId)) };
-	} else if (IsChatPeerId(peerId)) {
-		return Peer{ EmptyChat(BarePeerId(peerId)) };
+	if (peerIsUser(peerId)) {
+		return Peer{ EmptyUser(peerToUser(peerId)) };
+	} else if (peerIsChat(peerId)) {
+		return Peer{ EmptyChat(peerToChat(peerId)) };
+	} else if (peerIsChannel(peerId)) {
+		return Peer{ EmptyChat(peerToChat(peerId)) };
 	}
 	Unexpected("PeerId in EmptyPeer.");
 }
@@ -923,6 +2316,7 @@ Media ParseMedia(
 				+ "photos/"
 				+ PreparePhotoFileName(++context.photos, date))
 			: Photo();
+		content.spoilered = data.is_spoiler();
 		if (const auto ttl = data.vttl_seconds()) {
 			result.ttl = ttl->v;
 			content.image.file = File();
@@ -943,6 +2337,7 @@ Media ParseMedia(
 			result.ttl = ttl->v;
 			content.file = File();
 		}
+		content.spoilered = data.is_spoiler();
 		result.content = content;
 	}, [&](const MTPDmessageMediaWebPage &data) {
 		// Ignore web pages.
@@ -957,8 +2352,22 @@ Media ParseMedia(
 		result.ttl = data.vperiod().v;
 	}, [&](const MTPDmessageMediaPoll &data) {
 		result.content = ParsePoll(data);
+	}, [&](const MTPDmessageMediaToDo &data) {
+		result.content = ParseTodoList(data);
 	}, [](const MTPDmessageMediaDice &data) {
 		// #TODO dice
+	}, [](const MTPDmessageMediaStory &data) {
+		// #TODO export stories
+	}, [&](const MTPDmessageMediaGiveaway &data) {
+		result.content = ParseGiveaway(data);
+	}, [&](const MTPDmessageMediaGiveawayResults &data) {
+		result.content = ParseGiveaway(data);
+	}, [&](const MTPDmessageMediaPaidMedia &data) {
+		result.content = ParsePaidMedia(context, data, folder, date);
+	}, [](const MTPDmessageMediaVideoStream &data) {
+		// Live stories.
+	}, [](const MTPDmessageMediaWidget &data) {
+		// #TODO widgets
 	}, [](const MTPDmessageMediaEmpty &data) {});
 	return result;
 }
@@ -1034,6 +2443,8 @@ ServiceAction ParseServiceAction(
 		auto content = ActionPaymentSent();
 		content.currency = ParseString(data.vcurrency());
 		content.amount = data.vtotal_amount().v;
+		content.recurringInit = data.is_recurring_init();
+		content.recurringUsed = data.is_recurring_used();
 		result.content = content;
 	}, [&](const MTPDmessageActionPhoneCall &data) {
 		auto content = ActionPhoneCall();
@@ -1041,16 +2452,18 @@ ServiceAction ParseServiceAction(
 			content.duration = duration->v;
 		}
 		if (const auto reason = data.vreason()) {
-			using Reason = ActionPhoneCall::DiscardReason;
-			content.discardReason = reason->match(
+			using State = ActionPhoneCall::State;
+			content.state = reason->match(
 			[](const MTPDphoneCallDiscardReasonMissed &data) {
-				return Reason::Missed;
+				return State::Missed;
 			}, [](const MTPDphoneCallDiscardReasonDisconnect &data) {
-				return Reason::Disconnect;
+				return State::Disconnect;
 			}, [](const MTPDphoneCallDiscardReasonHangup &data) {
-				return Reason::Hangup;
+				return State::Hangup;
 			}, [](const MTPDphoneCallDiscardReasonBusy &data) {
-				return Reason::Busy;
+				return State::Busy;
+			}, [](const MTPDphoneCallDiscardReasonMigrateConferenceCall &) {
+				return State::MigrateConferenceCall;
 			});
 		}
 		result.content = content;
@@ -1062,7 +2475,17 @@ ServiceAction ParseServiceAction(
 		result.content = content;
 	}, [&](const MTPDmessageActionBotAllowed &data) {
 		auto content = ActionBotAllowed();
-		content.domain = ParseString(data.vdomain());
+		if (const auto app = data.vapp()) {
+			app->match([&](const MTPDbotApp &data) {
+				content.appId = data.vid().v;
+				content.app = ParseString(data.vtitle());
+			}, [](const MTPDbotAppNotModified &) {});
+		}
+		if (const auto domain = data.vdomain()) {
+			content.domain = ParseString(*domain);
+		}
+		content.attachMenu = data.is_attach_menu();
+		content.fromRequest = data.is_from_request();
 		result.content = content;
 	}, [&](const MTPDmessageActionSecureValuesSentMe &data) {
 		// Should not be in user inbox.
@@ -1129,23 +2552,311 @@ ServiceAction ParseServiceAction(
 		}
 		result.content = content;
 	}, [&](const MTPDmessageActionSetMessagesTTL &data) {
-		// #TODO ttl
+		result.content = ActionSetMessagesTTL{
+			.period = data.vperiod().v,
+		};
+	}, [&](const MTPDmessageActionGroupCallScheduled &data) {
+		result.content = ActionGroupCallScheduled{
+			.date = data.vschedule_date().v,
+		};
+	}, [&](const MTPDmessageActionSetChatTheme &data) {
+		data.vtheme().match([&](const MTPDchatTheme &data) {
+			result.content = ActionSetChatTheme{
+				.emoji = qs(data.vemoticon()),
+			};
+		}, [&](const MTPDchatThemeUniqueGift &data) {
+			result.content = ActionSetChatTheme{};
+		});
+	}, [&](const MTPDmessageActionChatJoinedByRequest &data) {
+		result.content = ActionChatJoinedByRequest();
+	}, [&](const MTPDmessageActionWebViewDataSentMe &data) {
+		// Should not be in user inbox.
+	}, [&](const MTPDmessageActionWebViewDataSent &data) {
+		auto content = ActionWebViewDataSent();
+		content.text = ParseString(data.vtext());
+		result.content = content;
+	}, [&](const MTPDmessageActionGiftPremium &data) {
+		auto content = ActionGiftPremium();
+		content.cost = Ui::FillAmountAndCurrency(
+			data.vamount().v,
+			qs(data.vcurrency())).toUtf8();
+		content.days = data.vdays().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionTopicCreate &data) {
+		auto content = ActionTopicCreate();
+		content.title = ParseString(data.vtitle());
+		result.content = content;
+	}, [&](const MTPDmessageActionTopicEdit &data) {
+		auto content = ActionTopicEdit();
+		if (const auto title = data.vtitle()) {
+			content.title = ParseString(*title);
+		}
+		if (const auto icon = data.vicon_emoji_id()) {
+			content.iconEmojiId = icon->v;
+		}
+		result.content = content;
+	}, [&](const MTPDmessageActionSuggestProfilePhoto &data) {
+		auto content = ActionSuggestProfilePhoto();
+		content.photo = ParsePhoto(
+			data.vphoto(),
+			mediaFolder
+			+ "photos/"
+			+ PreparePhotoFileName(++context.photos, date));
+		result.content = content;
+	}, [&](const MTPDmessageActionSetChatWallPaper &data) {
+		auto content = ActionSetChatWallPaper();
+		// #TODO wallpapers
+		content.same = data.is_same();
+		content.both = data.is_for_both();
+		result.content = content;
+	}, [&](const MTPDmessageActionRequestedPeer &data) {
+		auto content = ActionRequestedPeer();
+		for (const auto &peer : data.vpeers().v) {
+			content.peers.push_back(ParsePeerId(peer));
+		}
+		content.buttonId = data.vbutton_id().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionGiftCode &data) {
+		auto content = ActionGiftCode();
+		content.boostPeerId = data.vboost_peer()
+			? peerFromMTP(*data.vboost_peer())
+			: PeerId();
+		content.viaGiveaway = data.is_via_giveaway();
+		content.unclaimed = data.is_unclaimed();
+		content.days = data.vdays().v;
+		content.code = data.vslug().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionGiveawayLaunch &data) {
+		auto content = ActionGiveawayLaunch();
+		result.content = content;
+	}, [&](const MTPDmessageActionGiveawayResults &data) {
+		auto content = ActionGiveawayResults();
+		content.winners = data.vwinners_count().v;
+		content.unclaimed = data.vunclaimed_count().v;
+		content.credits = data.is_stars();
+		result.content = content;
+	}, [&](const MTPDmessageActionBoostApply &data) {
+		auto content = ActionBoostApply();
+		content.boosts = data.vboosts().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionRequestedPeerSentMe &data) {
+		// Should not be in user inbox.
+	}, [&](const MTPDmessageActionPaymentRefunded &data) {
+		auto content = ActionPaymentRefunded();
+		content.currency = ParseString(data.vcurrency());
+		content.amount = data.vtotal_amount().v;
+		content.peerId = ParsePeerId(data.vpeer());
+		content.transactionId = data.vcharge().data().vid().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionGiftStars &data) {
+		auto content = ActionGiftCredits();
+		content.cost = Ui::FillAmountAndCurrency(
+			data.vamount().v,
+			qs(data.vcurrency())).toUtf8();
+		content.amount = CreditsAmount(data.vstars().v, CreditsType::Stars);
+		result.content = content;
+	}, [&](const MTPDmessageActionGiftTon &data) {
+		auto content = ActionGiftCredits();
+		content.cost = Ui::FillAmountAndCurrency(
+			data.vamount().v,
+			qs(data.vcurrency())).toUtf8();
+		content.amount = CreditsAmount(
+			data.vamount().v / uint64(1'000'000'000),
+			data.vamount().v % uint64(1'000'000'000),
+			CreditsType::Ton);
+		result.content = content;
+	}, [&](const MTPDmessageActionPrizeStars &data) {
+		result.content = ActionPrizeStars{
+			.peerId = ParsePeerId(data.vboost_peer()),
+			.amount = data.vstars().v,
+			.transactionId = data.vtransaction_id().v,
+			.giveawayMsgId = data.vgiveaway_msg_id().v,
+			.isUnclaimed = data.is_unclaimed(),
+		};
+	}, [&](const MTPDmessageActionStarGift &data) {
+		auto content = ParseStarGift(data.vgift());
+		content.text = (data.vmessage()
+			? ParseText(
+				data.vmessage()->data().vtext(),
+				data.vmessage()->data().ventities().v)
+			: std::vector<TextPart>());
+		content.anonymous = data.is_name_hidden();
+		result.content = content;
+	}, [&](const MTPDmessageActionStarGiftUnique &data) {
+		result.content = ParseStarGift(data.vgift());
+	}, [&](const MTPDmessageActionPaidMessagesRefunded &data) {
+		result.content = ActionPaidMessagesRefunded{
+			.messages = data.vcount().v,
+			.stars = int64(data.vstars().v),
+		};
+	}, [&](const MTPDmessageActionPaidMessagesPrice &data) {
+		result.content = ActionPaidMessagesPrice{
+			.stars = int(data.vstars().v),
+			.broadcastAllowed = data.is_broadcast_messages_allowed(),
+		};
+	}, [&](const MTPDmessageActionTodoCompletions &data) {
+		const auto take = [](const MTPVector<MTPint> &list) {
+			return list.v
+				| ranges::views::transform(&MTPint::v)
+				| ranges::to_vector;
+		};
+		result.content = ActionTodoCompletions{
+			.completed = take(data.vcompleted()),
+			.incompleted = take(data.vincompleted()),
+		};
+	}, [&](const MTPDmessageActionTodoAppendTasks &data) {
+		result.content = ActionTodoAppendTasks{
+			.items = data.vlist().v
+				| ranges::views::transform(ParseTodoListItem)
+				| ranges::to_vector,
+		};
+	}, [&](const MTPDmessageActionPollAppendAnswer &data) {
+		result.content = ActionPollAppendAnswer{};
+	}, [&](const MTPDmessageActionSuggestedPostApproval &data) {
+		result.content = ActionSuggestedPostApproval{
+			.rejectComment = data.vreject_comment().value_or_empty(),
+			.scheduleDate = data.vschedule_date().value_or_empty(),
+			.price = CreditsAmountFromTL(data.vprice()),
+			.rejected = data.is_rejected(),
+			.balanceTooLow = data.is_balance_too_low(),
+		};
+	}, [&](const MTPDmessageActionSuggestedPostSuccess &data) {
+		result.content = ActionSuggestedPostSuccess{
+			.price = CreditsAmountFromTL(data.vprice()),
+		};
+	}, [&](const MTPDmessageActionSuggestedPostRefund &data) {
+		result.content = ActionSuggestedPostRefund{
+			.payerInitiated = data.is_payer_initiated(),
+		};
+	}, [&](const MTPDmessageActionConferenceCall &data) {
+		auto content = ActionPhoneCall();
+		using State = ActionPhoneCall::State;
+		content.conferenceId = data.vcall_id().v;
+		if (const auto duration = data.vduration()) {
+			content.duration = duration->v;
+		}
+		content.state = data.is_missed()
+			? State::Missed
+			: data.is_active()
+			? State::Active
+			: data.vduration().value_or_empty()
+			? State::Hangup
+			: State::Invitation;
+		result.content = content;
+	}, [&](const MTPDmessageActionSuggestBirthday &data) {
+		auto content = ActionSuggestBirthday();
+		const auto &fields = data.vbirthday().data();
+		content.birthday = Birthday(
+			fields.vday().v,
+			fields.vmonth().v,
+			fields.vyear().value_or_empty());
+		result.content = content;
+	}, [&](const MTPDmessageActionStarGiftPurchaseOffer &data) {
+		auto content = ParseStarGift(data.vgift());
+		content.offer = true;
+		content.offerPrice = CreditsAmountFromTL(data.vprice());
+		content.offerExpireAt = data.vexpires_at().v;
+		content.offerAccepted = data.is_accepted();
+		content.offerDeclined = data.is_declined();
+		result.content = content;
+	}, [&](const MTPDmessageActionStarGiftPurchaseOfferDeclined &data) {
+		auto content = ParseStarGift(data.vgift());
+		content.offer = true;
+		content.offerDeclined = true;
+		content.offerExpired = data.is_expired();
+		content.offerPrice = CreditsAmountFromTL(data.vprice());
+		result.content = content;
+	}, [&](const MTPDmessageActionNewCreatorPending &data) {
+		auto content = ActionNewCreatorPending();
+		content.newCreatorId = data.vnew_creator_id().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionChangeCreator &data) {
+		auto content = ActionChangeCreator();
+		content.newCreatorId = data.vnew_creator_id().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionNoForwardsToggle &data) {
+		auto content = ActionNoForwardsToggle();
+		content.newValue = (data.vnew_value().type() == mtpc_boolTrue);
+		result.content = content;
+	}, [&](const MTPDmessageActionNoForwardsRequest &data) {
+		auto content = ActionNoForwardsRequest();
+		content.expired = data.is_expired();
+		content.newValue = (data.vnew_value().type() == mtpc_boolTrue);
+		result.content = content;
+	}, [&](const MTPDmessageActionManagedBotCreated &data) {
+		auto content = ActionManagedBotCreated();
+		content.botId = data.vbot_id().v;
+		result.content = content;
+	}, [&](const MTPDmessageActionPollAppendAnswer &data) {
+		auto content = ActionPollAppendAnswer();
+		data.vanswer().match([&](const MTPDpollAnswer &answer) {
+			content.option = ParseString(answer.vtext().match(
+				[](const MTPDtextWithEntities &d) {
+					return d.vtext();
+				}));
+		}, [](const auto &) {});
+		result.content = content;
+	}, [&](const MTPDmessageActionPollDeleteAnswer &data) {
+		auto content = ActionPollDeleteAnswer();
+		data.vanswer().match([&](const MTPDpollAnswer &answer) {
+			content.option = ParseString(answer.vtext().match(
+				[](const MTPDtextWithEntities &d) {
+					return d.vtext();
+				}));
+		}, [](const auto &) {});
+		result.content = content;
+	}, [](const MTPDmessageActionChangeCommunity &) {
+	}, [&](const MTPDmessageActionChatJoinedViaCommunity &data) {
+		auto content = ActionChatJoinedViaCommunity();
+		content.communityId = ChannelId(data.vcommunity_id().v);
+		result.content = content;
+	}, [&](const MTPDmessageActionGramTransfer &data) {
+		result.content = ActionGramTransfer{
+			.amount = int64(data.vamount().v),
+			.peerAddress = data.vpeer_address().v,
+			.transactionId = data.vtransaction_id().v,
+			.comment = data.vcomment().value_or_empty(),
+			.commentEncrypted = data.is_comment_encrypted(),
+		};
+	}, [&](const MTPDmessageActionWalletTonConnectRequest &data) {
+		result.content = ActionWalletTonConnectRequest{
+			.sessionId = data.vsession_id().v,
+			.expires = data.vexpires().v,
+			.topic = data.vtopic().value_or_empty(),
+			.traceId = data.vtrace_id().value_or_empty(),
+			.accepted = data.is_accepted(),
+			.declined = data.is_declined(),
+		};
+	}, [&](const MTPDmessageActionNoPaidMessagesTokenUsed &data) {
+		result.content = ActionNoPaidMessagesTokenUsed();
 	}, [](const MTPDmessageActionEmpty &data) {});
 	return result;
 }
 
 File &Message::file() {
-	const auto service = &action.content;
-	if (const auto photo = std::get_if<ActionChatEditPhoto>(service)) {
+	const auto content = &action.content;
+	if (const auto photo = std::get_if<ActionChatEditPhoto>(content)) {
 		return photo->photo.image.file;
+	} else if (const auto photo = std::get_if<ActionSuggestProfilePhoto>(
+			content)) {
+		return photo->photo.image.file;
+	// } else if (const auto wallpaper = std::get_if<ActionSetChatWallPaper>(
+	// 		content)) {
+	// #TODO wallpapers
 	}
 	return media.file();
 }
 
 const File &Message::file() const {
-	const auto service = &action.content;
-	if (const auto photo = std::get_if<ActionChatEditPhoto>(service)) {
+	const auto content = &action.content;
+	if (const auto photo = std::get_if<ActionChatEditPhoto>(content)) {
 		return photo->photo.image.file;
+	} else if (const auto photo = std::get_if<ActionSuggestProfilePhoto>(
+			content)) {
+		return photo->photo.image.file;
+	// } else if (const auto wallpaper = std::get_if<ActionSetChatWallPaper>(
+	// 		content)) {
+	// #TODO wallpapers
 	}
 	return media.file();
 }
@@ -1171,9 +2882,6 @@ Message ParseMessage(
 			result.selfId = context.selfPeerId;
 			result.peerId = ParsePeerId(data.vpeer_id());
 			const auto fromId = data.vfrom_id();
-			if (IsChatPeerId(result.peerId)) {
-				result.chatId = BarePeerId(result.peerId);
-			}
 			if (fromId) {
 				result.fromId = ParsePeerId(*fromId);
 			} else {
@@ -1181,13 +2889,19 @@ Message ParseMessage(
 			}
 			if (const auto replyTo = data.vreply_to()) {
 				replyTo->match([&](const MTPDmessageReplyHeader &data) {
-					result.replyToMsgId = data.vreply_to_msg_id().v;
-					result.replyToPeerId = data.vreply_to_peer_id()
-						? ParsePeerId(*data.vreply_to_peer_id())
-						: 0;
-					if (result.replyToPeerId == result.peerId) {
-						result.replyToPeerId = 0;
+					if (const auto replyToMsg = data.vreply_to_msg_id()) {
+						result.replyToMsgId = replyToMsg->v;
+						result.replyToPeerId = data.vreply_to_peer_id()
+							? ParsePeerId(*data.vreply_to_peer_id())
+							: 0;
+						if (result.replyToPeerId == result.peerId) {
+							result.replyToPeerId = 0;
+						}
+					} else {
+						// #TODO export replies
 					}
+				}, [&](const MTPDmessageReplyStoryHeader &data) {
+					// #TODO export stories
 				});
 			}
 		}
@@ -1231,21 +2945,27 @@ Message ParseMessage(
 		}
 		if (const auto replyTo = data.vreply_to()) {
 			replyTo->match([&](const MTPDmessageReplyHeader &data) {
-				result.replyToMsgId = data.vreply_to_msg_id().v;
-				result.replyToPeerId = data.vreply_to_peer_id()
-					? ParsePeerId(*data.vreply_to_peer_id())
-					: PeerId(0);
+				if (const auto replyToMsg = data.vreply_to_msg_id()) {
+					result.replyToMsgId = replyToMsg->v;
+					result.replyToPeerId = data.vreply_to_peer_id()
+						? ParsePeerId(*data.vreply_to_peer_id())
+						: PeerId(0);
+				} else {
+					// #TODO export replies
+				}
+			}, [&](const MTPDmessageReplyStoryHeader &data) {
+				// #TODO export stories
 			});
 		}
 		if (const auto viaBotId = data.vvia_bot_id()) {
 			result.viaBotId = viaBotId->v;
 		}
 		if (const auto media = data.vmedia()) {
-			context.botId = (result.viaBotId
+			context.botId = result.viaBotId
 				? result.viaBotId
-				: IsUserPeerId(result.forwardedFromId)
-				? BarePeerId(result.forwardedFromId)
-				: result.fromId);
+				: peerIsUser(result.forwardedFromId)
+				? peerToUser(result.forwardedFromId)
+				: peerToUser(result.fromId);
 			result.media = ParseMedia(
 				context,
 				*media,
@@ -1257,9 +2977,27 @@ Message ParseMessage(
 			}
 			context.botId = 0;
 		}
+		if (const auto replyMarkup = data.vreply_markup()) {
+			replyMarkup->match([](const MTPDreplyKeyboardMarkup &) {
+			}, [&](const MTPDreplyInlineMarkup &data) {
+				result.inlineButtonRows = ButtonRowsFromTL(data);
+			}, [](const MTPDreplyKeyboardHide &) {
+			}, [](const MTPDreplyKeyboardForceReply &) {
+			});
+		}
 		result.text = ParseText(
 			data.vmessage(),
 			data.ventities().value_or_empty());
+			if (data.vreactions().has_value()) {
+				result.reactions = ParseReactions(*data.vreactions());
+			}
+		if (const auto richMessage = data.vrich_message()) {
+			result.richMessage = ParseRichMessage(
+				context,
+				*richMessage,
+				mediaFolder,
+				result.date);
+		}
 	}, [&](const MTPDmessageService &data) {
 		result.action = ParseServiceAction(
 			context,
@@ -1272,29 +3010,29 @@ Message ParseMessage(
 	return result;
 }
 
-std::map<uint64, Message> ParseMessagesList(
+std::map<MessageId, Message> ParseMessagesList(
 		PeerId selfId,
 		const MTPVector<MTPMessage> &data,
 		const QString &mediaFolder) {
 	auto context = ParseMediaContext{ .selfPeerId = selfId };
-	auto result = std::map<uint64, Message>();
+	auto result = std::map<MessageId, Message>();
 	for (const auto &message : data.v) {
 		auto parsed = ParseMessage(context, message, mediaFolder);
-		const auto shift = uint64(uint32(parsed.chatId)) << 32;
-		result.emplace(shift | uint32(parsed.id), std::move(parsed));
+		result.emplace(
+			MessageId{ peerToChannel(parsed.peerId), parsed.id },
+			std::move(parsed));
 	}
 	return result;
 }
 
-PersonalInfo ParsePersonalInfo(const MTPUserFull &data) {
-	Expects(data.type() == mtpc_userFull);
-
-	const auto &fields = data.c_userFull();
+PersonalInfo ParsePersonalInfo(const MTPDusers_userFull &data) {
 	auto result = PersonalInfo();
-	result.user = ParseUser(fields.vuser());
-	if (const auto about = fields.vabout()) {
-		result.bio = ParseString(*about);
-	}
+	result.user = ParseUser(data.vusers().v[0]);
+	data.vfull_user().match([&](const MTPDuserFull &data) {
+		if (const auto about = data.vabout()) {
+			result.bio = ParseString(*about);
+		}
+	});
 	return result;
 }
 
@@ -1326,6 +3064,8 @@ ContactsList ParseContactsList(const MTPVector<MTPSavedContact> &data) {
 			info.lastName = ParseString(data.vlast_name());
 			info.phoneNumber = ParseString(data.vphone());
 			info.date = data.vdate().v;
+			info.colorIndex = PeerColorIndex(
+				StringBarePeerId(info.phoneNumber));
 			return info;
 		});
 		result.list.push_back(std::move(info));
@@ -1433,7 +3173,7 @@ SessionsList ParseSessionsList(const MTPaccount_Authorizations &data) {
 
 WebSession ParseWebSession(
 		const MTPWebAuthorization &data,
-		const std::map<int32, User> &users) {
+		const std::map<UserId, User> &users) {
 	return data.match([&](const MTPDwebAuthorization &data) {
 		auto result = WebSession();
 		const auto i = users.find(data.vbot_id().v);
@@ -1489,7 +3229,13 @@ const DialogInfo *DialogsInfo::item(int index) const {
 
 DialogInfo::Type DialogTypeFromChat(const Chat &chat) {
 	using Type = DialogInfo::Type;
-	return chat.username.isEmpty()
+	return (chat.isMonoforum && !chat.isMonoforumAdmin)
+		? Type::Personal
+		: (chat.isMonoforumAdmin && chat.isMonoforumOfPublicBroadcast)
+		? Type::PublicSupergroup
+		: chat.isMonoforumAdmin
+		? Type::PrivateSupergroup
+		: chat.username.isEmpty()
 		? (chat.isBroadcast
 			? Type::PrivateChannel
 			: chat.isSupergroup
@@ -1505,6 +3251,8 @@ DialogInfo::Type DialogTypeFromUser(const User &user) {
 		? DialogInfo::Type::Self
 		: user.isReplies
 		? DialogInfo::Type::Replies
+		: user.isVerifyCodes
+		? DialogInfo::Type::VerifyCodes
 		: user.isBot
 		? DialogInfo::Type::Bot
 		: DialogInfo::Type::Personal;
@@ -1543,17 +3291,22 @@ DialogsInfo ParseDialogsInfo(const MTPmessages_Dialogs &data) {
 				info.lastName = peer.user()
 					? peer.user()->info.lastName
 					: Utf8String();
+				info.colorIndex = peer.colorIndex();
 				info.input = peer.input();
 				info.migratedToChannelId = peer.chat()
 					? peer.chat()->migratedToChannelId
 					: 0;
+				info.isMonoforum = peer.chat()
+					&& peer.chat()->isMonoforum;
+				info.monoforumBroadcastInput = peer.chat()
+					? peer.chat()->monoforumBroadcastInput
+					: MTPInputPeer(MTP_inputPeerEmpty());
 			}
 			info.topMessageId = fields.vtop_message().v;
-			const auto shift = IsChatPeerId(info.peerId)
-				? (uint64(uint32(BarePeerId(info.peerId))) << 32)
-				: 0;
-			const auto messageIt = messages.find(
-				shift | uint32(info.topMessageId));
+			const auto messageIt = messages.find(MessageId{
+				peerToChannel(info.peerId),
+				info.topMessageId,
+			});
 			if (messageIt != end(messages)) {
 				const auto &message = messageIt->second;
 				info.topMessageDate = message.date;
@@ -1569,7 +3322,7 @@ DialogInfo DialogInfoFromUser(const User &data) {
 	result.input = (Peer{ data }).input();
 	result.name = data.info.firstName;
 	result.lastName = data.info.lastName;
-	result.peerId = UserPeerId(data.info.userId);
+	result.peerId = data.id();
 	result.topMessageDate = 0;
 	result.topMessageId = 0;
 	result.type = DialogTypeFromUser(data);
@@ -1581,11 +3334,15 @@ DialogInfo DialogInfoFromChat(const Chat &data) {
 	auto result = DialogInfo();
 	result.input = data.input;
 	result.name = data.title;
-	result.peerId = ChatPeerId(data.id);
+	result.peerId = data.id();
 	result.topMessageDate = 0;
 	result.topMessageId = 0;
 	result.type = DialogTypeFromChat(data);
 	result.migratedToChannelId = data.migratedToChannelId;
+	result.isMonoforum = data.isMonoforum;
+	if (data.isMonoforumAdmin) {
+		result.monoforumBroadcastInput = data.monoforumBroadcastInput;
+	}
 	return result;
 }
 
@@ -1607,17 +3364,17 @@ DialogsInfo ParseDialogsInfo(
 		const MTPVector<MTPUser> &data) {
 	const auto singleId = singlePeer.match(
 	[](const MTPDinputPeerUser &data) {
-		return data.vuser_id().v;
+		return UserId(data.vuser_id());
 	}, [](const MTPDinputPeerSelf &data) {
-		return 0;
-	}, [](const auto &data) -> int {
+		return UserId();
+	}, [](const auto &data) -> UserId {
 		Unexpected("Single peer type in ParseDialogsInfo(users).");
 	});
 	auto result = DialogsInfo();
 	result.chats.reserve(data.v.size());
 	for (const auto &single : data.v) {
 		const auto userId = single.match([&](const auto &data) {
-			return data.vid().v;
+			return peerFromUser(data.vid());
 		});
 		if (userId != singleId
 			&& (singleId != 0
@@ -1636,20 +3393,28 @@ DialogsInfo ParseDialogsInfo(
 		const MTPmessages_Chats &data) {
 	const auto singleId = singlePeer.match(
 	[](const MTPDinputPeerChat &data) {
-		return data.vchat_id().v;
+		return peerFromChat(data.vchat_id());
 	}, [](const MTPDinputPeerChannel &data) {
-		return data.vchannel_id().v;
-	}, [](const auto &data) -> int {
+		return peerFromChannel(data.vchannel_id());
+	}, [](const auto &data) -> PeerId {
 		Unexpected("Single peer type in ParseDialogsInfo(chats).");
 	});
 	auto result = DialogsInfo();
 	data.match([&](const auto &data) { //MTPDmessages_chats &data) {
 		result.chats.reserve(data.vchats().v.size());
 		for (const auto &single : data.vchats().v) {
-			const auto chatId = single.match([&](const auto &data) {
-				return data.vid().v;
+			const auto peerId = single.match([](const MTPDchannel &data) {
+				return peerFromChannel(data.vid());
+			}, [](const MTPDchannelForbidden &data) {
+				return peerFromChannel(data.vid());
+			}, [](const MTPDcommunity &data) {
+				return peerFromChannel(data.vid());
+			}, [](const MTPDcommunityForbidden &data) {
+				return peerFromChannel(data.vid());
+			}, [](const auto &data) {
+				return peerFromChat(data.vid());
 			});
-			if (chatId != singleId) {
+			if (peerId != singleId) {
 				continue;
 			}
 			const auto chat = ParseChat(single);
@@ -1671,8 +3436,8 @@ bool AddMigrateFromSlice(
 	const auto good = to.migratedFromInput.match([](
 			const MTPDinputPeerEmpty &) {
 		return true;
-	}, [&](const MTPDinputPeerChat & data) {
-		return (ChatPeerId(data.vchat_id().v) == from.peerId);
+	}, [&](const MTPDinputPeerChat &data) {
+		return (peerFromChat(data.vchat_id()) == from.peerId);
 	}, [](auto&&) { return false; });
 	if (!good) {
 		return false;
@@ -1716,7 +3481,8 @@ void FinalizeDialogsInfo(DialogsInfo &info, const Settings &settings) {
 			}
 			Unexpected("Type in ApiWrap::onlyMyMessages.");
 		}();
-		dialog.onlyMyMessages = ((settings.fullChats & setting) != setting);
+		dialog.onlyMyMessages = (dialog.type != DialogType::Personal)
+			&& ((settings.fullChats & setting) != setting);
 
 		ranges::sort(dialog.splits);
 	}
@@ -1797,37 +3563,72 @@ bool SkipMessageByDate(const Message &message, const Settings &settings) {
 Utf8String FormatPhoneNumber(const Utf8String &phoneNumber) {
 	return phoneNumber.isEmpty()
 		? Utf8String()
-		: App::formatPhone(QString::fromUtf8(phoneNumber)).toUtf8();
+		: Ui::FormatPhone(QString::fromUtf8(phoneNumber)).toUtf8();
 }
 
 Utf8String FormatDateTime(
 		TimeId date,
+		bool hasTimeZone,
 		QChar dateSeparator,
 		QChar timeSeparator,
 		QChar separator) {
 	if (!date) {
 		return Utf8String();
 	}
-	const auto value = QDateTime::fromTime_t(date);
+	const auto value = QDateTime::fromSecsSinceEpoch(date);
+	const auto timeZoneOffset = hasTimeZone
+		? separator + value.timeZone().displayName(
+			QTimeZone::StandardTime,
+			QTimeZone::OffsetName)
+		: QString();
 	return (QString("%1") + dateSeparator + "%2" + dateSeparator + "%3"
 		+ separator + "%4" + timeSeparator + "%5" + timeSeparator + "%6"
+		+ "%7"
 	).arg(value.date().day(), 2, 10, QChar('0')
 	).arg(value.date().month(), 2, 10, QChar('0')
 	).arg(value.date().year()
 	).arg(value.time().hour(), 2, 10, QChar('0')
 	).arg(value.time().minute(), 2, 10, QChar('0')
 	).arg(value.time().second(), 2, 10, QChar('0')
+	).arg(timeZoneOffset
 	).toUtf8();
 }
 
-Utf8String FormatMoneyAmount(uint64 amount, const Utf8String &currency) {
+Utf8String FormatMoneyAmount(int64 amount, const Utf8String &currency) {
 	return Ui::FillAmountAndCurrency(
 		amount,
 		QString::fromUtf8(currency)).toUtf8();
 }
 
+Utf8String FormatGramsAmount(int64 nanos) {
+	constexpr auto kNanos = uint64(kNanosInGram);
+
+	const auto negative = (nanos < 0);
+	const auto absolute = negative ? (0 - uint64(nanos)) : uint64(nanos);
+	const auto whole = absolute / kNanos;
+	auto fraction = NumberToString(absolute % kNanos, 9);
+	while (fraction.endsWith('0')) {
+		fraction.chop(1);
+	}
+	return (negative ? Utf8String("-") : Utf8String())
+		+ NumberToString(whole)
+		+ (fraction.isEmpty() ? Utf8String() : ('.' + fraction))
+		+ ((absolute == kNanos) ? " Gram" : " Grams");
+}
+
 Utf8String FormatFileSize(int64 size) {
-	return Ui::FormatSizeText(size).toUtf8();
+	// Exports are written in English and off the main thread.
+	const auto tenths = [](int64 value) {
+		return QByteArray::number(value / 10)
+			+ '.'
+			+ QByteArray::number(value % 10);
+	};
+	if (size >= 1024 * 1024) {
+		return tenths(size * 10 / (1024 * 1024)) + " MB";
+	} else if (size >= 1024) {
+		return tenths(size * 10 / 1024) + " KB";
+	}
+	return QByteArray::number(size) + " B";
 }
 
 Utf8String FormatDuration(int64 seconds) {

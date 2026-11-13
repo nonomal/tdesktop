@@ -8,22 +8,26 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_document_media.h"
 
 #include "data/data_document.h"
+#include "data/data_document_resolver.h"
 #include "data/data_session.h"
-#include "data/data_cloud_themes.h"
 #include "data/data_file_origin.h"
-#include "data/data_auto_download.h"
 #include "media/clip/media_clip_reader.h"
 #include "main/main_session.h"
 #include "main/main_session_settings.h"
 #include "lottie/lottie_animation.h"
+#include "lottie/lottie_frame_generator.h"
+#include "ffmpeg/ffmpeg_frame_generator.h"
 #include "history/history_item.h"
 #include "history/history.h"
 #include "window/themes/window_theme_preview.h"
 #include "core/core_settings.h"
 #include "core/application.h"
+#include "core/mime_type.h"
 #include "storage/file_download.h"
-#include "ui/image/image.h"
-#include "app.h"
+#include "ui/chat/attach/attach_prepare.h"
+#include "ui/image/image_prepare.h"
+#include "ui/image/svg_preview.h"
+#include "ui/rect.h"
 
 #include <QtCore/QBuffer>
 #include <QtGui/QImageReader>
@@ -37,9 +41,13 @@ constexpr auto kGoodThumbQuality = 87;
 
 enum class FileType {
 	Video,
+	VideoSticker,
 	AnimatedSticker,
 	WallPaper,
+	WallPatternPNG,
+	WallPatternSVG,
 	Theme,
+	SvgImage,
 };
 
 [[nodiscard]] bool MayHaveGoodThumbnail(not_null<DocumentData*> owner) {
@@ -47,24 +55,57 @@ enum class FileType {
 		|| owner->isAnimation()
 		|| owner->isWallPaper()
 		|| owner->isTheme()
-		|| (owner->sticker() && owner->sticker()->animated);
+		|| owner->isSvgImage()
+		|| (owner->sticker() && owner->sticker()->isAnimated());
 }
 
 [[nodiscard]] QImage PrepareGoodThumbnail(
 		const QString &path,
 		QByteArray data,
 		FileType type) {
-	if (type == FileType::Video) {
-		return ::Media::Clip::PrepareForSending(path, data).thumbnail;
+	if (type == FileType::Video || type == FileType::VideoSticker) {
+		auto result = v::get<Ui::PreparedFileInformation::Video>(
+			::Media::Clip::PrepareForSending(path, data).media);
+		if (result.isWebmSticker && type == FileType::Video) {
+			result.thumbnail = Images::Opaque(std::move(result.thumbnail));
+		}
+		return result.thumbnail;
 	} else if (type == FileType::AnimatedSticker) {
 		return Lottie::ReadThumbnail(Lottie::ReadContent(data, path));
 	} else if (type == FileType::Theme) {
 		return Window::Theme::GeneratePreview(data, path);
+	} else if (type == FileType::WallPatternSVG) {
+		return Images::Read({
+			.path = path,
+			.content = std::move(data),
+			.maxSize = QSize(
+				kWallPaperThumbnailLimit,
+				kWallPaperThumbnailLimit),
+			.gzipSvg = true,
+		}).image;
+	} else if (type == FileType::SvgImage) {
+		if (data.isEmpty() && !path.isEmpty()) {
+			auto file = QFile(path);
+			if (file.open(QIODevice::ReadOnly)) {
+				const auto limit = Ui::SvgPreviewBytesLimit();
+				if (!file.isSequential() && (file.size() > limit)) {
+					return QImage();
+				}
+				data = file.read(limit + 1);
+				if (data.size() > limit) {
+					return QImage();
+				}
+			}
+		}
+		return Ui::RenderSvgPreview(data, Size(kWallPaperThumbnailLimit));
 	}
 	auto buffer = QBuffer(&data);
 	auto file = QFile(path);
 	auto device = data.isEmpty() ? static_cast<QIODevice*>(&file) : &buffer;
 	auto reader = QImageReader(device);
+	if (Images::IsSvgFormat(reader.format())) {
+		return QImage();
+	}
 	const auto size = reader.size();
 	if (!reader.canRead()
 		|| (size.width() * size.height() > kReadAreaLimit)) {
@@ -163,7 +204,7 @@ Image *DocumentMedia::goodThumbnail() const {
 }
 
 void DocumentMedia::setGoodThumbnail(QImage thumbnail) {
-	if (!(_flags & Flag::GoodThumbnailWanted)) {
+	if (!(_flags & Flag::GoodThumbnailWanted) || thumbnail.isNull()) {
 		return;
 	}
 	_goodThumbnail = std::make_unique<Image>(std::move(thumbnail));
@@ -171,7 +212,7 @@ void DocumentMedia::setGoodThumbnail(QImage thumbnail) {
 }
 
 Image *DocumentMedia::thumbnailInline() const {
-	if (!_inlineThumbnail) {
+	if (!_inlineThumbnail && !_owner->inlineThumbnailIsPath()) {
 		const auto bytes = _owner->inlineThumbnailBytes();
 		if (!bytes.isEmpty()) {
 			auto image = Images::FromInlineBytes(bytes);
@@ -183,6 +224,19 @@ Image *DocumentMedia::thumbnailInline() const {
 		}
 	}
 	return _inlineThumbnail.get();
+}
+
+const QPainterPath &DocumentMedia::thumbnailPath() const {
+	if (_pathThumbnail.isEmpty() && _owner->inlineThumbnailIsPath()) {
+		const auto bytes = _owner->inlineThumbnailBytes();
+		if (!bytes.isEmpty()) {
+			_pathThumbnail = Images::PathFromInlineBytes(bytes);
+			if (_pathThumbnail.isEmpty()) {
+				_owner->clearInlineThumbnailBytes();
+			}
+		}
+	}
+	return _pathThumbnail;
 }
 
 Image *DocumentMedia::thumbnail() const {
@@ -236,7 +290,7 @@ void DocumentMedia::checkStickerLarge() {
 		return;
 	}
 	automaticLoad(_owner->stickerSetOrigin(), nullptr);
-	if (data->animated || !loaded()) {
+	if (data->isAnimated() || !loaded()) {
 		return;
 	}
 	if (_bytes.isEmpty()) {
@@ -253,21 +307,29 @@ void DocumentMedia::checkStickerLarge() {
 void DocumentMedia::automaticLoad(
 		Data::FileOrigin origin,
 		const HistoryItem *item) {
-	if (_owner->status != FileReady || loaded() || _owner->cancelled()) {
+	if (_owner->status != FileReady
+		|| loaded()
+		|| _owner->uploading()
+		|| _owner->cancelled()) {
 		return;
 	} else if (!item && !_owner->sticker() && !_owner->isAnimation()) {
 		return;
 	}
 	const auto toCache = _owner->saveToCache();
-	if (!toCache && Core::App().settings().askDownloadPath()) {
+	if (!toCache && _owner->forbidsFileSave()) {
+		return;
+	} else if (!toCache && !Core::App().canSaveFileWithoutAskingForPath()) {
 		// We need a filename, but we're supposed to ask user for it.
 		// No automatic download in this case.
 		return;
 	}
+	const auto indata = _owner->filename();
 	const auto filename = toCache
 		? QString()
 		: DocumentFileNameForSave(_owner);
-	const auto shouldLoadFromCloud = !Data::IsExecutableName(filename)
+	const auto shouldLoadFromCloud = (indata.isEmpty()
+		|| Core::DetectNameType(indata) != Core::NameType::Executable)
+		&& Core::DetectNameType(filename) != Core::NameType::Executable
 		&& (item
 			? Data::AutoDownload::Should(
 				_owner->session().settings().autoDownload(),
@@ -279,6 +341,12 @@ void DocumentMedia::automaticLoad(
 	const auto loadFromCloud = shouldLoadFromCloud
 		? LoadFromCloudOrLocal
 		: LoadFromLocalOnly;
+	if (_owner->loading()) {
+		if (loadFromCloud == LoadFromCloudOrLocal) {
+			_owner->permitLoadFromCloud();
+		}
+		return;
+	}
 	_owner->save(
 		origin,
 		filename,
@@ -342,9 +410,9 @@ bool DocumentMedia::thumbnailEnoughForSticker() const {
 
 void DocumentMedia::checkStickerSmall() {
 	const auto data = _owner->sticker();
-	if ((data && data->animated) || thumbnailEnoughForSticker()) {
+	if ((data && data->isAnimated()) || thumbnailEnoughForSticker()) {
 		_owner->loadThumbnail(_owner->stickerSetOrigin());
-		if (data && data->animated) {
+		if (data && data->isAnimated()) {
 			automaticLoad(_owner->stickerSetOrigin(), nullptr);
 		}
 	} else {
@@ -359,7 +427,7 @@ Image *DocumentMedia::getStickerLarge() {
 
 Image *DocumentMedia::getStickerSmall() {
 	const auto data = _owner->sticker();
-	if ((data && data->animated) || thumbnailEnoughForSticker()) {
+	if ((data && data->isAnimated()) || thumbnailEnoughForSticker()) {
 		return thumbnail();
 	}
 	return _sticker.get();
@@ -377,13 +445,21 @@ void DocumentMedia::checkStickerLarge(not_null<FileLoader*> loader) {
 void DocumentMedia::GenerateGoodThumbnail(
 		not_null<DocumentData*> document,
 		QByteArray data) {
-	const auto type = document->isWallPaper()
+	const auto type = document->isPatternWallPaperSVG()
+		? FileType::WallPatternSVG
+		: document->isPatternWallPaperPNG()
+		? FileType::WallPatternPNG
+		: document->isWallPaper()
 		? FileType::WallPaper
 		: document->isTheme()
 		? FileType::Theme
-		: document->sticker()
+		: document->isSvgImage()
+		? FileType::SvgImage
+		: !document->sticker()
+		? FileType::Video
+		: document->sticker()->isLottie()
 		? FileType::AnimatedSticker
-		: FileType::Video;
+		: FileType::VideoSticker;
 	auto location = document->location().isEmpty()
 		? nullptr
 		: std::make_unique<Core::FileLocation>(document->location());
@@ -391,7 +467,7 @@ void DocumentMedia::GenerateGoodThumbnail(
 		document->setGoodThumbnailChecked(false);
 		return;
 	}
-	const auto guard = base::make_weak(&document->owner().session());
+	const auto guard = base::make_weak(&document->session());
 	crl::async([=, location = std::move(location)] {
 		const auto filepath = (location && location->accessEnable())
 			? location->name()
@@ -400,9 +476,12 @@ void DocumentMedia::GenerateGoodThumbnail(
 		auto bytes = QByteArray();
 		if (!result.isNull()) {
 			auto buffer = QBuffer(&bytes);
-			const auto format = (type == FileType::AnimatedSticker)
+			const auto format = (type == FileType::AnimatedSticker
+				|| type == FileType::VideoSticker)
 				? "WEBP"
-				: (type == FileType::WallPaper && result.hasAlphaChannel())
+				: (type == FileType::WallPatternPNG
+					|| type == FileType::WallPatternSVG
+					|| type == FileType::SvgImage)
 				? "PNG"
 				: "JPG";
 			result.save(&buffer, format, kGoodThumbQuality);
@@ -450,11 +529,11 @@ void DocumentMedia::ReadOrGenerateThumbnail(
 			});
 		} else if (active) {
 			crl::async([=] {
-				const auto image = App::readImage(value, nullptr, false);
-				crl::on_main(guard, [=] {
+				auto image = Images::Read({ .content = value }).image;
+				crl::on_main(guard, [=, image = std::move(image)]() mutable {
 					document->setGoodThumbnailChecked(true);
 					if (const auto active = document->activeMediaView()) {
-						active->setGoodThumbnail(image);
+						active->setGoodThumbnail(std::move(image));
 					}
 				});
 			});
@@ -465,6 +544,49 @@ void DocumentMedia::ReadOrGenerateThumbnail(
 		}
 	};
 	document->owner().cache().get(document->goodThumbnailCacheKey(), got);
+}
+
+auto DocumentIconFrameGenerator(not_null<DocumentMedia*> media)
+-> FnMut<std::unique_ptr<Ui::FrameGenerator>()> {
+	if (!media->loaded()) {
+		return nullptr;
+	}
+	using Type = StickerType;
+	const auto document = media->owner();
+	const auto content = media->bytes();
+	const auto fromFile = content.isEmpty();
+	const auto type = document->sticker()
+		? document->sticker()->type
+		: (document->isVideoFile() || document->isAnimation())
+		? Type::Webm
+		: Type::Webp;
+	const auto &location = media->owner()->location(true);
+	if (fromFile && !location.accessEnable()) {
+		return nullptr;
+	}
+	return [=]() -> std::unique_ptr<Ui::FrameGenerator> {
+		const auto bytes = Lottie::ReadContent(content, location.name());
+		if (fromFile) {
+			location.accessDisable();
+		}
+		if (bytes.isEmpty()) {
+			return nullptr;
+		}
+		switch (type) {
+		case Type::Tgs:
+			return std::make_unique<Lottie::FrameGenerator>(bytes);
+		case Type::Webm:
+			return std::make_unique<FFmpeg::FrameGenerator>(bytes);
+		case Type::Webp:
+			return std::make_unique<Ui::ImageFrameGenerator>(bytes);
+		}
+		Unexpected("Document type in DocumentIconFrameGenerator.");
+	};
+}
+
+auto DocumentIconFrameGenerator(const std::shared_ptr<DocumentMedia> &media)
+-> FnMut<std::unique_ptr<Ui::FrameGenerator>()> {
+	return DocumentIconFrameGenerator(media.get());
 }
 
 } // namespace Data

@@ -7,11 +7,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include <rpl/producer.h>
 #include "lang_auto.h"
+#include "base/const_string.h"
 #include "base/weak_ptr.h"
 
 namespace Lang {
+
+inline constexpr auto kChoosingStickerReplacement = "oo"_cs;
 
 struct Language {
 	QString id;
@@ -29,8 +31,6 @@ inline bool operator!=(const Language &a, const Language &b) {
 	return !(a == b);
 }
 
-QString DefaultLanguageId();
-QString LanguageIdOrDefault(const QString &id);
 QString CloudLangPackName();
 QString CustomLanguageId();
 Language DefaultLanguage();
@@ -73,6 +73,9 @@ public:
 
 	QByteArray serialize() const;
 	void fillFromSerialized(const QByteArray &data, int dataAppVersion);
+
+	bool supportChoosingStickerReplacement() const;
+	int rightIndexChoosingStickerReplacement(bool named) const;
 
 	void applyDifference(
 		Pack pack,
@@ -120,6 +123,7 @@ private:
 		const QString &relativePath,
 		const QByteArray &content);
 	void updatePluralRules();
+	void updateChoosingStickerReplacement();
 
 	Instance *_derived = nullptr;
 
@@ -131,6 +135,12 @@ private:
 	QByteArray _customFileContent;
 	int _version = 0;
 	rpl::event_stream<> _updated;
+
+	struct {
+		bool support = false;
+		int rightIndex = 0;
+		int rightIndexNamed = 0;
+	} _choosingStickerReplacement;
 
 	mutable QString _systemLanguage;
 

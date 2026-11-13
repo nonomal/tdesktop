@@ -1,23 +1,28 @@
-// This file is part of Desktop App Toolkit,
-// a set of libraries for developing nice desktop applications.
-//
-// For license and copyright information please follow this link:
-// https://github.com/desktop-app/legal/blob/master/LEGAL
-//
+/*
+This file is part of Telegram Desktop,
+the official desktop application for the Telegram messaging service.
+
+For license and copyright information please follow this link:
+https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+*/
 #include "ui/controls/call_mute_button.h"
 
 #include "base/flat_map.h"
 #include "ui/abstract_button.h"
+#include "ui/effects/shake_animation.h"
 #include "ui/paint/blobs.h"
 #include "ui/painter.h"
-#include "ui/widgets/call_button.h"
+#include "ui/power_saving.h"
+#include "ui/controls/call_button.h"
 #include "ui/widgets/labels.h"
-#include "base/openssl_help.h"
+#include "ui/ui_utility.h"
+#include "base/random.h"
 #include "styles/palette.h"
 #include "styles/style_widgets.h"
 #include "styles/style_calls.h"
 
 #include <QtCore/QtMath>
+#include <QtCore/QCoreApplication>
 
 namespace Ui {
 namespace {
@@ -46,7 +51,6 @@ constexpr auto kGlowAlpha = 150;
 constexpr auto kOverrideColorBgAlpha = 76;
 constexpr auto kOverrideColorRippleAlpha = 50;
 
-constexpr auto kShiftDuration = crl::time(300);
 constexpr auto kSwitchStateDuration = crl::time(120);
 constexpr auto kSwitchLabelDuration = crl::time(180);
 
@@ -69,6 +73,37 @@ constexpr auto kBlobPartAnimation = float(kBlobsScaleEnterDuration)
 constexpr auto kOverlapProgressRadialHide = 1.2;
 
 constexpr auto kRadialFinishArcShift = 1200;
+
+[[nodiscard]] CallMuteButtonType TypeForIcon(CallMuteButtonType type) {
+	return (type == CallMuteButtonType::Connecting
+		|| type == CallMuteButtonType::ConferenceForceMuted)
+		? CallMuteButtonType::Muted
+		: (type == CallMuteButtonType::RaisedHand)
+		? CallMuteButtonType::ForceMuted
+		: type;
+};
+
+[[nodiscard]] QSize AdjustedLottieSize(
+		not_null<const style::CallMuteButton*> st) {
+	const auto &button = st->active.button;
+	const auto left = (button.width - st->lottieSize.width()) / 2;
+	const auto size = button.width - 2 * left;
+	return QSize(size, size);
+}
+
+[[nodiscard]] int AdjustedBgSize(
+		not_null<const style::CallMuteButton*> st) {
+	const auto &button = st->active.button;
+	const auto left = (button.width - st->active.bgSize) / 2;
+	return button.width - 2 * left;
+}
+
+[[nodiscard]] int AdjustedBgSkip(
+		not_null<const style::CallMuteButton*> st) {
+	const auto &button = st->active.button;
+	const auto bgSize = AdjustedBgSize(st);
+	return (button.width - bgSize) / 2;
+}
 
 auto MuteBlobs() {
 	return std::vector<Paint::Blobs::BlobData>{
@@ -102,21 +137,7 @@ auto MuteBlobs() {
 auto Colors() {
 	using Vector = std::vector<QColor>;
 	using Colors = anim::gradient_colors;
-	return base::flat_map<CallMuteButtonType, Colors>{
-		{
-			CallMuteButtonType::ForceMuted,
-			Colors(QGradientStops{
-				{ .0, st::groupCallForceMuted3->c },
-				{ .5, st::groupCallForceMuted2->c },
-				{ 1., st::groupCallForceMuted1->c } })
-		},
-		{
-			CallMuteButtonType::RaisedHand,
-			Colors(QGradientStops{
-				{ .0, st::groupCallForceMuted3->c },
-				{ .5, st::groupCallForceMuted2->c },
-				{ 1., st::groupCallForceMuted1->c } })
-		},
+	auto result = base::flat_map<CallMuteButtonType, Colors>{
 		{
 			CallMuteButtonType::Active,
 			Colors(Vector{ st::groupCallLive1->c, st::groupCallLive2->c })
@@ -130,10 +151,22 @@ auto Colors() {
 			Colors(Vector{ st::groupCallMuted1->c, st::groupCallMuted2->c })
 		},
 	};
-}
-
-bool IsMuted(CallMuteButtonType type) {
-	return (type != CallMuteButtonType::Active);
+	const auto forceMutedColors = Colors(QGradientStops{
+		{ .0, st::groupCallForceMuted3->c },
+		{ .5, st::groupCallForceMuted2->c },
+		{ 1., st::groupCallForceMuted1->c } });
+	const auto forceMutedTypes = {
+		CallMuteButtonType::ForceMuted,
+		CallMuteButtonType::RaisedHand,
+		CallMuteButtonType::ConferenceForceMuted,
+		CallMuteButtonType::ScheduledCanStart,
+		CallMuteButtonType::ScheduledNotify,
+		CallMuteButtonType::ScheduledSilent,
+	};
+	for (const auto type : forceMutedTypes) {
+		result.emplace(type, forceMutedColors);
+	}
+	return result;
 }
 
 bool IsConnecting(CallMuteButtonType type) {
@@ -141,9 +174,7 @@ bool IsConnecting(CallMuteButtonType type) {
 }
 
 bool IsInactive(CallMuteButtonType type) {
-	return IsConnecting(type)
-		|| (type == CallMuteButtonType::ForceMuted)
-		|| (type == CallMuteButtonType::RaisedHand);
+	return IsConnecting(type);
 }
 
 auto Clamp(float64 value) {
@@ -168,11 +199,10 @@ public:
 		int additionalHeight,
 		const style::FlatLabel &st = st::defaultFlatLabel);
 
-	int height() const;
+	int contentHeight() const;
+	void setMaxWidth(int width);
 
 private:
-	int realHeight() const;
-
 	void setText(const QString &text);
 
 	const style::FlatLabel &_st;
@@ -182,6 +212,8 @@ private:
 
 	Text::String _text;
 	Text::String _previousText;
+
+	int _maxLabelWidth = 0;
 
 	Animations::Simple _animation;
 
@@ -200,12 +232,12 @@ AnimatedLabel::AnimatedLabel(
 , _options({ 0, 0, 0, Qt::LayoutDirectionAuto }) {
 	std::move(
 		text
-	) | rpl::start_with_next([=](const QString &value) {
+	) | rpl::on_next([=](const QString &value) {
 		setText(value);
 	}, lifetime());
 
 	paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		Painter p(this);
 		const auto progress = _animation.value(1.);
 
@@ -213,62 +245,82 @@ AnimatedLabel::AnimatedLabel(
 		p.setPen(_st.textFg);
 		p.setTextPalette(_st.palette);
 
-		const auto textHeight = height();
-		const auto diffHeight = realHeight() - textHeight;
-		const auto center = (diffHeight) / 2;
+		const auto textHeight = contentHeight();
+		const auto diffHeight = height() - textHeight;
+		const auto center = diffHeight / 2;
 
 		p.setOpacity(1. - progress);
 		if (p.opacity()) {
-			_previousText.draw(
+			_previousText.drawElided(
 				p,
 				0,
 				anim::interpolate(center, diffHeight, progress),
 				width(),
+				1,
 				style::al_center);
 		}
 
 		p.setOpacity(progress);
 		if (p.opacity()) {
-			_text.draw(
+			_text.drawElided(
 				p,
 				0,
 				anim::interpolate(0, center, progress),
 				width(),
+				1,
 				style::al_center);
 		}
 	}, lifetime());
 }
 
-int AnimatedLabel::height() const {
-	return _st.style.font->height;
-}
-
-int AnimatedLabel::realHeight() const {
-	return RpWidget::height();
+int AnimatedLabel::contentHeight() const {
+	const auto lineHeight = _st.style.font->height;
+	if (!_maxLabelWidth) {
+		return lineHeight;
+	}
+	const auto textHeight = _text.countHeight(_maxLabelWidth);
+	const auto previousHeight = _previousText.countHeight(_maxLabelWidth);
+	return std::min(std::max(textHeight, previousHeight), lineHeight * 2);
 }
 
 void AnimatedLabel::setText(const QString &text) {
 	if (_text.toString() == text) {
 		return;
 	}
-	_previousText = _text;
-	_text.setText(_st.style, text, _options);
+	_previousText = std::move(_text);
+	_text = Ui::Text::String(_st.style, text, _options);
 
-	const auto width = std::max(
-		_st.style.font->width(_text.toString()),
-		_st.style.font->width(_previousText.toString()));
-	resize(width + _additionalHeight, height() + _additionalHeight * 2);
+	const auto width = _maxLabelWidth
+		? _maxLabelWidth
+		: std::max(
+			_st.style.font->width(_text.toString()),
+			_st.style.font->width(_previousText.toString()));
+	resize(
+		width + _additionalHeight,
+		contentHeight() + _additionalHeight * 2);
 
 	_animation.stop();
 	_animation.start([=] { update(); }, 0., 1., _duration);
+}
+
+void AnimatedLabel::setMaxWidth(int width) {
+	_maxLabelWidth = width;
+	if (!_text.isEmpty()) {
+		resize(
+			_maxLabelWidth + _additionalHeight,
+			contentHeight() + _additionalHeight * 2);
+		update();
+	}
 }
 
 class BlobsWidget final : public RpWidget {
 public:
 	BlobsWidget(
 		not_null<RpWidget*> parent,
+		int diameter,
 		rpl::producer<bool> &&hideBlobs);
 
+	void setDiameter(int diameter);
 	void setLevel(float level);
 	void setBlobBrush(QBrush brush);
 	void setGlowBrush(QBrush brush);
@@ -279,11 +331,12 @@ public:
 	void setSwitchConnectingProgress(float64 progress);
 
 private:
-	void init();
+	void init(int diameter);
+	void computeCircleRect();
 
 	Paint::Blobs _blobs;
 
-	const float _circleRadius;
+	float _circleRadius = 0.;
 	QBrush _blobBrush;
 	QBrush _glowBrush;
 	int _center = 0;
@@ -305,19 +358,19 @@ private:
 
 BlobsWidget::BlobsWidget(
 	not_null<RpWidget*> parent,
+	int diameter,
 	rpl::producer<bool> &&hideBlobs)
 : RpWidget(parent)
 , _blobs(MuteBlobs(), kLevelDuration, kMaxLevel)
-, _circleRadius(st::callMuteButtonActive.bgSize / 2.)
 , _blobBrush(Qt::transparent)
 , _glowBrush(Qt::transparent)
 , _blobsLastTime(crl::now())
 , _blobsScaleLastTime(crl::now()) {
-	init();
+	init(diameter);
 
 	std::move(
 		hideBlobs
-	) | rpl::start_with_next([=](bool hide) {
+	) | rpl::on_next([=](bool hide) {
 		if (_hideBlobs != hide) {
 			const auto now = crl::now();
 			if ((now - _blobsScaleLastTime) >= kBlobsScaleEnterDuration) {
@@ -335,7 +388,27 @@ BlobsWidget::BlobsWidget(
 	}, lifetime());
 }
 
-void BlobsWidget::init() {
+void BlobsWidget::setDiameter(int diameter) {
+	_circleRadius = diameter / 2.;
+	const auto defaultSize = _blobs.maxRadius() * 2 * kGlowPaddingFactor;
+	const auto s = int(std::ceil((defaultSize * diameter)
+		/ float64(st::callMuteBlobRadiusForDiameter)));
+	const auto size = QSize{ s, s };
+	if (this->size() != size) {
+		resize(size);
+	}
+	computeCircleRect();
+}
+
+void BlobsWidget::computeCircleRect() {
+	const auto &r = _circleRadius;
+	const auto left = (size().width() - r * 2.) / 2.;
+	const auto add = st::callConnectingRadial.thickness / 2;
+	_circleRect = QRectF(left, left, r * 2, r * 2).marginsAdded(
+		style::margins(add, add, add, add));
+}
+
+void BlobsWidget::init(int diameter) {
 	setAttribute(Qt::WA_TransparentForMouseEvents);
 
 	const auto cutRect = [](Painter &p, const QRectF &r) {
@@ -347,26 +420,16 @@ void BlobsWidget::init() {
 		p.restore();
 	};
 
-	{
-		const auto s = _blobs.maxRadius() * 2 * kGlowPaddingFactor;
-		resize(s, s);
-	}
+	setDiameter(diameter);
 
 	sizeValue(
-	) | rpl::start_with_next([=](QSize size) {
+	) | rpl::on_next([=](QSize size) {
 		_center = size.width() / 2;
-
-		{
-			const auto &r = _circleRadius;
-			const auto left = (size.width() - r * 2.) / 2.;
-			const auto add = st::callConnectingRadial.thickness / 2;
-			_circleRect = QRectF(left, left, r * 2, r * 2).marginsAdded(
-				style::margins(add, add, add, add));
-		}
+		computeCircleRect();
 	}, lifetime());
 
 	paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		Painter p(this);
 		PainterHighQualityEnabler hq(p);
 
@@ -389,7 +452,9 @@ void BlobsWidget::init() {
 				_blobsScaleEnter * (1. - Clamp(
 					_switchConnectingProgress / kBlobPartAnimation)))
 			: _blobsScaleEnter;
-		_blobs.paint(p, _blobBrush, scale);
+		const auto sizeScale = (2. * _circleRadius)
+			/ st::callMuteBlobRadiusForDiameter;
+		_blobs.paint(p, _blobBrush, scale * sizeScale);
 		p.translate(-_center, -_center);
 
 		if (scale < 1.) {
@@ -397,8 +462,8 @@ void BlobsWidget::init() {
 		}
 
 		// Main circle.
-		const auto circleProgress =
-			Clamp(_switchConnectingProgress - kBlobPartAnimation)
+		const auto circleProgress
+			= Clamp(_switchConnectingProgress - kBlobPartAnimation)
 				/ kFillCirclePartAnimation;
 		const auto skipColoredCircle = (circleProgress == 1.);
 
@@ -448,7 +513,7 @@ void BlobsWidget::init() {
 		return true;
 	});
 	shownValue(
-	) | rpl::start_with_next([=](bool shown) {
+	) | rpl::on_next([=](bool shown) {
 		if (shown) {
 			_animation.start();
 		} else {
@@ -492,209 +557,65 @@ void BlobsWidget::setSwitchConnectingProgress(float64 progress) {
 
 CallMuteButton::CallMuteButton(
 	not_null<RpWidget*> parent,
+	const style::CallMuteButton &st,
 	rpl::producer<bool> &&hideBlobs,
 	CallMuteButtonState initial)
 : _state(initial)
-, _st(st::callMuteButtonActive)
+, _st(&st)
+, _lottieSize(AdjustedLottieSize(_st))
+, _bgSize(AdjustedBgSize(_st))
+, _bgSkip(AdjustedBgSkip(_st))
 , _blobs(base::make_unique_q<BlobsWidget>(
 	parent,
+	_bgSize,
 	rpl::combine(
-		rpl::single(anim::Disabled()) | rpl::then(anim::Disables()),
+		PowerSaving::OnValue(PowerSaving::kCalls),
 		std::move(hideBlobs),
 		_state.value(
 		) | rpl::map([](const CallMuteButtonState &state) {
 			return IsInactive(state.type);
 		})
-	) | rpl::map([](bool animDisabled, bool hide, bool isBadState) {
-		return isBadState || !(!animDisabled && !hide);
-	})))
+	) | rpl::map(rpl::mappers::_1 || rpl::mappers::_2 || rpl::mappers::_3)))
 , _content(base::make_unique_q<AbstractButton>(parent))
-, _centerLabel(base::make_unique_q<AnimatedLabel>(
-	parent,
-	_state.value(
-	) | rpl::map([](const CallMuteButtonState &state) {
-		return state.subtext.isEmpty() ? state.text : QString();
-	}),
-	kSwitchLabelDuration,
-	st::callMuteButtonLabelAdditional,
-	_st.label))
-, _label(base::make_unique_q<AnimatedLabel>(
-	parent,
-	_state.value(
-	) | rpl::map([](const CallMuteButtonState &state) {
-		return state.subtext.isEmpty() ? QString() : state.text;
-	}),
-	kSwitchLabelDuration,
-	st::callMuteButtonLabelAdditional,
-	_st.label))
-, _sublabel(base::make_unique_q<AnimatedLabel>(
-	parent,
-	_state.value(
-	) | rpl::map([](const CallMuteButtonState &state) {
-		return state.subtext;
-	}),
-	kSwitchLabelDuration,
-	st::callMuteButtonLabelAdditional,
-	st::callMuteButtonSublabel))
 , _colors(Colors())
-, _iconState(initialState()) {
+, _iconState(iconStateFrom(initial.type)) {
 	init();
 }
 
-CallMuteButton::IconState CallMuteButton::initialState() {
-	_icons[0].emplace(Lottie::IconDescriptor{
-		.path = u":/gui/icons/calls/hand_muted_active.json"_q,
-		.color = st::groupCallIconFg,
-		.sizeOverride = st::groupCallMuteButtonIconSize,
-		.frame = 22,
-	});
-	_icons[1].emplace(Lottie::IconDescriptor{
-		.path = u":/gui/icons/calls/active_hand.json"_q,
-		.color = st::groupCallIconFg,
-		.sizeOverride = st::groupCallMuteButtonIconSize,
-		.frame = 0,
-	});
-	_icons[2].emplace(Lottie::IconDescriptor{
-		.path = u":/gui/icons/calls/raised_hand.json"_q,
-		.color = st::groupCallIconFg,
-		.sizeOverride = st::groupCallMuteButtonIconSize,
-		.frame = 0,
-	});
-	return iconStateFrom(_state.current().type);
-}
+void CallMuteButton::refreshLabels() {
+	_centerLabel = base::make_unique_q<AnimatedLabel>(
+		_content->parentWidget(),
+		_state.value(
+		) | rpl::map([](const CallMuteButtonState &state) {
+			return state.subtext.isEmpty() ? state.text : QString();
+		}),
+		kSwitchLabelDuration,
+		_st->labelAdditional,
+		_st->active.label);
+	_label = base::make_unique_q<AnimatedLabel>(
+		_content->parentWidget(),
+		_state.value(
+		) | rpl::map([](const CallMuteButtonState &state) {
+			return state.subtext.isEmpty() ? QString() : state.text;
+		}),
+		kSwitchLabelDuration,
+		_st->labelAdditional,
+		_st->active.label);
+	_sublabel = base::make_unique_q<AnimatedLabel>(
+		_content->parentWidget(),
+		_state.value(
+		) | rpl::map([](const CallMuteButtonState &state) {
+			return state.subtext;
+		}),
+		kSwitchLabelDuration,
+		_st->labelAdditional,
+		_st->sublabel);
 
-CallMuteButton::IconState CallMuteButton::iconStateFrom(
-		CallMuteButtonType previous) {
-	const auto current = _state.current().type;
-	switch (previous) {
-	case CallMuteButtonType::Active: {
-		switch (current) {
-		case CallMuteButtonType::Active: {
-			return { // Active
-				.icon = &*_icons[0],
-				.frameFrom = 41,
-				.frameTo = 41,
-				.otherJumpToFrame = 0,
-			};
-		} break;
-		case CallMuteButtonType::Connecting:
-		case CallMuteButtonType::Muted: {
-			return { // Active -> Muted
-				.icon = &*_icons[0],
-				.frameFrom = 42,
-				.frameTo = 62,
-			};
-		} break;
-		case CallMuteButtonType::ForceMuted:
-		case CallMuteButtonType::RaisedHand: {
-			return { // Active -> Hand
-				.icon = &*_icons[1],
-				.frameFrom = 0,
-				.frameTo = 22,
-				.otherJumpToFrame = 0,
-			};
-		} break;
-		}
-	} break;
-	case CallMuteButtonType::Connecting:
-	case CallMuteButtonType::Muted: {
-		switch (current) {
-		case CallMuteButtonType::Active: {
-			return { // Muted -> Active
-				.icon = &*_icons[0],
-				.frameFrom = 21,
-				.frameTo = 41,
-				.otherJumpToFrame = 0,
-			};
-		} break;
-		case CallMuteButtonType::Connecting:
-		case CallMuteButtonType::Muted: {
-			return { // Muted
-				.icon = &*_icons[0],
-				.frameFrom = 22,
-				.frameTo = 22,
-			};
-		} break;
-		case CallMuteButtonType::ForceMuted:
-		case CallMuteButtonType::RaisedHand: {
-			return { // Muted -> Hand
-				.icon = &*_icons[0],
-				.frameFrom = 63,
-				.frameTo = 83,
-				.otherJumpToFrame = 22,
-			};
-		} break;
-		}
-	} break;
-	case CallMuteButtonType::ForceMuted:
-	case CallMuteButtonType::RaisedHand: {
-		switch (current) {
-		case CallMuteButtonType::Active: {
-			return { // Hand -> Active
-				.icon = &*_icons[1],
-				.frameFrom = 22,
-				.frameTo = 0,
-				.otherJumpToFrame = 42,
-			};
-		} break;
-		case CallMuteButtonType::Connecting:
-		case CallMuteButtonType::Muted: {
-			return { // Hand -> Muted
-				.icon = &*_icons[0],
-				.frameFrom = 0,
-				.frameTo = 20,
-			};
-		} break;
-		case CallMuteButtonType::ForceMuted:
-		case CallMuteButtonType::RaisedHand: {
-			return { // Hand
-				.icon = &*_icons[0],
-				.frameFrom = 0,
-				.frameTo = 0,
-				.otherJumpToFrame = 22,
-			};
-		} break;
-		}
-	} break;
-	}
-	Unexpected("State in CallMuteButton::iconStateFrom.");
-}
-
-CallMuteButton::IconState CallMuteButton::randomWavingState() {
-	switch (openssl::RandomValue<uint32>() % 5) {
-	case 0: return {
-		.icon = &*_icons[2],
-		.frameFrom = 0,
-		.frameTo = 120 };
-	case 1: return {
-		.icon = &*_icons[2],
-		.frameFrom = 120,
-		.frameTo = 240 };
-	case 2: return {
-		.icon = &*_icons[2],
-		.frameFrom = 240,
-		.frameTo = 420 };
-	case 3: return {
-		.icon = &*_icons[2],
-		.frameFrom = 420,
-		.frameTo = 540 };
-	case 4: return {
-		.icon = &*_icons[2],
-		.frameFrom = 540,
-		.frameTo = 720 };
-	}
-	Unexpected("Value in CallMuteButton::randomWavingState.");
-}
-
-void CallMuteButton::init() {
-	_content->resize(_st.button.width, _st.button.height);
-
-	// Label text.
 	_label->show();
 	rpl::combine(
 		_content->geometryValue(),
 		_label->sizeValue()
-	) | rpl::start_with_next([=](QRect my, QSize size) {
+	) | rpl::on_next([=](QRect my, QSize size) {
 		updateLabelGeometry(my, size);
 	}, _label->lifetime());
 	_label->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -703,7 +624,7 @@ void CallMuteButton::init() {
 	rpl::combine(
 		_content->geometryValue(),
 		_sublabel->sizeValue()
-	) | rpl::start_with_next([=](QRect my, QSize size) {
+	) | rpl::on_next([=](QRect my, QSize size) {
 		updateSublabelGeometry(my, size);
 	}, _sublabel->lifetime());
 	_sublabel->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -712,15 +633,141 @@ void CallMuteButton::init() {
 	rpl::combine(
 		_content->geometryValue(),
 		_centerLabel->sizeValue()
-	) | rpl::start_with_next([=](QRect my, QSize size) {
+	) | rpl::on_next([=](QRect my, QSize size) {
 		updateCenterLabelGeometry(my, size);
 	}, _centerLabel->lifetime());
 	_centerLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
 
+	_content->sizeValue(
+	) | rpl::map([](QSize size) {
+		return size.width();
+	}) | rpl::distinct_until_changed(
+	) | rpl::on_next([=](int w) {
+		_centerLabel->setMaxWidth(w);
+		_label->setMaxWidth(w);
+		_sublabel->setMaxWidth(w);
+	}, _centerLabel->lifetime());
+}
+
+void CallMuteButton::refreshIcons() {
+	_icons[0].emplace(Lottie::IconDescriptor{
+		.path = u":/icons/calls/voice.lottie"_q,
+		.color = &st::groupCallIconFg,
+		.sizeOverride = _lottieSize,
+		.frame = (_iconState.index ? 0 : _iconState.frameTo),
+	});
+	_icons[1].emplace(Lottie::IconDescriptor{
+		.path = u":/icons/calls/hands.lottie"_q,
+		.color = &st::groupCallIconFg,
+		.sizeOverride = _lottieSize,
+		.frame = (_iconState.index ? _iconState.frameTo : 0),
+	});
+
+}
+
+auto CallMuteButton::iconStateAnimated(CallMuteButtonType previous)
+-> IconState {
+	using Type = CallMuteButtonType;
+	using Key = std::pair<Type, Type>;
+	struct Animation {
+		int from = 0;
+		int to = 0;
+	};
+	static const auto kAnimations = std::vector<std::pair<Key, Animation>>{
+		{ { Type::ForceMuted, Type::Muted }, { 0, 35 } },
+		{ { Type::Muted, Type::Active }, { 36, 68 } },
+		{ { Type::Active, Type::Muted }, { 69, 98 } },
+		{ { Type::Muted, Type::ForceMuted }, { 99, 135 } },
+		{ { Type::Active, Type::ForceMuted }, { 136, 172 } },
+		{ { Type::ScheduledSilent, Type::ScheduledNotify }, { 173, 201 } },
+		{ { Type::ScheduledSilent, Type::Muted }, { 202, 236 } },
+		{ { Type::ScheduledSilent, Type::ForceMuted }, { 237, 273 } },
+		{ { Type::ScheduledNotify, Type::ForceMuted }, { 274, 310 } },
+		{ { Type::ScheduledNotify, Type::ScheduledSilent }, { 311, 343 } },
+		{ { Type::ScheduledNotify, Type::Muted }, { 344, 375 } },
+		{ { Type::ScheduledCanStart, Type::Muted }, { 376, 403 } },
+	};
+	static const auto kMap = [] {
+		// flat_multi_map_pair_type lacks some required constructors :(
+		auto &&list = kAnimations | ranges::views::transform([](auto &&pair) {
+			return base::flat_multi_map_pair_type<Key, Animation>(
+				pair.first,
+				pair.second);
+		});
+		return base::flat_map<Key, Animation>(begin(list), end(list));
+	}();
+	const auto was = TypeForIcon(previous);
+	const auto now = TypeForIcon(_state.current().type);
+	if (was == now) {
+		return {};
+	}
+
+	if (const auto i = kMap.find(Key{ was, now }); i != end(kMap)) {
+		return { 0, i->second.from, i->second.to };
+	}
+	return {};
+}
+
+CallMuteButton::IconState CallMuteButton::iconStateFrom(
+		CallMuteButtonType previous) {
+	if (const auto animated = iconStateAnimated(previous)) {
+		return animated;
+	}
+
+	using Type = CallMuteButtonType;
+	static const auto kFinal = base::flat_map<Type, int>{
+		{ Type::ForceMuted, 0 },
+		{ Type::Muted, 36 },
+		{ Type::Active, 69 },
+		{ Type::ScheduledSilent, 173 },
+		{ Type::ScheduledNotify, 274 },
+		{ Type::ScheduledCanStart, 376 },
+	};
+
+	const auto now = TypeForIcon(_state.current().type);
+	const auto i = kFinal.find(now);
+
+	Ensures(i != end(kFinal));
+	return { 0, i->second, i->second };
+}
+
+CallMuteButton::IconState CallMuteButton::randomWavingState() {
+	struct Animation {
+		int from = 0;
+		int to = 0;
+	};
+	static const auto kAnimations = std::vector<Animation>{
+		{ 0, 119 },
+		{ 120, 239 },
+		{ 240, 419 },
+		{ 420, 539 },
+	};
+	const auto index = base::RandomIndex(kAnimations.size());
+	return { 1, kAnimations[index].from, kAnimations[index].to };
+}
+
+void CallMuteButton::init() {
+	refreshLabels();
+	refreshIcons();
+
+	const auto &button = _st->active.button;
+	_content->resize(button.width, button.height);
+
+	_content->events(
+	) | rpl::on_next([=](not_null<QEvent*> e) {
+		if (e->type() == QEvent::MouseMove) {
+			if (!_state.current().tooltip.isEmpty()) {
+				Ui::Tooltip::Show(1000, this);
+			}
+		} else if (e->type() == QEvent::Leave) {
+			Ui::Tooltip::Hide();
+		}
+	}, _content->lifetime());
+
 	rpl::combine(
 		_radialInfo.rawShowProgress.value(),
 		anim::Disables()
-	) | rpl::start_with_next([=](float64 value, bool disabled) {
+	) | rpl::on_next([=](float64 value, bool disabled) {
 		auto &info = _radialInfo;
 		info.realShowProgress = (1. - value) / kRadialEndPartAnimation;
 
@@ -758,45 +805,16 @@ void CallMuteButton::init() {
 	}, lifetime());
 
 	// State type.
-	const auto previousType =
-		lifetime().make_state<CallMuteButtonType>(_state.current().type);
+	const auto previousType
+		= lifetime().make_state<CallMuteButtonType>(_state.current().type);
 	setHandleMouseState(HandleMouseState::Disabled);
 
-	const auto blobsInner = [&] {
-		// The point of the circle at 45 degrees.
-		const auto w = _blobs->innerRect().width();
-		const auto mF = (1 - std::cos(M_PI / 4.)) * (w / 2.);
-		return _blobs->innerRect().marginsRemoved(QMarginsF(mF, mF, mF, mF));
-	}();
-
-	auto linearGradients = anim::linear_gradients<CallMuteButtonType>(
-		_colors,
-		QPointF(blobsInner.x() + blobsInner.width(), blobsInner.y()),
-		QPointF(blobsInner.x(), blobsInner.y() + blobsInner.height()));
-
-	auto glowColors = [&] {
-		auto copy = _colors;
-		for (auto &[type, stops] : copy) {
-			auto firstColor = IsInactive(type)
-				? st::groupCallBg->c
-				: stops.stops[0].second;
-			firstColor.setAlpha(kGlowAlpha);
-			stops.stops = QGradientStops{
-				{ 0., std::move(firstColor) },
-				{ 1., QColor(Qt::transparent) }
-			};
-		}
-		return copy;
-	}();
-	auto glows = anim::radial_gradients<CallMuteButtonType>(
-		std::move(glowColors),
-		blobsInner.center(),
-		_blobs->width() / 2);
+	refreshGradients();
 
 	_state.value(
 	) | rpl::map([](const CallMuteButtonState &state) {
 		return state.type;
-	}) | rpl::start_with_next([=](CallMuteButtonType type) {
+	}) | rpl::on_next([=](CallMuteButtonType type) {
 		const auto previous = *previousType;
 		*previousType = type;
 
@@ -824,14 +842,14 @@ void CallMuteButton::init() {
 		auto callback = [=](float64 value) {
 			const auto brushProgress = fromConnecting ? 1. : value;
 			_blobs->setBlobBrush(QBrush(
-				linearGradients.gradient(previous, type, brushProgress)));
+				_linearGradients.gradient(previous, type, brushProgress)));
 			_blobs->setGlowBrush(QBrush(
-				glows.gradient(previous, type, value)));
+				_glowGradients.gradient(previous, type, value)));
 			_blobs->update();
 
 			const auto radialShowProgress = (radialShowFrom == radialShowTo)
 				? radialShowTo
-				: anim::interpolateF(radialShowFrom, radialShowTo, value);
+				: anim::interpolateToF(radialShowFrom, radialShowTo, value);
 			if (radialShowProgress != _radialInfo.rawShowProgress.current()) {
 				_radialInfo.rawShowProgress = radialShowProgress;
 				_blobs->setSwitchConnectingProgress(Clamp(
@@ -854,21 +872,31 @@ void CallMuteButton::init() {
 
 	// Icon rect.
 	_content->sizeValue(
-	) | rpl::start_with_next([=](QSize size) {
-		const auto icon = st::groupCallMuteButtonIconSize;
+	) | rpl::on_next([=](QSize size) {
+		const auto icon = _lottieSize;
 		_muteIconRect = QRect(
 			(size.width() - icon.width()) / 2,
-			st::groupCallMuteButtonIconTop,
+			_st->lottieTop,
 			icon.width(),
 			icon.height());
 	}, lifetime());
 
 	// Paint.
 	_content->paintRequest(
-	) | rpl::start_with_next([=](QRect clip) {
+	) | rpl::on_next([=](QRect clip) {
 		Painter p(_content);
 
-		_iconState.icon->paint(p, _muteIconRect.x(), _muteIconRect.y());
+		const auto expand = _state.current().expandType;
+		if (expand == CallMuteButtonExpandType::Expanded) {
+			st::callMuteFromFullScreen.paintInCenter(p, _muteIconRect);
+		} else if (expand == CallMuteButtonExpandType::Normal) {
+			st::callMuteToFullScreen.paintInCenter(p, _muteIconRect);
+		} else {
+			_icons[_iconState.index]->paint(
+				p,
+				_muteIconRect.x(),
+				_muteIconRect.y());
+		}
 
 		if (_radialInfo.state.has_value() && _switchAnimation.animating()) {
 			const auto radialProgress = _radialInfo.realShowProgress;
@@ -890,8 +918,8 @@ void CallMuteButton::init() {
 			InfiniteRadialAnimation::Draw(
 				p,
 				r,
-				_st.bgPosition,
-				_radialInfo.st.size,
+				QPoint(_bgSkip, _bgSkip),
+				QSize(_bgSize, _bgSize),
 				_content->width(),
 				QPen(_radialInfo.st.color),
 				_radialInfo.st.thickness);
@@ -902,8 +930,8 @@ void CallMuteButton::init() {
 			InfiniteRadialAnimation::Draw(
 				p,
 				std::move(state),
-				_st.bgPosition,
-				_radialInfo.st.size,
+				QPoint(_bgSkip, _bgSkip),
+				QSize(_bgSize, _bgSize),
 				_content->width(),
 				QPen(_radialInfo.st.color),
 				_radialInfo.st.thickness);
@@ -911,9 +939,42 @@ void CallMuteButton::init() {
 	}, _content->lifetime());
 }
 
+void CallMuteButton::refreshGradients() {
+	const auto blobsInner = [&] {
+		// The point of the circle at 45 degrees.
+		const auto w = _blobs->innerRect().width();
+		const auto mF = (1 - std::cos(M_PI / 4.)) * (w / 2.);
+		return _blobs->innerRect().marginsRemoved(QMarginsF(mF, mF, mF, mF));
+	}();
+
+	_linearGradients = anim::linear_gradients<CallMuteButtonType>(
+		_colors,
+		QPointF(blobsInner.x() + blobsInner.width(), blobsInner.y()),
+		QPointF(blobsInner.x(), blobsInner.y() + blobsInner.height()));
+
+	auto glowColors = [&] {
+		auto copy = _colors;
+		for (auto &[type, stops] : copy) {
+			auto firstColor = IsInactive(type)
+				? st::groupCallBg->c
+				: stops.stops[(stops.stops.size() - 1) / 2].second;
+			firstColor.setAlpha(kGlowAlpha);
+			stops.stops = QGradientStops{
+				{ 0., std::move(firstColor) },
+				{ 1., QColor(Qt::transparent) }
+			};
+		}
+		return copy;
+	}();
+	_glowGradients = anim::radial_gradients<CallMuteButtonType>(
+		std::move(glowColors),
+		blobsInner.center(),
+		_blobs->width() / 2);
+}
+
 void CallMuteButton::scheduleIconState(const IconState &state) {
 	if (_iconState != state) {
-		if (_iconState.icon->animating()) {
+		if (_icons[_iconState.index]->animating()) {
 			_scheduledState = state;
 		} else {
 			startIconState(state);
@@ -926,24 +987,35 @@ void CallMuteButton::scheduleIconState(const IconState &state) {
 void CallMuteButton::startIconState(const IconState &state) {
 	_iconState = state;
 	_scheduledState = std::nullopt;
-	_iconState.icon->animate(
+	_icons[_iconState.index]->animate(
 		[=] { iconAnimationCallback(); },
 		_iconState.frameFrom,
 		_iconState.frameTo);
-	if (const auto other = state.otherJumpToFrame) {
-		if (_iconState.icon == &*_icons[0]) {
-			_icons[1]->jumpTo(*other, nullptr);
-		} else {
-			_icons[0]->jumpTo(*other, nullptr);
-		}
-	}
 }
 
 void CallMuteButton::iconAnimationCallback() {
 	_content->update(_muteIconRect);
-	if (!_iconState.icon->animating() && _scheduledState) {
+	if (!_icons[_iconState.index]->animating() && _scheduledState) {
 		startIconState(*_scheduledState);
 	}
+}
+
+QString CallMuteButton::tooltipText() const {
+	return _state.current().tooltip;
+}
+
+QPoint CallMuteButton::tooltipPos() const {
+	return QCursor::pos();
+}
+
+bool CallMuteButton::tooltipWindowActive() const {
+	return Ui::AppInFocus()
+		&& Ui::InFocusChain(_content->window())
+		&& _content->mapToGlobal(_content->rect()).contains(QCursor::pos());
+}
+
+const style::Tooltip *CallMuteButton::tooltipSt() const {
+	return &st::groupCallTooltip;
 }
 
 void CallMuteButton::updateLabelsGeometry() {
@@ -953,28 +1025,32 @@ void CallMuteButton::updateLabelsGeometry() {
 }
 
 void CallMuteButton::updateLabelGeometry(QRect my, QSize size) {
-	const auto skip = st::callMuteButtonSublabelSkip
-		+ st::callMuteButtonLabelsSkip;
+	const auto skip = _st->sublabelSkip + _st->labelsSkip;
+	const auto contentHeight = _label->contentHeight();
+	const auto contentTop = my.y() + my.height() - contentHeight - skip;
 	_label->moveToLeft(
 		my.x() + (my.width() - size.width()) / 2 + _labelShakeShift,
-		my.y() + my.height() - _label->height() - skip,
+		contentTop - (size.height() - contentHeight) / 2,
 		my.width());
 }
 
 void CallMuteButton::updateCenterLabelGeometry(QRect my, QSize size) {
-	const auto skip = (st::callMuteButtonSublabelSkip / 2)
-		+ st::callMuteButtonLabelsSkip;
+	const auto skip = (_st->sublabelSkip / 2) + _st->labelsSkip;
+	const auto contentHeight = _centerLabel->contentHeight();
+	const auto contentTop = my.y() + my.height() - contentHeight - skip;
 	_centerLabel->moveToLeft(
 		my.x() + (my.width() - size.width()) / 2 + _labelShakeShift,
-		my.y() + my.height() - _centerLabel->height() - skip,
+		contentTop - (size.height() - contentHeight) / 2,
 		my.width());
 }
 
 void CallMuteButton::updateSublabelGeometry(QRect my, QSize size) {
-	const auto skip = st::callMuteButtonLabelsSkip;
+	const auto skip = _st->labelsSkip;
+	const auto contentHeight = _sublabel->contentHeight();
+	const auto contentTop = my.y() + my.height() - contentHeight - skip;
 	_sublabel->moveToLeft(
 		my.x() + (my.width() - size.width()) / 2 + _labelShakeShift,
-		my.y() + my.height() - _sublabel->height() - skip,
+		contentTop - (size.height() - contentHeight) / 2,
 		my.width());
 }
 
@@ -982,29 +1058,10 @@ void CallMuteButton::shake() {
 	if (_shakeAnimation.animating()) {
 		return;
 	}
-	const auto update = [=] {
-		const auto fullProgress = _shakeAnimation.value(1.) * 6;
-		const auto segment = std::clamp(int(std::floor(fullProgress)), 0, 5);
-		const auto part = fullProgress - segment;
-		const auto from = (segment == 0)
-			? 0.
-			: (segment == 1 || segment == 3 || segment == 5)
-			? 1.
-			: -1.;
-		const auto to = (segment == 0 || segment == 2 || segment == 4)
-			? 1.
-			: (segment == 1 || segment == 3)
-			? -1.
-			: 0.;
-		const auto shift = from * (1. - part) + to * part;
-		_labelShakeShift = int(std::round(shift * st::shakeShift));
+	_shakeAnimation.start(DefaultShakeCallback([=](int shift) {
+		_labelShakeShift = shift;
 		updateLabelsGeometry();
-	};
-	_shakeAnimation.start(
-		update,
-		0.,
-		1.,
-		kShiftDuration);
+	}), 0., 1., st::shakeDuration);
 }
 
 CallMuteButton::HandleMouseState CallMuteButton::HandleMouseStateFromType(
@@ -1015,11 +1072,33 @@ CallMuteButton::HandleMouseState CallMuteButton::HandleMouseStateFromType(
 		return HandleMouseState::Enabled;
 	case CallMuteButtonType::Connecting:
 		return HandleMouseState::Disabled;
+	case CallMuteButtonType::ScheduledCanStart:
+	case CallMuteButtonType::ScheduledNotify:
+	case CallMuteButtonType::ScheduledSilent:
+	case CallMuteButtonType::ConferenceForceMuted:
 	case CallMuteButtonType::ForceMuted:
 	case CallMuteButtonType::RaisedHand:
 		return HandleMouseState::Enabled;
 	}
 	Unexpected("Type in HandleMouseStateFromType.");
+}
+
+void CallMuteButton::setStyle(const style::CallMuteButton &st) {
+	if (_st == &st) {
+		return;
+	}
+	_st = &st;
+	_lottieSize = AdjustedLottieSize(_st);
+	_bgSize = AdjustedBgSize(_st);
+	_bgSkip = AdjustedBgSkip(_st);
+	const auto &button = _st->active.button;
+	_content->resize(button.width, button.height);
+	_blobs->setDiameter(_st->active.bgSize);
+
+	refreshIcons();
+	refreshLabels();
+	updateLabelsGeometry();
+	refreshGradients();
 }
 
 void CallMuteButton::setState(const CallMuteButtonState &state) {
@@ -1042,21 +1121,13 @@ rpl::producer<Qt::MouseButton> CallMuteButton::clicks() {
 }
 
 QSize CallMuteButton::innerSize() const {
-	return innerGeometry().size();
-}
-
-QRect CallMuteButton::innerGeometry() const {
-	const auto &skip = _st.outerRadius;
-	return QRect(
-		_content->x(),
-		_content->y(),
-		_content->width() - 2 * skip,
-		_content->width() - 2 * skip);
+	return QSize(
+		_content->width() - 2 * _bgSkip,
+		_content->width() - 2 * _bgSkip);
 }
 
 void CallMuteButton::moveInner(QPoint position) {
-	const auto &skip = _st.outerRadius;
-	_content->move(position - QPoint(skip, skip));
+	_content->move(position - QPoint(_bgSkip, _bgSkip));
 
 	{
 		const auto offset = QPoint(
@@ -1067,16 +1138,29 @@ void CallMuteButton::moveInner(QPoint position) {
 }
 
 void CallMuteButton::setVisible(bool visible) {
+	_centerLabel->setVisible(visible);
+	_label->setVisible(visible);
+	_sublabel->setVisible(visible);
 	_content->setVisible(visible);
 	_blobs->setVisible(visible);
+}
+
+bool CallMuteButton::isHidden() const {
+	return _content->isHidden();
 }
 
 void CallMuteButton::raise() {
 	_blobs->raise();
 	_content->raise();
+	_centerLabel->raise();
+	_label->raise();
+	_sublabel->raise();
 }
 
 void CallMuteButton::lower() {
+	_centerLabel->lower();
+	_label->lower();
+	_sublabel->lower();
 	_content->lower();
 	_blobs->lower();
 }
@@ -1096,22 +1180,16 @@ void CallMuteButton::overridesColors(
 		CallMuteButtonType fromType,
 		CallMuteButtonType toType,
 		float64 progress) {
-	const auto forceMutedToConnecting = [](CallMuteButtonType &type) {
-		if (type == CallMuteButtonType::ForceMuted
-			|| type == CallMuteButtonType::RaisedHand) {
-			type = CallMuteButtonType::Connecting;
-		}
-	};
-	forceMutedToConnecting(toType);
-	forceMutedToConnecting(fromType);
 	const auto toInactive = IsInactive(toType);
 	const auto fromInactive = IsInactive(fromType);
 	if (toInactive && (progress == 1)) {
-		_colorOverrides.fire({ std::nullopt, std::nullopt });
+		_colorOverrides = CallButtonColors();
 		return;
 	}
-	auto from = _colors.find(fromType)->second.stops[0].second;
-	auto to = _colors.find(toType)->second.stops[0].second;
+	const auto &fromStops = _colors.find(fromType)->second.stops;
+	const auto &toStops = _colors.find(toType)->second.stops;
+	auto from = fromStops[(fromStops.size() - 1) / 2].second;
+	auto to = toStops[(toStops.size() - 1) / 2].second;
 	auto fromRipple = from;
 	auto toRipple = to;
 	if (!toInactive) {
@@ -1124,11 +1202,15 @@ void CallMuteButton::overridesColors(
 	}
 	const auto resultBg = anim::color(from, to, progress);
 	const auto resultRipple = anim::color(fromRipple, toRipple, progress);
-	_colorOverrides.fire({ resultBg, resultRipple });
+	_colorOverrides = CallButtonColors{ resultBg, resultRipple };
 }
 
 rpl::producer<CallButtonColors> CallMuteButton::colorOverrides() const {
-	return _colorOverrides.events();
+	return _colorOverrides.value();
+}
+
+not_null<RpWidget*> CallMuteButton::outer() const {
+	return _content.get();
 }
 
 rpl::lifetime &CallMuteButton::lifetime() {

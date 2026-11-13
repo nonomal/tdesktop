@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/bytes.h"
 #include "base/weak_ptr.h"
+#include "base/weak_qptr.h"
 #include "base/flat_map.h"
 #include "mtproto/core_types.h"
 #include "mtproto/details/mtproto_serialized_request.h"
@@ -83,7 +84,7 @@ class ConcurrentSender : public base::has_weak_ptr {
 
 public:
 	ConcurrentSender(
-		QPointer<Instance> weak,
+		base::weak_qptr<Instance> weak,
 		Fn<void(FnMut<void()>)> runner);
 
 	template <typename Request>
@@ -184,7 +185,7 @@ private:
 	void senderRequestCancelAll();
 	void senderRequestDetach(mtpRequestId requestId);
 
-	const QPointer<Instance> _weak;
+	const base::weak_qptr<Instance> _weak;
 	const Fn<void(FnMut<void()>)> _runner;
 	base::flat_map<mtpRequestId, Handlers> _requests;
 
@@ -314,10 +315,10 @@ auto ConcurrentSender::SpecificRequestBuilder<Request>::done(
 		Handler,
 		mtpRequestId,
 		Result>;
-	constexpr auto takesResponse = rpl::details::is_callable_plain_v<
+	[[maybe_unused]] constexpr auto takesResponse = rpl::details::is_callable_plain_v<
 		Handler,
 		Result>;
-	constexpr auto takesNone = rpl::details::is_callable_plain_v<Handler>;
+	[[maybe_unused]] constexpr auto takesNone = rpl::details::is_callable_plain_v<Handler>;
 
 	if constexpr (takesFull) {
 		setDoneHandler<Result>(std::forward<Handler>(handler));
@@ -348,10 +349,10 @@ auto ConcurrentSender::SpecificRequestBuilder<Request>::fail(
 		Handler,
 		mtpRequestId,
 		Error>;
-	constexpr auto takesError = rpl::details::is_callable_plain_v<
+	[[maybe_unused]] constexpr auto takesError = rpl::details::is_callable_plain_v<
 		Handler,
 		Error>;
-	constexpr auto takesNone = rpl::details::is_callable_plain_v<Handler>;
+	[[maybe_unused]] constexpr auto takesNone = rpl::details::is_callable_plain_v<Handler>;
 
 	if constexpr (takesFull) {
 		setFailHandler(std::forward<Handler>(handler));

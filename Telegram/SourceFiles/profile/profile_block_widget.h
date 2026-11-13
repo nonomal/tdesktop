@@ -7,14 +7,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "base/observer.h"
 #include "ui/rp_widget.h"
 
 namespace Profile {
 
 class SectionMemento;
 
-class BlockWidget : public Ui::RpWidget, protected base::Subscriber {
+class BlockWidget : public Ui::RpWidget {
 public:
 	BlockWidget(QWidget *parent, PeerData *peer, const QString &title);
 

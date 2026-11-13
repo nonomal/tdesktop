@@ -7,8 +7,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/mac/touchbar/mac_touchbar_audio.h"
 
-#ifndef OS_OSX
-
 #include "media/audio/media_audio.h"
 #include "media/player/media_player_instance.h"
 #include "platform/mac/touchbar/mac_touchbar_common.h"
@@ -120,7 +118,7 @@ const auto kCurrentPositionItemIdentifier = Format(@"currentPosition");
 				: mediaPlayer->previous(kSongType); });
 		rpl::duplicate(
 			_trackState
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			const auto newValue = isNext
 				? mediaPlayer->nextAvailable(kSongType)
 				: mediaPlayer->previousAvailable(kSongType);
@@ -176,5 +174,3 @@ const auto kCurrentPositionItemIdentifier = Format(@"currentPosition");
 }
 
 @end // @implementation TouchBarAudioPlayer
-
-#endif // OS_OSX

@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/cache/storage_cache_types.h"
 #include "storage/serialize_common.h"
 #include "data/data_file_origin.h"
+#include "data/data_location.h"
 #include "base/overload.h"
 #include "main/main_session.h"
 
@@ -23,35 +24,39 @@ constexpr auto kDocumentBaseCacheTag = 0x0000000000010000ULL;
 constexpr auto kDocumentBaseCacheMask = 0x000000000000FF00ULL;
 constexpr auto kPhotoBaseCacheTag = 0x0000000000020000ULL;
 constexpr auto kPhotoBaseCacheMask = 0x000000000000FF00ULL;
-constexpr auto kSerializeTypeShift = quint8(0x08);
+
 constexpr auto kNonStorageLocationToken = quint8(0x10);
+constexpr auto kLegacyInMessagePeerIdFlag = quint8(0x08);
+constexpr auto kModernLocationFlag = quint8(0x20);
+constexpr auto kInMessageFieldsFlag = quint8(0x40);
 
 enum class NonStorageLocationType : quint8 {
 	Web,
 	Geo,
 	Url,
 	Memory,
+	AudioAlbumThumb,
 };
 
 MTPInputPeer GenerateInputPeer(
-		uint64 id,
+		PeerId id,
 		uint64 accessHash,
-		int32 inMessagePeerId,
+		PeerId inMessagePeerId,
 		int32 inMessageId,
-		int32 self) {
+		UserId self) {
 	const auto bareId = [&] {
 		return peerToBareMTPInt(id);
 	};
-	if (inMessagePeerId > 0 && inMessageId) {
+	if (inMessageId && peerIsUser(inMessagePeerId)) {
 		return MTP_inputPeerUserFromMessage(
 			GenerateInputPeer(id, accessHash, 0, 0, self),
 			MTP_int(inMessageId),
-			MTP_int(inMessagePeerId));
-	} else if (inMessagePeerId < 0 && inMessageId) {
+			MTP_long(peerToUser(inMessagePeerId).bare));
+	} else if (inMessageId && peerIsChannel(inMessagePeerId)) {
 		return MTP_inputPeerChannelFromMessage(
 			GenerateInputPeer(id, accessHash, 0, 0, self),
 			MTP_int(inMessageId),
-			MTP_int(-inMessagePeerId));
+			MTP_long(peerToChannel(inMessagePeerId).bare));
 	} else if (!id) {
 		return MTP_inputPeerEmpty();
 	} else if (id == peerFromUser(self)) {
@@ -73,7 +78,7 @@ WebFileLocation WebFileLocation::Null;
 
 StorageFileLocation::StorageFileLocation(
 	int32 dcId,
-	int32 self,
+	UserId self,
 	const MTPInputFileLocation &tl)
 : _dcId(dcId) {
 	tl.match([&](const MTPDinputFileLocation &data) {
@@ -119,15 +124,15 @@ StorageFileLocation::StorageFileLocation(
 		const auto fillPeer = base::overload([&](
 				const MTPDinputPeerEmpty &data) {
 			_id = 0;
-		}, [&](const MTPDinputPeerSelf & data) {
-			_id = peerFromUser(self);
-		}, [&](const MTPDinputPeerChat & data) {
-			_id = peerFromChat(data.vchat_id());
-		}, [&](const MTPDinputPeerUser & data) {
-			_id = peerFromUser(data.vuser_id());
+		}, [&](const MTPDinputPeerSelf &data) {
+			_id = peerFromUser(self).value;
+		}, [&](const MTPDinputPeerChat &data) {
+			_id = peerFromChat(data.vchat_id()).value;
+		}, [&](const MTPDinputPeerUser &data) {
+			_id = peerFromUser(data.vuser_id()).value;
 			_accessHash = data.vaccess_hash().v;
-		}, [&](const MTPDinputPeerChannel & data) {
-			_id = peerFromChannel(data.vchannel_id());
+		}, [&](const MTPDinputPeerChannel &data) {
+			_id = peerFromChannel(data.vchannel_id()).value;
 			_accessHash = data.vaccess_hash().v;
 		});
 		data.vpeer().match(fillPeer, [&](
@@ -136,19 +141,21 @@ StorageFileLocation::StorageFileLocation(
 				// Bad data provided.
 				_id = _accessHash = 0;
 			});
-			_inMessagePeerId = data.vuser_id().v;
+			_inMessagePeerId = peerFromUser(data.vuser_id());
 			_inMessageId = data.vmsg_id().v;
 		}, [&](const MTPDinputPeerChannelFromMessage &data) {
 			data.vpeer().match(fillPeer, [&](auto &&) {
 				// Bad data provided.
 				_id = _accessHash = 0;
 			});
-			_inMessagePeerId = -data.vchannel_id().v;
+			_inMessagePeerId = peerFromChannel(data.vchannel_id());
 			_inMessageId = data.vmsg_id().v;
 		});
-		_volumeId = data.vvolume_id().v;
-		_localId = data.vlocal_id().v;
+		_volumeId = data.vphoto_id().v;
 		_sizeLetter = data.is_big() ? 'c' : 'a';
+
+		// _localId place is used in serialization.
+		Ensures(_localId == 0);
 	}, [&](const MTPDinputStickerSetThumb &data) {
 		_type = Type::StickerSetThumb;
 		data.vstickerset().match([&](const MTPDinputStickerSetEmpty &data) {
@@ -156,39 +163,45 @@ StorageFileLocation::StorageFileLocation(
 		}, [&](const MTPDinputStickerSetID &data) {
 			_id = data.vid().v;
 			_accessHash = data.vaccess_hash().v;
-		}, [&](const MTPDinputStickerSetShortName &data) {
-			Unexpected("inputStickerSetShortName in StorageFileLocation.");
-		}, [&](const MTPDinputStickerSetAnimatedEmoji &data) {
-			Unexpected(
-				"inputStickerSetAnimatedEmoji in StorageFileLocation.");
-		}, [&](const MTPDinputStickerSetDice &data) {
-			Unexpected("inputStickerSetDice in StorageFileLocation.");
+		}, [&](const auto &data) {
+			Unexpected("InputStickerSet type in StorageFileLocation.");
 		});
-		_volumeId = data.vvolume_id().v;
-		_localId = data.vlocal_id().v;
+		_volumeId = 0;
+		_localId = data.vthumb_version().v;
 	}, [&](const MTPDinputGroupCallStream &data) {
 		_type = Type::GroupCallStream;
 		data.vcall().match([&](const MTPDinputGroupCall &data) {
 			_id = data.vid().v;
 			_accessHash = data.vaccess_hash().v;
+		}, [](const auto &data) {
+			Unexpected("slug/msg in inputGroupCallStream.");
 		});
 		_volumeId = data.vtime_ms().v;
 		_localId = data.vscale().v;
+		_sizeLetter = uint8(data.vvideo_channel().value_or_empty() & 0x3F)
+			| uint8((data.vvideo_quality().value_or_empty() & 0x03) << 6);
 	});
 }
 
-StorageFileLocation StorageFileLocation::convertToModern(
-		Type type,
+StorageFileLocation StorageFileLocation::convertToModernPeerPhoto(
 		uint64 id,
-		uint64 accessHash) const {
-	Expects(_type == Type::Legacy);
-	Expects(type == Type::PeerPhoto || type == Type::StickerSetThumb);
+		uint64 accessHash,
+		uint64 photoId) const {
+	if (_type != Type::Legacy && _type != Type::PeerPhoto) {
+		return *this;
+	} else if (!photoId) {
+		return StorageFileLocation();
+	}
 
 	auto result = *this;
-	result._type = type;
+	result._type = Type::PeerPhoto;
 	result._id = id;
 	result._accessHash = accessHash;
-	result._sizeLetter = (type == Type::PeerPhoto) ? uint8('a') : uint8(0);
+	result._sizeLetter = uint8('a');
+	result._volumeId = photoId;
+	result._localId = 0;
+	result._inMessagePeerId = 0;
+	result._inMessageId = 0;
 	return result;
 }
 
@@ -200,7 +213,7 @@ uint64 StorageFileLocation::objectId() const {
 	return _id;
 }
 
-MTPInputFileLocation StorageFileLocation::tl(int32 self) const {
+MTPInputFileLocation StorageFileLocation::tl(UserId self) const {
 	switch (_type) {
 	case Type::Legacy:
 		return MTP_inputFileLocation(
@@ -244,25 +257,29 @@ MTPInputFileLocation StorageFileLocation::tl(int32 self) const {
 				? MTPDinputPeerPhotoFileLocation::Flag::f_big
 				: MTPDinputPeerPhotoFileLocation::Flag(0)),
 			GenerateInputPeer(
-				_id,
+				PeerId(_id),
 				_accessHash,
 				_inMessagePeerId,
 				_inMessageId,
 				self),
-			MTP_long(_volumeId),
-			MTP_int(_localId));
+			MTP_long(_volumeId));
 
 	case Type::StickerSetThumb:
 		return MTP_inputStickerSetThumb(
 			MTP_inputStickerSetID(MTP_long(_id), MTP_long(_accessHash)),
-			MTP_long(_volumeId),
 			MTP_int(_localId));
 
 	case Type::GroupCallStream:
 		return MTP_inputGroupCallStream(
+			MTP_flags((_sizeLetter != 0)
+				? (MTPDinputGroupCallStream::Flag::f_video_channel
+					| MTPDinputGroupCallStream::Flag::f_video_quality)
+				: MTPDinputGroupCallStream::Flag(0)),
 			MTP_inputGroupCall(MTP_long(_id), MTP_long(_accessHash)),
 			MTP_long(_volumeId),
-			MTP_int(_localId));
+			MTP_int(_localId),
+			MTP_int(_sizeLetter & 0x3F),
+			MTP_int((_sizeLetter >> 6) & 0x03));
 
 	}
 	Unexpected("Type in StorageFileLocation::tl.");
@@ -276,15 +293,29 @@ QByteArray StorageFileLocation::serialize() const {
 		buffer.open(QIODevice::WriteOnly);
 		auto stream = QDataStream(&buffer);
 		stream.setVersion(QDataStream::Qt_5_1);
+
+		Assert(!(quint8(_type) & kModernLocationFlag)
+			&& !(quint8(_type) & kInMessageFieldsFlag));
+		auto typeWithFlags = quint8(_type);
+		typeWithFlags |= kModernLocationFlag;
+		auto field1 = qint32(_localId);
+		auto field2 = qint32(0);
+		if (_inMessagePeerId != 0) {
+			Assert(field1 == 0);
+			typeWithFlags |= kInMessageFieldsFlag;
+			field1 = qint32(uint32(_inMessagePeerId.value >> 32));
+			field2 = qint32(uint32(_inMessagePeerId.value & 0xFFFFFFFFULL));
+		}
+		Assert(typeWithFlags != kNonStorageLocationToken);
 		stream
 			<< quint16(_dcId)
-			<< quint8(kSerializeTypeShift | quint8(_type))
+			<< typeWithFlags
 			<< quint8(_sizeLetter)
-			<< qint32(_localId)
+			<< field1
 			<< quint64(_id)
 			<< quint64(_accessHash)
 			<< quint64(_volumeId)
-			<< qint32(_inMessagePeerId)
+			<< field2
 			<< qint32(_inMessageId)
 			<< _fileReference;
 	}
@@ -298,52 +329,88 @@ int StorageFileLocation::serializeSize() const {
 }
 
 std::optional<StorageFileLocation> StorageFileLocation::FromSerialized(
-	const QByteArray &serialized) {
+		const QByteArray &serialized) {
 	if (serialized.isEmpty()) {
 		return StorageFileLocation();
 	}
 
 	quint16 dcId = 0;
-	quint8 type = 0;
+	quint8 typeWithFlags = 0;
 	quint8 sizeLetter = 0;
-	qint32 localId = 0;
+	qint32 field1 = 0;
 	quint64 id = 0;
 	quint64 accessHash = 0;
 	quint64 volumeId = 0;
-	qint32 inMessagePeerId = 0;
+	qint32 field2 = 0;
 	qint32 inMessageId = 0;
 	QByteArray fileReference;
 	auto stream = QDataStream(serialized);
 	stream.setVersion(QDataStream::Qt_5_1);
 	stream
 		>> dcId
-		>> type;
-	if (type == kNonStorageLocationToken) {
+		>> typeWithFlags;
+	if (typeWithFlags == kNonStorageLocationToken) {
 		return std::nullopt;
 	}
 	stream
 		>> sizeLetter
-		>> localId
+		>> field1
 		>> id
 		>> accessHash
 		>> volumeId;
-	if (type & kSerializeTypeShift) {
-		type &= ~kSerializeTypeShift;
-		stream >> inMessagePeerId >> inMessageId;
+	const auto modern = ((typeWithFlags & kModernLocationFlag) != 0);
+	const auto inMessageFields
+		= ((typeWithFlags & kInMessageFieldsFlag) != 0);
+	if (modern) {
+		stream >> field2 >> inMessageId;
+		typeWithFlags &= ~kModernLocationFlag;
+		if (inMessageFields) {
+			typeWithFlags &= ~kInMessageFieldsFlag;
+		}
+	} else if (typeWithFlags & kLegacyInMessagePeerIdFlag) {
+		typeWithFlags &= ~kLegacyInMessagePeerIdFlag;
+		stream >> field2 >> inMessageId;
 	}
 	stream >> fileReference;
 
 	auto result = StorageFileLocation();
 	result._dcId = dcId;
-	result._type = Type(type);
+	result._type = Type(typeWithFlags);
 	result._sizeLetter = sizeLetter;
-	result._localId = localId;
-	result._id = id;
 	result._accessHash = accessHash;
 	result._volumeId = volumeId;
-	result._inMessagePeerId = inMessagePeerId;
 	result._inMessageId = inMessageId;
 	result._fileReference = fileReference;
+
+	if (modern) {
+		result._id = id;
+		if (inMessageFields) {
+			result._localId = 0;
+			result._inMessagePeerId = PeerId(
+				(uint64(uint32(field1)) << 32) | uint64(uint32(field2)));
+		} else {
+			result._localId = field1;
+			result._inMessagePeerId = 0;
+		}
+	} else {
+		result._id = (result._type == Type::PeerPhoto)
+			? DeserializePeerId(id).value
+			: id;
+		result._localId = (result._type == Type::PeerPhoto)
+			? 0
+			: field1;
+		result._inMessagePeerId = (field2 && result._type == Type::PeerPhoto)
+			? ((field2 > 0)
+				? peerFromUser(UserId(field2))
+				: peerFromChannel(ChannelId(-field2)))
+			: PeerId();
+	}
+	if (result._type == Type::StickerSetThumb && result._volumeId != 0) {
+		// Legacy field values that cannot be converted to modern.
+		// No information about thumb_version, which is required.
+		return std::nullopt;
+	}
+
 	return (stream.status() == QDataStream::Ok && result.valid())
 		? std::make_optional(result)
 		: std::nullopt;
@@ -397,10 +464,14 @@ Storage::Cache::Key StorageFileLocation::cacheKey() const {
 	switch (_type) {
 	case Type::Legacy:
 	case Type::PeerPhoto:
-	case Type::StickerSetThumb:
 		return Key{
 			shifted | sliced | (uint64(uint32(_localId)) << 16),
 			_volumeId };
+
+	case Type::StickerSetThumb:
+		return Key{
+			shifted | sliced | (uint64(uint32(_localId)) << 16),
+			_id };
 
 	case Type::Encrypted:
 	case Type::Secure:
@@ -424,7 +495,8 @@ Storage::Cache::Key StorageFileLocation::cacheKey() const {
 			(shifted
 				| sliced
 				| (uint32(_localId) << 16)
-				| (_volumeId << 20)),
+				| (_volumeId << 20)
+				| (uint64(_sizeLetter) << 56)),
 			_id };
 	}
 	return Key();
@@ -438,7 +510,7 @@ Storage::Cache::Key StorageFileLocation::bigFileBaseCacheKey() const {
 			| (_id >> 48);
 		const auto low = (_id << 16);
 
-		Ensures((low & 0xFFULL) == 0);
+		Ensures((low & 0x1FFULL) == 0);
 		return Storage::Cache::Key{ high, low };
 	}
 
@@ -446,8 +518,8 @@ Storage::Cache::Key StorageFileLocation::bigFileBaseCacheKey() const {
 		const auto high = (uint64(uint32(_localId)) << 24)
 			| ((uint64(_type) + 1) << 16)
 			| ((uint64(_dcId) & 0xFFULL) << 8)
-			| (_volumeId >> 56);
-		const auto low = (_volumeId << 8);
+			| (_id >> 56);
+		const auto low = (_id << 8);
 
 		Ensures((low & 0xFFULL) == 0);
 		return Storage::Cache::Key{ high, low };
@@ -552,7 +624,8 @@ bool operator==(const StorageFileLocation &a, const StorageFileLocation &b) {
 	case Type::GroupCallStream:
 		return (a._dcId == b._dcId)
 			&& (a._id == b._id)
-			&& (a._localId == b._localId);
+			&& (a._localId == b._localId)
+			&& (a._sizeLetter == b._sizeLetter);
 	};
 	Unexpected("Type in StorageFileLocation::operator==.");
 }
@@ -606,8 +679,8 @@ bool operator<(const StorageFileLocation &a, const StorageFileLocation &b) {
 			< std::tie(b._id, b._localId, b._volumeId, b._dcId);
 
 	case Type::GroupCallStream:
-		return std::tie(a._id, a._localId, a._dcId)
-			< std::tie(b._id, b._localId, b._dcId);
+		return std::tie(a._id, a._localId, a._dcId, a._sizeLetter)
+			< std::tie(b._id, b._localId, b._dcId, b._sizeLetter);
 	};
 	Unexpected("Type in StorageFileLocation::operator==.");
 }
@@ -629,8 +702,9 @@ InMemoryKey inMemoryKey(const WebFileLocation &location) {
 
 InMemoryKey inMemoryKey(const GeoPointLocation &location) {
 	return InMemoryKey(
-		(uint64(std::round(std::abs(location.lat + 360.) * 1000000)) << 32)
-		| uint64(std::round(std::abs(location.lon + 360.) * 1000000)),
+		(uint64(base::SafeRound(
+			std::abs(location.lat + 360.) * 1000000)) << 32)
+		| uint64(base::SafeRound(std::abs(location.lon + 360.) * 1000000)),
 		(uint64(location.width) << 32) | uint64(location.height));
 }
 
@@ -642,6 +716,11 @@ InMemoryKey inMemoryKey(const PlainUrlLocation &location) {
 		bytes::object_as_span(&result),
 		bytes::make_span(sha).subspan(0, sizeof(result)));
 	return result;
+}
+
+InMemoryKey inMemoryKey(const AudioAlbumThumbLocation &location) {
+	const auto key = Data::AudioAlbumThumbCacheKey(location);
+	return { key.high, key.low };
 }
 
 InMemoryKey inMemoryKey(const InMemoryLocation &location) {
@@ -715,7 +794,9 @@ std::optional<StorageImageLocation> StorageImageLocation::FromSerialized(
 }
 
 QByteArray DownloadLocation::serialize() const {
-	if (!valid() || v::is<StorageFileLocation>(data)) {
+	if (!valid()) {
+		return QByteArray();
+	} else if (v::is<StorageFileLocation>(data)) {
 		return v::get<StorageFileLocation>(data).serialize();
 	}
 	auto result = QByteArray();
@@ -742,6 +823,10 @@ QByteArray DownloadLocation::serialize() const {
 			<< qint32(data.height)
 			<< qint32(data.zoom)
 			<< qint32(data.scale);
+	}, [&](const AudioAlbumThumbLocation &data) {
+		stream
+			<< quint8(NonStorageLocationType::AudioAlbumThumb)
+			<< quint64(data.documentId);
 	}, [&](const PlainUrlLocation &data) {
 		stream << quint8(NonStorageLocationType::Url) << data.url.toUtf8();
 	}, [&](const InMemoryLocation &data) {
@@ -752,7 +837,9 @@ QByteArray DownloadLocation::serialize() const {
 }
 
 int DownloadLocation::serializeSize() const {
-	if (!valid() || v::is<StorageFileLocation>(data)) {
+	if (!valid()) {
+		return 0;
+	} else if (v::is<StorageFileLocation>(data)) {
 		return v::get<StorageFileLocation>(data).serializeSize();
 	}
 	auto result = sizeof(quint16) + sizeof(quint8) + sizeof(quint8);
@@ -764,6 +851,8 @@ int DownloadLocation::serializeSize() const {
 		result += 2 * sizeof(qreal) + sizeof(quint64) + 4 * sizeof(qint32);
 	}, [&](const PlainUrlLocation &data) {
 		result += Serialize::bytearraySize(data.url.toUtf8());
+	}, [&](const AudioAlbumThumbLocation &data) {
+		result += sizeof(quint64);
 	}, [&](const InMemoryLocation &data) {
 		result += Serialize::bytearraySize(data.bytes);
 	});
@@ -805,6 +894,9 @@ std::optional<DownloadLocation> DownloadLocation::FromSerialized(
 		qint32 zoom = 0;
 		qint32 scale = 0;
 		stream >> lat >> lon >> access >> width >> height >> zoom >> scale;
+		if (!Data::ValidGeoCoordinates(lat, lon)) {
+			return std::nullopt;
+		}
 		return (stream.status() == QDataStream::Ok)
 			? std::make_optional(
 				DownloadLocation{ GeoPointLocation{
@@ -815,6 +907,15 @@ std::optional<DownloadLocation> DownloadLocation::FromSerialized(
 					.height = height,
 					.zoom = zoom,
 					.scale = scale } })
+			: std::nullopt;
+	} break;
+
+	case NonStorageLocationType::AudioAlbumThumb: {
+		quint64 id = 0;
+		stream >> id;
+		return (stream.status() == QDataStream::Ok)
+			? std::make_optional(DownloadLocation{
+				AudioAlbumThumbLocation{ id } })
 			: std::nullopt;
 	} break;
 
@@ -839,20 +940,24 @@ std::optional<DownloadLocation> DownloadLocation::FromSerialized(
 	return std::nullopt;
 }
 
-DownloadLocation DownloadLocation::convertToModern(
-		StorageFileLocation::Type type,
+DownloadLocation DownloadLocation::convertToModernPeerPhoto(
 		uint64 id,
-		uint64 accessHash) const {
+		uint64 accessHash,
+		uint64 photoId) const {
 	if (!v::is<StorageFileLocation>(data)) {
 		return *this;
 	}
 	auto &file = v::get<StorageFileLocation>(data);
-	return DownloadLocation{ file.convertToModern(type, id, accessHash) };
+	return DownloadLocation{
+		file.convertToModernPeerPhoto(id, accessHash, photoId)
+	};
 }
 
 Storage::Cache::Key DownloadLocation::cacheKey() const {
 	return v::match(data, [](const GeoPointLocation &data) {
-		return Data::GeoPointCacheKey(data);
+		return Data::ValidGeoCoordinates(data.lat, data.lon)
+			? Data::GeoPointCacheKey(data)
+			: Storage::Cache::Key();
 	}, [](const StorageFileLocation &data) {
 		return data.valid()
 			? data.cacheKey()
@@ -865,6 +970,8 @@ Storage::Cache::Key DownloadLocation::cacheKey() const {
 		return data.url.isEmpty()
 			? Storage::Cache::Key()
 			: Data::UrlCacheKey(data.url);
+	}, [](const AudioAlbumThumbLocation &data) {
+		return Data::AudioAlbumThumbCacheKey(data);
 	}, [](const InMemoryLocation &data) {
 		return Storage::Cache::Key();
 	});
@@ -878,13 +985,15 @@ Storage::Cache::Key DownloadLocation::bigFileBaseCacheKey() const {
 
 bool DownloadLocation::valid() const {
 	return v::match(data, [](const GeoPointLocation &data) {
-		return true;
+		return Data::ValidGeoCoordinates(data.lat, data.lon);
 	}, [](const StorageFileLocation &data) {
 		return data.valid();
 	}, [](const WebFileLocation &data) {
 		return !data.isNull();
 	}, [](const PlainUrlLocation &data) {
 		return !data.url.isEmpty();
+	}, [](const AudioAlbumThumbLocation &data) {
+		return data.documentId != 0;
 	}, [](const InMemoryLocation &data) {
 		return !data.bytes.isEmpty();
 	});

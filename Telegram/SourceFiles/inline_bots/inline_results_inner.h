@@ -16,6 +16,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/timer.h"
 #include "mtproto/sender.h"
 #include "inline_bots/inline_bot_layout_item.h"
+#include "layout/layout_mosaic.h"
 
 namespace Api {
 struct SendOptions;
@@ -29,6 +30,7 @@ class RoundButton;
 class FlatLabel;
 class RippleAnimation;
 class PopupMenu;
+class PathShiftGradient;
 } // namespace Ui
 
 namespace Window {
@@ -41,28 +43,28 @@ struct ResultSelected;
 } // namespace InlineBots
 
 namespace SendMenu {
-enum class Type;
+struct Details;
 } // namespace SendMenu
 
 namespace InlineBots {
 namespace Layout {
 
-constexpr int kInlineItemsMaxPerRow = 5;
-
 class ItemBase;
-using Results = std::vector<std::unique_ptr<Result>>;
+using Results = std::vector<std::shared_ptr<Result>>;
 
 struct CacheEntry {
 	QString nextOffset;
-	QString switchPmText, switchPmStartToken;
+	QString switchPmText;
+	QString switchPmStartToken;
+	QByteArray switchPmUrl;
 	Results results;
+	bool gallery = false;
 };
 
 class Inner
 	: public Ui::RpWidget
 	, public Ui::AbstractTooltipShower
-	, public Context
-	, private base::Subscriber {
+	, public Context {
 
 public:
 	Inner(QWidget *parent, not_null<Window::SessionController*> controller);
@@ -88,10 +90,7 @@ public:
 	void setResultSelectedCallback(Fn<void(ResultSelected)> callback) {
 		_resultSelectedCallback = std::move(callback);
 	}
-	void setCurrentDialogsEntryState(Dialogs::EntryState state) {
-		_currentDialogsEntryState = state;
-	}
-	void setSendMenuType(Fn<SendMenu::Type()> &&callback);
+	void setSendMenuDetails(Fn<SendMenu::Details()> &&callback);
 
 	// Ui::AbstractTooltipShower interface.
 	QString tooltipText() const override;
@@ -110,6 +109,7 @@ protected:
 	void mousePressEvent(QMouseEvent *e) override;
 	void mouseReleaseEvent(QMouseEvent *e) override;
 	void mouseMoveEvent(QMouseEvent *e) override;
+	void resizeEvent(QResizeEvent *e) override;
 	void paintEvent(QPaintEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
 	void leaveToChildEvent(QEvent *e, QWidget *child) override;
@@ -119,11 +119,6 @@ protected:
 private:
 	static constexpr bool kRefreshIconsScrollAnimation = true;
 	static constexpr bool kRefreshIconsNoAnimation = false;
-
-	struct Row {
-		int height = 0;
-		QVector<ItemBase*> items;
-	};
 
 	void switchPm();
 
@@ -135,42 +130,47 @@ private:
 	void paintInlineItems(Painter &p, const QRect &r);
 
 	void refreshSwitchPmButton(const CacheEntry *entry);
+	void refreshMosaicOffset();
 
 	void showPreview();
 	void updateInlineItems();
+	void repaintItems(crl::time now = 0);
 	void clearInlineRows(bool resultsDeleted);
-	ItemBase *layoutPrepareInlineResult(Result *result, int32 position);
+	ItemBase *layoutPrepareInlineResult(std::shared_ptr<Result> result);
 
-	bool inlineRowsAddItem(Result *result, Row &row, int32 &sumWidth);
-	bool inlineRowFinalize(Row &row, int32 &sumWidth, bool force = false);
-
-	Row &layoutInlineRow(Row &row, int32 sumWidth = 0);
+	void updateRestrictedLabelGeometry();
 	void deleteUnusedInlineLayouts();
 
 	int validateExistingInlineRows(const Results &results);
-	void selectInlineResult(int row, int column);
-	void selectInlineResult(int row, int column, Api::SendOptions options);
+	void selectInlineResult(
+		int index,
+		Api::SendOptions options,
+		bool open);
 
 	not_null<Window::SessionController*> _controller;
+	const std::unique_ptr<Ui::PathShiftGradient> _pathGradient;
 
 	int _visibleTop = 0;
 	int _visibleBottom = 0;
 
 	UserData *_inlineBot = nullptr;
 	PeerData *_inlineQueryPeer = nullptr;
-	crl::time _lastScrolled = 0;
+	crl::time _lastScrolledAt = 0;
+	crl::time _lastUpdatedAt = 0;
 	base::Timer _updateInlineItems;
 	bool _inlineWithThumb = false;
+	bool _gallery = false;
 
 	object_ptr<Ui::RoundButton> _switchPmButton = { nullptr };
 	QString _switchPmStartToken;
-	Dialogs::EntryState _currentDialogsEntryState;
+	QByteArray _switchPmUrl;
 
 	object_ptr<Ui::FlatLabel> _restrictedLabel = { nullptr };
+	QString _restrictedLabelKey;
 
 	base::unique_qptr<Ui::PopupMenu> _menu;
 
-	QVector<Row> _rows;
+	Mosaic::Layout::MosaicLayout<InlineBots::Layout::ItemBase> _mosaic;
 
 	std::map<Result*, std::unique_ptr<ItemBase>> _inlineLayouts;
 
@@ -184,7 +184,7 @@ private:
 	bool _previewShown = false;
 
 	Fn<void(ResultSelected)> _resultSelectedCallback;
-	Fn<SendMenu::Type()> _sendMenuType;
+	Fn<SendMenu::Details()> _sendMenuDetails;
 
 };
 

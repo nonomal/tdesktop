@@ -8,9 +8,34 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "ui/rp_widget.h"
+#include "chat_helpers/bot_command.h"
 #include "dialogs/dialogs_key.h"
 #include "media/player/media_player_float.h" // FloatSectionDelegate
 #include "base/object_ptr.h"
+#include "window/window_section_common.h"
+
+#include <optional>
+
+class History;
+class PeerData;
+class UserData;
+
+namespace ChatHelpers {
+struct FileChosen;
+class Show;
+} // namespace ChatHelpers
+
+namespace SendMenu {
+struct Details;
+} // namespace SendMenu
+
+namespace Data {
+struct ReactionId;
+struct ReportInput;
+class ForumTopic;
+class WallPaper;
+class Session;
+} // namespace Data
 
 namespace Main {
 class Session;
@@ -18,6 +43,7 @@ class Session;
 
 namespace Ui {
 class LayerWidget;
+class ChatTheme;
 } // namespace Ui
 
 namespace Window {
@@ -35,15 +61,12 @@ enum class Column {
 
 class AbstractSectionWidget
 	: public Ui::RpWidget
-	, public Media::Player::FloatSectionDelegate
-	, protected base::Subscriber {
+	, public Media::Player::FloatSectionDelegate {
 public:
 	AbstractSectionWidget(
 		QWidget *parent,
-		not_null<SessionController*> controller)
-	: RpWidget(parent)
-	, _controller(controller) {
-	}
+		not_null<SessionController*> controller,
+		rpl::producer<PeerData*> peerForBackground);
 
 	[[nodiscard]] Main::Session &session() const;
 	[[nodiscard]] not_null<SessionController*> controller() const {
@@ -52,13 +75,15 @@ public:
 
 	// Tabbed selector management.
 	virtual bool pushTabbedSelectorToThirdSection(
-			not_null<PeerData*> peer,
+			not_null<Data::Thread*> thread,
 			const SectionShow &params) {
 		return false;
 	}
 	virtual bool returnTabbedSelector() {
 		return false;
 	}
+	[[nodiscard]] virtual SendMenu::Details sendMenuDetails() const;
+	virtual bool processChosenSticker(ChatHelpers::FileChosen &&chosen);
 
 private:
 	const not_null<SessionController*> _controller;
@@ -69,9 +94,12 @@ class SectionMemento;
 
 struct SectionSlideParams {
 	QPixmap oldContentCache;
+	int topSkip = 0;
+	QPixmap topMask;
 	bool withTopBarShadow = false;
 	bool withTabs = false;
 	bool withFade = false;
+	bool fromBottom = false;
 
 	explicit operator bool() const {
 		return !oldContentCache.isNull();
@@ -82,7 +110,12 @@ class SectionWidget : public AbstractSectionWidget {
 public:
 	SectionWidget(
 		QWidget *parent,
-		not_null<SessionController*> controller);
+		not_null<SessionController*> controller,
+		rpl::producer<PeerData*> peerForBackground = nullptr);
+	SectionWidget(
+		QWidget *parent,
+		not_null<SessionController*> controller,
+		not_null<PeerData*> peerForBackground);
 
 	virtual Dialogs::RowDescriptor activeChat() const {
 		return {};
@@ -103,6 +136,7 @@ public:
 		SlideDirection direction,
 		const SectionSlideParams &params);
 	void showFast();
+	[[nodiscard]] bool animatingShow() const;
 
 	// This can be used to grab with or without top bar shadow.
 	// This will be protected when animation preparation will be done inside.
@@ -117,6 +151,12 @@ public:
 	virtual bool showInternal(
 		not_null<SectionMemento*> memento,
 		const SectionShow &params) = 0;
+	virtual bool showBackInternal() {
+		return false;
+	}
+	virtual bool sameTypeAs(not_null<SectionMemento*> memento) {
+		return false;
+	}
 
 	virtual bool showMessage(
 			PeerId peerId,
@@ -124,12 +164,59 @@ public:
 			MsgId messageId) {
 		return false;
 	}
-
-	virtual bool replyToMessage(not_null<HistoryItem*> item) {
+	virtual bool searchInChatEmbedded(
+			QString query,
+			Dialogs::Key chat,
+			PeerData *searchFrom = nullptr) {
 		return false;
 	}
 
-	virtual bool preventsClose(Fn<void()> &&continueCallback) const {
+	virtual bool showChooseReportMessages(
+			not_null<PeerData*> peer,
+			Data::ReportInput &&reportInput,
+			Fn<void(std::vector<MsgId>)> &&done) {
+		return false;
+	}
+	virtual bool clearChooseReportMessages() {
+		return false;
+	}
+	virtual bool toggleChooseChatTheme(
+			not_null<PeerData*> peer,
+			std::optional<bool> show = std::nullopt) {
+		return false;
+	}
+	[[nodiscard]] virtual Ui::ChatTheme *customChatTheme() const {
+		return nullptr;
+	}
+
+	[[nodiscard]] virtual bool preventsClose(
+			Fn<void()> &&continueCallback) const {
+		return false;
+	}
+
+	// Send bot command from peer info or media viewer.
+	virtual SectionActionResult sendBotCommand(
+			Bot::SendCommandRequest request) {
+		return SectionActionResult::Ignore;
+	}
+
+	virtual SectionActionResult hideSingleUseKeyboard(FullMsgId replyToId) {
+		return SectionActionResult::Fallback;
+	}
+
+	virtual bool confirmSendingFiles(const QStringList &files) {
+		return false;
+	}
+	virtual bool confirmSendingFiles(not_null<const QMimeData*> data) {
+		return false;
+	}
+	virtual void insertTextAtCursor(const QString &text) {
+	}
+
+	virtual bool notify_switchInlineBotButtonReceived(
+			const QString &query,
+			UserData *samePeerBot,
+			MsgId samePeerReplyTo) {
 		return false;
 	}
 
@@ -137,30 +224,70 @@ public:
 	// This method may modify the section ("take" heavy items).
 	virtual std::shared_ptr<SectionMemento> createMemento();
 
+	// Create a memento that only identifies the section, without taking
+	// anything from it. Unlike createMemento() this doesn't modify the
+	// section, so it is safe to call on the one that stays alive, like
+	// when saving the opened windows state. Null if not supported.
+	[[nodiscard]] virtual auto createIdentityMemento()
+	-> std::shared_ptr<SectionMemento> {
+		return nullptr;
+	}
+
 	void setInnerFocus() {
 		doSetInnerFocus();
 	}
+	virtual void checkActivation() {
+	}
 
-	virtual rpl::producer<int> desiredHeight() const;
+	[[nodiscard]] virtual rpl::producer<int> desiredHeight() const;
+	[[nodiscard]] virtual rpl::producer<> removeRequests() const {
+		return rpl::never<>();
+	}
 
 	// Some sections convert to layers on some geometry sizes.
-	virtual object_ptr<Ui::LayerWidget> moveContentToLayer(
+	[[nodiscard]] virtual object_ptr<Ui::LayerWidget> moveContentToLayer(
 			QRect bodyGeometry) {
 		return nullptr;
 	}
 
+	virtual void validateSubsectionTabs() {
+	}
+
+	[[nodiscard]] virtual bool contentOverlapped(const QRect &globalRect) {
+		return false;
+	}
+
 	static void PaintBackground(
 		not_null<SessionController*> controller,
+		not_null<Ui::ChatTheme*> theme,
 		not_null<QWidget*> widget,
 		QRect clip);
+	static void PaintBackground(
+		not_null<Ui::ChatTheme*> theme,
+		not_null<QWidget*> widget,
+		int fillHeight,
+		int fromy,
+		QRect clip,
+		bool paused = false);
+	static void PaintBackground(
+		QPainter &p,
+		not_null<Ui::ChatTheme*> theme,
+		QSize fill,
+		QRect clip,
+		bool paused = false);
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
 
-	// Temp variable used in resizeEvent() implementation, that is passed
-	// to setGeometryWithTopMoved() to adjust the scroll position with the resize.
-	int topDelta() const {
-		return _topDelta;
+	void showHistoryAfterThreadDestroyed(not_null<History*> history);
+
+	// A size-changing setGeometryWithTopMoved() can deliver the shift to
+	// the section twice: Ui::RpWidget fires its geometry stream before
+	// QEvent::Resize reaches resizeEvent(), so a section with a consumer
+	// of its own sizeValue() relayouts once for each. A relative applier
+	// must add the shift only once.
+	[[nodiscard]] int takeTopDelta() {
+		return base::take(_topDelta);
 	}
 
 	// Called after the hideChildren() call in showAnimated().
@@ -176,10 +303,6 @@ protected:
 		setFocus();
 	}
 
-	bool animating() const {
-		return _showAnimation != nullptr;
-	}
-
 	~SectionWidget();
 
 private:
@@ -187,9 +310,29 @@ private:
 
 	std::unique_ptr<SlideAnimation> _showAnimation;
 
-	// Saving here topDelta in setGeometryWithTopMoved() to get it passed to resizeEvent().
 	int _topDelta = 0;
 
 };
+
+[[nodiscard]] auto ChatThemeValueFromPeer(
+	not_null<SessionController*> controller,
+	not_null<PeerData*> peer)
+-> rpl::producer<std::shared_ptr<Ui::ChatTheme>>;
+
+[[nodiscard]] bool ShowSendPremiumError(
+	not_null<SessionController*> controller,
+	not_null<DocumentData*> document);
+[[nodiscard]] bool ShowSendPremiumError(
+	std::shared_ptr<ChatHelpers::Show> show,
+	not_null<DocumentData*> document);
+
+[[nodiscard]] bool ShowReactPremiumError(
+	not_null<SessionController*> controller,
+	not_null<HistoryItem*> item,
+	const Data::ReactionId &id);
+
+[[nodiscard]] rpl::producer<const Data::WallPaper*> WallPaperResolved(
+	not_null<Data::Session*> owner,
+	const Data::WallPaper *paper);
 
 } // namespace Window

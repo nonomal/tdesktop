@@ -7,14 +7,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "data/data_abstract_sparse_ids.h"
 #include "storage/storage_user_photos.h"
 #include "base/weak_ptr.h"
+
+class UserData;
 
 namespace Main {
 class Session;
 } // namespace Main
 
-class UserPhotosSlice {
+class UserPhotosSlice final : public AbstractSparseIds<std::deque<PhotoId>> {
 public:
 	using Key = Storage::UserPhotosKey;
 
@@ -26,24 +29,11 @@ public:
 		std::optional<int> skippedBefore,
 		std::optional<int> skippedAfter);
 
-	void reverse();
-
-	const Key &key() const { return _key; }
-
-	std::optional<int> fullCount() const { return _fullCount; }
-	std::optional<int> skippedBefore() const { return _skippedBefore; }
-	std::optional<int> skippedAfter() const { return _skippedAfter; }
-	std::optional<int> indexOf(PhotoId msgId) const;
-	int size() const { return _ids.size(); }
-	PhotoId operator[](int index) const;
 	std::optional<int> distance(const Key &a, const Key &b) const;
+	const Key &key() const { return _key; }
 
 private:
 	Key _key;
-	std::deque<PhotoId> _ids;
-	std::optional<int> _fullCount;
-	std::optional<int> _skippedBefore;
-	std::optional<int> _skippedAfter;
 
 	friend class UserPhotosSliceBuilder;
 
@@ -60,3 +50,6 @@ rpl::producer<UserPhotosSlice> UserPhotosReversedViewer(
 	UserPhotosSlice::Key key,
 	int limitBefore,
 	int limitAfter);
+
+[[nodiscard]] std::optional<PhotoId> SyncUserFallbackPhotoViewer(
+	not_null<UserData*> user);

@@ -11,6 +11,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/effects/animations.h"
 #include "ui/effects/radial_animation.h"
 
+class FileClickHandler;
+
 namespace HistoryView {
 
 class File : public Media {
@@ -22,19 +24,17 @@ public:
 	, _realParent(realParent) {
 	}
 
-	bool toggleSelectionByHandlerClick(const ClickHandlerPtr &p) const override {
-		return p == _openl || p == _savel || p == _cancell;
-	}
-	bool dragItemByHandler(const ClickHandlerPtr &p) const override {
-		return p == _openl || p == _savel || p == _cancell;
-	}
+	[[nodiscard]] bool toggleSelectionByHandlerClick(
+		const ClickHandlerPtr &p) const override;
+	[[nodiscard]] bool dragItemByHandler(
+		const ClickHandlerPtr &p) const override;
 
 	void clickHandlerActiveChanged(const ClickHandlerPtr &p, bool active) override;
 	void clickHandlerPressedChanged(const ClickHandlerPtr &p, bool pressed) override;
 
 	void refreshParentId(not_null<HistoryItem*> realParent) override;
 
-	bool allowsFastShare() const override {
+	[[nodiscard]] bool allowsFastShare() const override {
 		return true;
 	}
 
@@ -52,21 +52,29 @@ protected:
 		FileClickHandlerPtr &&cancell);
 	void setDocumentLinks(
 		not_null<DocumentData*> document,
-		not_null<HistoryItem*> realParent);
+		not_null<HistoryItem*> realParent,
+		Fn<bool()> openHook = nullptr);
 
 	// >= 0 will contain download / upload string, _statusSize = loaded bytes
 	// < 0 will contain played string, _statusSize = -(seconds + 1) played
-	// 0x7FFFFFF0 will contain status for not yet downloaded file
-	// 0x7FFFFFF1 will contain status for already downloaded file
-	// 0x7FFFFFF2 will contain status for failed to download / upload file
-	mutable int _statusSize;
+	// 0xFFFFFFF0LL will contain status for not yet downloaded file
+	// 0xFFFFFFF1LL will contain status for already downloaded file
+	// 0xFFFFFFF2LL will contain status for failed to download / upload file
+	mutable int64 _statusSize = 0;
 	mutable QString _statusText;
 
 	// duration = -1 - no duration, duration = -2 - "GIF" duration
-	void setStatusSize(int newSize, int fullSize, int duration, qint64 realDuration) const;
+	void setStatusSize(int64 newSize, int64 fullSize, TimeId duration, TimeId realDuration) const;
 
 	void radialAnimationCallback(crl::time now) const;
-	void thumbAnimationCallback();
+
+	void paintTtlFire(QPainter &p, QRect inner) const;
+	void paintTtlCountdown(
+		QPainter &p,
+		QRect inner,
+		int line,
+		const style::color &color,
+		bool paused) const;
 
 	void ensureAnimation() const;
 	void checkAnimationFinished() const;

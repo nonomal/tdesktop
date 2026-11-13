@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "main/main_session.h"
 #include "apiwrap.h"
+#include "api/api_peer_photo.h"
 #include "data/data_session.h"
 #include "data/data_user.h"
 #include "storage/storage_facade.h"
@@ -45,7 +46,7 @@ private:
 	int _limitBefore = 0;
 	int _limitAfter = 0;
 
-	rpl::event_stream<PhotoId> _insufficientPhotosAround;
+	rpl::event_stream<Api::PeerPhoto::UserPhotoId> _insufficientPhotosAround;
 
 };
 
@@ -64,39 +65,23 @@ UserPhotosSlice::UserPhotosSlice(
 	std::optional<int> fullCount,
 	std::optional<int> skippedBefore,
 	std::optional<int> skippedAfter)
-: _key(key)
-, _ids(std::move(ids))
-, _fullCount(fullCount)
-, _skippedBefore(skippedBefore)
-, _skippedAfter(skippedAfter) {
+: AbstractSparseIds<std::deque<PhotoId>>(
+	ids,
+	fullCount,
+	skippedBefore,
+	skippedAfter)
+, _key(key) {
 }
 
-void UserPhotosSlice::reverse() {
-	ranges::reverse(_ids);
-	std::swap(_skippedBefore, _skippedAfter);
-}
-
-std::optional<int> UserPhotosSlice::indexOf(PhotoId photoId) const {
-	auto it = ranges::find(_ids, photoId);
-	if (it != _ids.end()) {
-		return (it - _ids.begin());
-	}
-	return std::nullopt;
-}
-
-PhotoId UserPhotosSlice::operator[](int index) const {
-	Expects(index >= 0 && index < size());
-
-	return *(_ids.begin() + index);
-}
-
-std::optional<int> UserPhotosSlice::distance(const Key &a, const Key &b) const {
+std::optional<int> UserPhotosSlice::distance(
+		const Key &a,
+		const Key &b) const {
 	if (a.userId != _key.userId
 		|| b.userId != _key.userId) {
 		return std::nullopt;
 	}
-	if (auto i = indexOf(a.photoId)) {
-		if (auto j = indexOf(b.photoId)) {
+	if (const auto i = indexOf(a.photoId)) {
+		if (const auto j = indexOf(b.photoId)) {
 			return *j - *i;
 		}
 	}
@@ -125,7 +110,7 @@ bool UserPhotosSliceBuilder::applyUpdate(const Storage::UserPhotosSliceUpdate &u
 	if (update.userId != _key.userId) {
 		return false;
 	}
-	auto idsCount = update.photoIds ? int(update.photoIds->size()) : 0;
+	const auto idsCount = update.photoIds ? int(update.photoIds->size()) : 0;
 	mergeSliceData(
 		update.count,
 		update.photoIds ? *update.photoIds : std::deque<PhotoId> {},
@@ -168,9 +153,9 @@ void UserPhotosSliceBuilder::mergeSliceData(
 }
 
 void UserPhotosSliceBuilder::sliceToLimits() {
-	auto aroundIt = ranges::find(_ids, _key.photoId);
-	auto removeFromBegin = (aroundIt - _ids.begin() - _limitBefore);
-	auto removeFromEnd = (_ids.end() - aroundIt - _limitAfter - 1);
+	const auto aroundIt = ranges::find(_ids, _key.photoId);
+	const auto removeFromBegin = (aroundIt - _ids.begin() - _limitBefore);
+	const auto removeFromEnd = (_ids.end() - aroundIt - _limitAfter - 1);
 	if (removeFromEnd > 0) {
 		_ids.erase(_ids.end() - removeFromEnd, _ids.end());
 		_skippedAfter += removeFromEnd;
@@ -180,7 +165,8 @@ void UserPhotosSliceBuilder::sliceToLimits() {
 		if (_skippedBefore) {
 			*_skippedBefore += removeFromBegin;
 		}
-	} else if (removeFromBegin < 0 && (!_skippedBefore || *_skippedBefore > 0)) {
+	} else if (removeFromBegin < 0
+		&& (!_skippedBefore || *_skippedBefore > 0)) {
 		_insufficientPhotosAround.fire(_ids.empty() ? 0 : _ids.front());
 	}
 }
@@ -201,30 +187,32 @@ rpl::producer<UserPhotosSlice> UserPhotosViewer(
 		int limitAfter) {
 	return [=](auto consumer) {
 		auto lifetime = rpl::lifetime();
-		auto builder = lifetime.make_state<UserPhotosSliceBuilder>(
+		const auto builder = lifetime.make_state<UserPhotosSliceBuilder>(
 			key,
 			limitBefore,
 			limitAfter);
-		auto applyUpdate = [=](auto &&update) {
+		const auto applyUpdate = [=](auto &&update) {
 			if (builder->applyUpdate(std::forward<decltype(update)>(update))) {
 				consumer.put_next(builder->snapshot());
 			}
 		};
 		auto requestPhotosAround = [user = session->data().user(key.userId)](
-				PhotoId photoId) {
-			user->session().api().requestUserPhotos(user, photoId);
+				Api::PeerPhoto::UserPhotoId photoId) {
+			user->session().api().peerPhoto().requestUserPhotos(
+				user,
+				photoId);
 		};
 		builder->insufficientPhotosAround()
-			| rpl::start_with_next(requestPhotosAround, lifetime);
+			| rpl::on_next(std::move(requestPhotosAround), lifetime);
 
 		session->storage().userPhotosSliceUpdated()
-			| rpl::start_with_next(applyUpdate, lifetime);
+			| rpl::on_next(applyUpdate, lifetime);
 
 		session->storage().query(Storage::UserPhotosQuery(
 			key,
 			limitBefore,
 			limitAfter
-		)) | rpl::start_with_next_done(
+		)) | rpl::on_next_done(
 			applyUpdate,
 			[=] { builder->checkInsufficientPhotos(); },
 			lifetime);
@@ -248,4 +236,22 @@ rpl::producer<UserPhotosSlice> UserPhotosReversedViewer(
 		slice.reverse();
 		return std::move(slice);
 	});
+}
+
+std::optional<PhotoId> SyncUserFallbackPhotoViewer(not_null<UserData*> user) {
+	auto syncLifetime = rpl::lifetime();
+	auto result = std::optional<PhotoId>(std::nullopt);
+
+	constexpr auto kFallbackCount = 1;
+	user->session().storage().query(Storage::UserPhotosQuery(
+		Storage::UserPhotosKey(peerToUser(user->id), true),
+		kFallbackCount,
+		kFallbackCount
+	)) | rpl::on_next([&](Storage::UserPhotosResult &&slice) {
+		if (slice.photoIds.empty()) {
+			return;
+		}
+		result = slice.photoIds.front();
+	}, syncLifetime);
+	return result;
 }

@@ -7,17 +7,91 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "media/streaming/media_streaming_video_track.h"
 
+#include "ffmpeg/ffmpeg_utility.h"
 #include "media/audio/media_audio.h"
+#include "media/media_common.h"
 #include "base/concurrent_timer.h"
+#include "core/crash_reports.h"
+#include "base/debug_log.h"
+
+#ifdef Q_OS_MAC
+#include "media/streaming/media_streaming_native_frame_mac.h"
+
+#include <CoreVideo/CoreVideo.h>
+#endif // Q_OS_MAC
 
 namespace Media {
 namespace Streaming {
 namespace {
 
-constexpr auto kMaxFrameArea = 3840 * 2160; // usual 4K
 constexpr auto kDisplaySkipped = crl::time(-1);
 constexpr auto kFinishedPosition = std::numeric_limits<crl::time>::max();
 static_assert(kDisplaySkipped != kTimeUnknown);
+
+using ::Media::ValidFrameSize;
+
+[[nodiscard]] crl::time WorldTimeDelay(crl::time trackDelay, float64 speed) {
+	if (trackDelay <= 0 || speed <= 0. || speed == 1.) {
+		return trackDelay;
+	}
+	const auto adjusted = base::SafeRound(trackDelay / speed);
+	return (adjusted < 1.) ? crl::time(1) : crl::time(adjusted);
+}
+
+[[nodiscard]] QImage ConvertToARGB32(
+		FrameFormat format,
+		const FrameYUV &data) {
+	Expects(data.y.data != nullptr);
+	Expects(data.u.data != nullptr);
+	Expects((format == FrameFormat::NV12) || (data.v.data != nullptr));
+	Expects(!data.size.isEmpty());
+
+	//if (FFmpeg::RotationSwapWidthHeight(stream.rotation)) {
+	//	resize.transpose();
+	//}
+
+	auto result = FFmpeg::CreateFrameStorage(data.size);
+	if (result.isNull()) {
+		return QImage();
+	}
+	const auto swscale = FFmpeg::MakeSwscalePointer(
+		data.size,
+		(format == FrameFormat::YUV420
+			? AV_PIX_FMT_YUV420P
+			: AV_PIX_FMT_NV12),
+		data.size,
+		AV_PIX_FMT_BGRA);
+	if (!swscale) {
+		return QImage();
+	}
+
+	// AV_NUM_DATA_POINTERS defined in AVFrame struct
+	const uint8_t *srcData[AV_NUM_DATA_POINTERS] = {
+		static_cast<const uint8_t*>(data.y.data),
+		static_cast<const uint8_t*>(data.u.data),
+		static_cast<const uint8_t*>(data.v.data),
+		nullptr,
+	};
+	int srcLinesize[AV_NUM_DATA_POINTERS] = {
+		data.y.stride,
+		data.u.stride,
+		data.v.stride,
+		0,
+	};
+	uint8_t *dstData[AV_NUM_DATA_POINTERS] = { result.bits(), nullptr };
+	int dstLinesize[AV_NUM_DATA_POINTERS] = { int(result.bytesPerLine()), 0 };
+
+	sws_scale(
+		swscale.get(),
+		srcData,
+		srcLinesize,
+		0,
+		data.size.height(),
+		dstData,
+		dstLinesize);
+
+	return result;
+}
 
 } // namespace
 
@@ -53,6 +127,7 @@ public:
 	void removeFrameRequest(const Instance *instance);
 
 	void rasterizeFrame(not_null<Frame*> frame);
+	[[nodiscard]] bool requireARGB32() const;
 
 private:
 	enum class FrameResult {
@@ -77,7 +152,7 @@ private:
 	[[nodiscard]] ReadEnoughState readEnoughFrames(crl::time trackTime);
 	[[nodiscard]] FrameResult readFrame(not_null<Frame*> frame);
 	void fillRequests(not_null<Frame*> frame) const;
-	[[nodiscard]] QSize chooseOriginalResize() const;
+	[[nodiscard]] QSize chooseOriginalResize(QSize encoded) const;
 	void presentFrameIfNeeded();
 	void callReady();
 	[[nodiscard]] bool loopAround();
@@ -103,6 +178,7 @@ private:
 	Fn<void(Error)> _error;
 	crl::time _pausedTime = kTimeUnknown;
 	crl::time _resumedTime = kTimeUnknown;
+	int _frameIndex = 0;
 	int _durationByLastPacket = 0;
 	mutable TimePoint _syncTimePoint;
 	crl::time _loopingShift = 0;
@@ -141,15 +217,15 @@ VideoTrackObject::VideoTrackObject(
 
 rpl::producer<> VideoTrackObject::checkNextFrame() const {
 	return interrupted()
-		? (rpl::complete<>() | rpl::type_erased())
+		? (rpl::complete<>() | rpl::type_erased)
 		: !_shared->firstPresentHappened()
-		? (_checkNextFrame.events() | rpl::type_erased())
+		? (_checkNextFrame.events() | rpl::type_erased)
 		: _checkNextFrame.events_starting_with({});
 }
 
 rpl::producer<> VideoTrackObject::waitingForData() const {
 	return interrupted()
-		? (rpl::never() | rpl::type_erased())
+		? (rpl::never() | rpl::type_erased)
 		: _waitingForData.events();
 }
 
@@ -209,7 +285,7 @@ int VideoTrackObject::durationByPacket(const FFmpeg::Packet &packet) {
 
 void VideoTrackObject::queueReadFrames(crl::time delay) {
 	if (delay > 0) {
-		_readFramesTimer.callOnce(delay);
+		_readFramesTimer.callOnce(std::min(delay, kDurationMax - 1));
 	} else if (!_queued) {
 		_queued = true;
 		_weak.with([](VideoTrackObject &that) {
@@ -237,6 +313,7 @@ void VideoTrackObject::readFrames() {
 			}
 		}, [&](Shared::PrepareNextCheck delay) {
 			Expects(delay == kTimeUnknown || delay > 0);
+
 			if (delay != kTimeUnknown) {
 				queueReadFrames(delay);
 			}
@@ -251,8 +328,12 @@ void VideoTrackObject::readFrames() {
 auto VideoTrackObject::readEnoughFrames(crl::time trackTime)
 -> ReadEnoughState {
 	const auto dropStaleFrames = !_options.waitForMarkAsShown;
-	const auto state = _shared->prepareState(trackTime, dropStaleFrames);
-	return v::match(state, [&](Shared::PrepareFrame frame) -> ReadEnoughState {
+	const auto state = _shared->prepareState(
+		trackTime,
+		_options.speed,
+		dropStaleFrames);
+	return v::match(state, [&](Shared::PrepareFrame frame)
+	-> ReadEnoughState {
 		while (true) {
 			const auto result = readFrame(frame);
 			if (result != FrameResult::Done) {
@@ -277,6 +358,7 @@ bool VideoTrackObject::loopAround() {
 		return false;
 	}
 	avcodec_flush_buffers(_stream.codec.get());
+	_frameIndex = 0;
 	_loopingShift += duration;
 	_readTillEnd = false;
 	return true;
@@ -313,12 +395,23 @@ auto VideoTrackObject::readFrame(not_null<Frame*> frame) -> FrameResult {
 		_waitingForData.fire({});
 		return FrameResult::Waiting;
 	}
+	const auto decodedFrame = _stream.decodedFrame.get();
+	const auto valid = ValidFrameSize(
+		decodedFrame->width,
+		decodedFrame->height,
+		kMaxFrameArea);
+	if (!valid) {
+		fail(Error::InvalidData);
+		return FrameResult::Error;
+	}
 	const auto position = currentFramePosition();
 	if (position == kTimeUnknown) {
 		fail(Error::InvalidData);
 		return FrameResult::Error;
 	}
-	std::swap(frame->decoded, _stream.frame);
+	std::swap(frame->decoded, _stream.decodedFrame);
+	std::swap(frame->transferred, _stream.transferredFrame);
+	frame->index = _frameIndex++;
 	frame->position = position;
 	frame->displayed = kTimeUnknown;
 	return FrameResult::Done;
@@ -340,16 +433,22 @@ void VideoTrackObject::fillRequests(not_null<Frame*> frame) const {
 	}
 }
 
-QSize VideoTrackObject::chooseOriginalResize() const {
+QSize VideoTrackObject::chooseOriginalResize(QSize encoded) const {
 	auto chosen = QSize();
+	if (FFmpeg::RotationSwapWidthHeight(_stream.rotation)) {
+		encoded.transpose();
+	}
 	for (const auto &[_, request] : _requests) {
-		if (request.resize.isEmpty()) {
+		const auto resize = request.blurredBackground
+			? CalculateResizeFromOuter(request.outer, encoded)
+			: request.resize;
+		if (resize.isEmpty()) {
 			return QSize();
 		}
-		const auto byWidth = (request.resize.width() >= chosen.width());
-		const auto byHeight = (request.resize.height() >= chosen.height());
+		const auto byWidth = (resize.width() >= chosen.width());
+		const auto byHeight = (resize.height() >= chosen.height());
 		if (byWidth && byHeight) {
-			chosen = request.resize;
+			chosen = resize;
 		} else if (byWidth || byHeight) {
 			return QSize();
 		}
@@ -357,23 +456,120 @@ QSize VideoTrackObject::chooseOriginalResize() const {
 	return chosen;
 }
 
+bool VideoTrackObject::requireARGB32() const {
+	for (const auto &[_, request] : _requests) {
+		if (!request.requireARGB32) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void VideoTrackObject::rasterizeFrame(not_null<Frame*> frame) {
 	Expects(frame->position != kFinishedPosition);
 
 	fillRequests(frame);
-	frame->alpha = (frame->decoded->format == AV_PIX_FMT_BGRA);
-	frame->original = ConvertFrame(
-		_stream,
-		frame->decoded.get(),
-		chooseOriginalResize(),
-		std::move(frame->original));
-	if (frame->original.isNull()) {
-		frame->prepared.clear();
-		fail(Error::InvalidData);
-		return;
+	frame->format = FrameFormat::None;
+	frame->nativeFrame = NativeFrame();
+	if (frame->decoded->hw_frames_ctx) {
+#ifdef Q_OS_MAC
+		const auto hwFormat = frame->decoded->format;
+		const auto wantARGB = requireARGB32();
+		const auto isVT = (hwFormat == AV_PIX_FMT_VIDEOTOOLBOX);
+		const auto pb = isVT ? (void*)frame->decoded->data[3] : nullptr;
+		const auto pbFormat = pb
+			? CVPixelBufferGetPixelFormatType(
+				static_cast<CVPixelBufferRef>(pb))
+			: 0;
+		const auto pbSupported = (pb != nullptr)
+			&& (pbFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+				|| pbFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+		if (!wantARGB && isVT && pbSupported) {
+				const auto w = frame->decoded->width;
+				const auto h = frame->decoded->height;
+				frame->nativeFrame = NativeFrame{
+					.pixelBuffer = pb,
+					.size = { w, h },
+					.chromaSize = {
+						(w + 1) / 2,
+						(h + 1) / 2,
+					},
+				};
+				frame->alpha = false;
+				frame->format = FrameFormat::NativeTexture;
+				if (!frame->original.isNull()) {
+					frame->original = QImage();
+					for (auto &[_, prepared] : frame->prepared) {
+						prepared.image = QImage();
+					}
+				}
+				return;
+		}
+#endif // Q_OS_MAC
+		if (!frame->transferred) {
+			frame->transferred = FFmpeg::MakeFramePointer();
+		}
+		const auto success = TransferFrame(
+			_stream,
+			frame->decoded.get(),
+			frame->transferred.get());
+		if (!success) {
+			frame->prepared.clear();
+			fail(Error::InvalidData);
+			return;
+		}
+	} else {
+		frame->transferred = nullptr;
+	}
+	const auto frameWithData = frame->transferred
+		? frame->transferred.get()
+		: frame->decoded.get();
+	if ((frameWithData->format == AV_PIX_FMT_YUV420P
+		|| frameWithData->format == AV_PIX_FMT_NV12) && !requireARGB32()) {
+		const auto nv12 = (frameWithData->format == AV_PIX_FMT_NV12);
+		frame->alpha = false;
+		frame->yuv = ExtractYUV(_stream, frameWithData);
+		if (frame->yuv.size.isEmpty()
+			|| frame->yuv.chromaSize.isEmpty()
+			|| !frame->yuv.y.data
+			|| !frame->yuv.u.data
+			|| (!nv12 && !frame->yuv.v.data)) {
+			frame->prepared.clear();
+			fail(Error::InvalidData);
+			return;
+		}
+		if (!frame->original.isNull()) {
+			frame->original = QImage();
+			for (auto &[_, prepared] : frame->prepared) {
+				prepared.image = QImage();
+			}
+		}
+		frame->format = nv12 ? FrameFormat::NV12 : FrameFormat::YUV420;
+	} else {
+		frame->alpha = (frameWithData->format == AV_PIX_FMT_BGRA)
+			|| (frameWithData->format == AV_PIX_FMT_YUVA420P);
+		frame->yuv.size = {
+			frameWithData->width,
+			frameWithData->height
+		};
+		frame->original = ConvertFrame(
+			_stream,
+			frameWithData,
+			chooseOriginalResize(
+				{ frameWithData->width, frameWithData->height }),
+			std::move(frame->original));
+		if (frame->original.isNull()) {
+			frame->prepared.clear();
+			fail(Error::InvalidData);
+			return;
+		}
+		frame->format = FrameFormat::ARGB32;
 	}
 
-	VideoTrack::PrepareFrameByRequests(frame, _stream.rotation);
+	VideoTrack::PrepareFrameByRequests(
+		frame,
+		_stream.aspect,
+		_stream.rotation);
 
 	Ensures(VideoTrack::IsRasterized(frame));
 }
@@ -383,9 +579,10 @@ void VideoTrackObject::presentFrameIfNeeded() {
 		return;
 	}
 	const auto dropStaleFrames = !_options.waitForMarkAsShown;
+	const auto time = trackTime();
 	const auto presented = _shared->presentFrame(
 		this,
-		trackTime(),
+		time,
 		_options.speed,
 		dropStaleFrames);
 	addTimelineDelay(presented.addedWorldTimeDelay);
@@ -439,7 +636,8 @@ void VideoTrackObject::setSpeed(float64 speed) {
 		return;
 	}
 	if (_syncTimePoint.valid()) {
-		_syncTimePoint = trackTime();
+		const auto time = trackTime();
+		_syncTimePoint = time;
 	}
 	_options.speed = speed;
 }
@@ -452,7 +650,7 @@ void VideoTrackObject::setWaitForMarkAsShown(bool wait) {
 }
 
 bool VideoTrackObject::interrupted() const {
-	return (_shared == nullptr);
+	return !_shared;
 }
 
 void VideoTrackObject::frameShown() {
@@ -474,7 +672,7 @@ void VideoTrackObject::addTimelineDelay(crl::time delayed) {
 void VideoTrackObject::updateFrameRequest(
 		const Instance *instance,
 		const FrameRequest &request) {
-	_requests.emplace(instance, request);
+	_requests[instance] = request;
 }
 
 void VideoTrackObject::removeFrameRequest(const Instance *instance) {
@@ -492,7 +690,7 @@ bool VideoTrackObject::tryReadFirstFrame(FFmpeg::Packet &&packet) {
 					return false;
 				}
 				// Return the last valid frame if we seek too far.
-				_stream.frame = std::move(_initialSkippingFrame);
+				_stream.decodedFrame = std::move(_initialSkippingFrame);
 				return processFirstFrame();
 			} else if (error.code() != AVERROR(EAGAIN) || _readTillEnd) {
 				return false;
@@ -508,26 +706,55 @@ bool VideoTrackObject::tryReadFirstFrame(FFmpeg::Packet &&packet) {
 
 		// Seek was with AVSEEK_FLAG_BACKWARD so first we get old frames.
 		// Try skipping frames until one is after the requested position.
-		std::swap(_initialSkippingFrame, _stream.frame);
-		if (!_stream.frame) {
-			_stream.frame = FFmpeg::MakeFramePointer();
+		std::swap(_initialSkippingFrame, _stream.decodedFrame);
+		if (!_stream.decodedFrame) {
+			_stream.decodedFrame = FFmpeg::MakeFramePointer();
 		}
 	}
 }
 
 bool VideoTrackObject::processFirstFrame() {
-	if (_stream.frame->width * _stream.frame->height > kMaxFrameArea) {
+	const auto decodedFrame = _stream.decodedFrame.get();
+	const auto valid = ValidFrameSize(
+		decodedFrame->width,
+		decodedFrame->height,
+		kMaxFrameArea);
+	if (!valid) {
 		return false;
+	} else if (decodedFrame->hw_frames_ctx) {
+		if (!_stream.transferredFrame) {
+			_stream.transferredFrame = FFmpeg::MakeFramePointer();
+		}
+		const auto success = TransferFrame(
+			_stream,
+			decodedFrame,
+			_stream.transferredFrame.get());
+		if (!success) {
+			LOG(("Video Error: Failed accelerated decoding from format %1."
+				).arg(int(decodedFrame->format)));
+			return false;
+		}
+		DEBUG_LOG(("Video Info: "
+			"Using accelerated decoding from format %1 to format %2."
+			).arg(int(decodedFrame->format)
+			).arg(int(_stream.transferredFrame->format)));
+	} else {
+		_stream.transferredFrame = nullptr;
 	}
+	const auto frameWithData = _stream.transferredFrame
+		? _stream.transferredFrame.get()
+		: decodedFrame;
+	const auto alpha = (frameWithData->format == AV_PIX_FMT_BGRA)
+		|| (frameWithData->format == AV_PIX_FMT_YUVA420P);
 	auto frame = ConvertFrame(
 		_stream,
-		_stream.frame.get(),
+		frameWithData,
 		QSize(),
 		QImage());
 	if (frame.isNull()) {
 		return false;
 	}
-	_shared->init(std::move(frame), _syncTimePoint.trackTime);
+	_shared->init(std::move(frame), alpha, _syncTimePoint.trackTime);
 	callReady();
 	queueReadFrames();
 	return true;
@@ -535,7 +762,9 @@ bool VideoTrackObject::processFirstFrame() {
 
 crl::time VideoTrackObject::currentFramePosition() const {
 	const auto position = FramePosition(_stream);
-	if (position == kTimeUnknown || position == kFinishedPosition) {
+	if (position == kTimeUnknown
+		|| position == kFinishedPosition
+		|| position > kDurationMax) {
 		return kTimeUnknown;
 	}
 	return _loopingShift + std::clamp(
@@ -557,22 +786,31 @@ void VideoTrackObject::callReady() {
 	Expects(_ready != nullptr);
 
 	const auto frame = _shared->frameForPaint();
+	++_frameIndex;
 
-	auto data = VideoInformation();
-	data.size = FFmpeg::CorrectByAspect(
-		frame->original.size(),
-		_stream.aspect);
-	if (FFmpeg::RotationSwapWidthHeight(_stream.rotation)) {
-		data.size.transpose();
-	}
-	data.cover = frame->original;
-	data.rotation = _stream.rotation;
-	data.state.duration = _stream.duration;
-	data.state.position = _syncTimePoint.trackTime;
-	data.state.receivedTill = _readTillEnd
-		? _stream.duration
-		: _syncTimePoint.trackTime;
-	base::take(_ready)({ data });
+	const auto frameSize = frame->original.isNull()
+		? frame->yuv.size
+		: frame->original.size();
+
+	base::take(_ready)({ VideoInformation{
+		.state = {
+			.position = _syncTimePoint.trackTime,
+			.receivedTill = (_readTillEnd
+				? _stream.duration
+				: _syncTimePoint.trackTime),
+			.duration = _stream.duration,
+		},
+		.size = FFmpeg::TransposeSizeByRotation(
+			FFmpeg::CorrectByAspect(frameSize, _stream.aspect),
+			_stream.rotation),
+		.realSize = FFmpeg::TransposeSizeByRotation(
+			frameSize,
+			_stream.rotation),
+		.cover = frame->original,
+		.rotation = _stream.rotation,
+		.fps = _stream.fps,
+		.alpha = frame->alpha,
+	} });
 }
 
 TimePoint VideoTrackObject::trackTime() const {
@@ -594,8 +832,10 @@ TimePoint VideoTrackObject::trackTime() const {
 		}
 	}
 	const auto adjust = (result.worldTime - _syncTimePoint.worldTime);
-	result.trackTime = _syncTimePoint.trackTime
-		+ crl::time(std::round(adjust * _options.speed));
+	const auto adjustSpeed = adjust * _options.speed;
+	const auto roundAdjustSpeed = base::SafeRound(adjustSpeed);
+	const auto timeRoundAdjustSpeed = crl::time(roundAdjustSpeed);
+	result.trackTime = _syncTimePoint.trackTime + timeRoundAdjustSpeed;
 	return result;
 }
 
@@ -608,11 +848,16 @@ void VideoTrackObject::fail(Error error) {
 	_error(error);
 }
 
-void VideoTrack::Shared::init(QImage &&cover, crl::time position) {
+void VideoTrack::Shared::init(
+		QImage &&cover,
+		bool hasAlpha,
+		crl::time position) {
 	Expects(!initialized());
 
 	_frames[0].original = std::move(cover);
 	_frames[0].position = position;
+	_frames[0].format = FrameFormat::ARGB32;
+	_frames[0].alpha = hasAlpha;
 
 	// Usually main thread sets displayed time before _counter increment.
 	// But in this case we update _counter, so we set a fake displayed time.
@@ -645,6 +890,7 @@ not_null<const VideoTrack::Frame*> VideoTrack::Shared::getFrame(
 
 auto VideoTrack::Shared::prepareState(
 	crl::time trackTime,
+	float64 playbackSpeed,
 	bool dropStaleFrames)
 -> PrepareState {
 	const auto prepareNext = [&](int index) -> PrepareState {
@@ -664,7 +910,19 @@ auto VideoTrack::Shared::prepareState(
 			next->displayed = kDisplaySkipped;
 			return next;
 		} else {
-			return PrepareNextCheck(frame->position - trackTime + 1);
+			if (frame->position - trackTime + 1 <= 0) { // Debugging crash.
+				CrashReports::SetAnnotation(
+					"DelayValues",
+					(QString::number(frame->position)
+						+ " + 1 <= "
+						+ QString::number(trackTime)));
+			}
+			Assert(frame->position >= trackTime);
+			Assert(frame->position - trackTime + 1 > 0);
+
+			return PrepareNextCheck(WorldTimeDelay(
+				frame->position - trackTime + 1,
+				playbackSpeed));
 		}
 	};
 	const auto finishPrepare = [&](int index) -> PrepareState {
@@ -716,13 +974,15 @@ auto VideoTrack::Shared::presentFrame(
 			return { kTimeUnknown, kTimeUnknown, addedWorldTimeDelay };
 		}
 		const auto trackLeft = position - time.trackTime;
+		const auto adjustedBySpeed = trackLeft / playbackSpeed;
+		const auto roundedAdjustedBySpeed = base::SafeRound(adjustedBySpeed);
 		frame->display = time.worldTime
 			+ addedWorldTimeDelay
-			+ crl::time(std::round(trackLeft / playbackSpeed));
+			+ crl::time(roundedAdjustedBySpeed);
 
 		// Release this frame to the main thread for rendering.
 		_counter.store(
-			(counter + 1) % (2 * kFramesCount),
+			counter + 1,
 			std::memory_order_release);
 		return { position, crl::time(0), addedWorldTimeDelay };
 	};
@@ -739,7 +999,8 @@ auto VideoTrack::Shared::presentFrame(
 			|| IsStale(frame, time.trackTime)) {
 			return { kTimeUnknown, kTimeUnknown };
 		}
-		return { kTimeUnknown, (frame->position - time.trackTime + 1) };
+		const auto delay = frame->position - time.trackTime + 1;
+		return { kTimeUnknown, WorldTimeDelay(delay, playbackSpeed) };
 	};
 
 	switch (counter()) {
@@ -867,12 +1128,19 @@ bool VideoTrack::Shared::markFrameShown() {
 }
 
 not_null<VideoTrack::Frame*> VideoTrack::Shared::frameForPaint() {
-	const auto result = getFrame(counter() / 2);
-	Assert(!result->original.isNull());
-	Assert(result->position != kTimeUnknown);
-	Assert(result->displayed != kTimeUnknown);
+	return frameForPaintWithIndex().frame;
+}
 
-	return result;
+VideoTrack::FrameWithIndex VideoTrack::Shared::frameForPaintWithIndex() {
+	const auto index = counter() / 2;
+	const auto frame = getFrame(index);
+	Assert(frame->format != FrameFormat::None);
+	Assert(frame->position != kTimeUnknown);
+	Assert(frame->displayed != kTimeUnknown);
+	return {
+		.frame = frame,
+		.index = frame->index,
+	};
 }
 
 VideoTrack::VideoTrack(
@@ -885,7 +1153,7 @@ VideoTrack::VideoTrack(
 , _streamTimeBase(stream.timeBase)
 , _streamDuration(stream.duration)
 , _streamRotation(stream.rotation)
-//, _streamAspect(stream.aspect)
+, _streamAspect(stream.aspect)
 , _shared(std::make_unique<Shared>())
 , _wrapped(
 	options,
@@ -977,7 +1245,45 @@ bool VideoTrack::markFrameShown() {
 QImage VideoTrack::frame(
 		const FrameRequest &request,
 		const Instance *instance) {
-	const auto frame = _shared->frameForPaint();
+	return frameImage(_shared->frameForPaint(), request, instance);
+}
+
+FrameWithInfo VideoTrack::frameWithInfo(
+		const FrameRequest &request,
+		const Instance *instance) {
+	const auto data = _shared->frameForPaintWithIndex();
+	return {
+		.image = frameImage(data.frame, request, instance),
+		.format = FrameFormat::ARGB32,
+		.index = data.index,
+	};
+}
+
+FrameWithInfo VideoTrack::frameWithInfo(const Instance *instance) {
+	const auto data = _shared->frameForPaintWithIndex();
+	const auto i = data.frame->prepared.find(instance);
+	const auto none = (i == data.frame->prepared.end());
+	if (none || i->second.request.requireARGB32) {
+		_wrapped.with([=](Implementation &unwrapped) {
+			unwrapped.updateFrameRequest(
+				instance,
+				{ .requireARGB32 = false });
+		});
+	}
+	return {
+		.image = data.frame->original,
+		.yuv = &data.frame->yuv,
+		.nativeFrame = &data.frame->nativeFrame,
+		.format = data.frame->format,
+		.index = data.index,
+		.alpha = data.frame->alpha,
+	};
+}
+
+QImage VideoTrack::frameImage(
+		not_null<Frame*> frame,
+		const FrameRequest &request,
+		const Instance *instance) {
 	const auto i = frame->prepared.find(instance);
 	const auto none = (i == frame->prepared.end());
 	const auto preparedFor = frame->prepared.empty()
@@ -990,8 +1296,21 @@ QImage VideoTrack::frame(
 			unwrapped.updateFrameRequest(instance, useRequest);
 		});
 	}
-	if (!frame->alpha
-		&& GoodForRequest(frame->original, _streamRotation, useRequest)) {
+	if (frame->original.isNull()) {
+		if (frame->format == FrameFormat::YUV420
+			|| frame->format == FrameFormat::NV12) {
+			frame->original = ConvertToARGB32(frame->format, frame->yuv);
+#ifdef Q_OS_MAC
+		} else if (frame->format == FrameFormat::NativeTexture) {
+			frame->original = ConvertNativeFrameToARGB32(frame->nativeFrame);
+#endif // Q_OS_MAC
+		}
+	}
+	if (GoodForRequest(
+			frame->original,
+			frame->alpha,
+			_streamRotation,
+			useRequest)) {
 		return frame->original;
 	} else if (changed || none || i->second.image.isNull()) {
 		const auto j = none
@@ -1012,12 +1331,28 @@ QImage VideoTrack::frame(
 		j->second.image = PrepareByRequest(
 			frame->original,
 			frame->alpha,
+			_streamAspect,
 			_streamRotation,
 			useRequest,
 			std::move(j->second.image));
 		return j->second.image;
 	}
 	return i->second.image;
+}
+
+QImage VideoTrack::currentFrameImage() {
+	const auto frame = _shared->frameForPaint();
+	if (frame->original.isNull()) {
+		if (frame->format == FrameFormat::YUV420
+			|| frame->format == FrameFormat::NV12) {
+			frame->original = ConvertToARGB32(frame->format, frame->yuv);
+#ifdef Q_OS_MAC
+		} else if (frame->format == FrameFormat::NativeTexture) {
+			frame->original = ConvertNativeFrameToARGB32(frame->nativeFrame);
+#endif // Q_OS_MAC
+		}
+	}
+	return frame->original;
 }
 
 void VideoTrack::unregisterInstance(not_null<const Instance*> instance) {
@@ -1028,15 +1363,24 @@ void VideoTrack::unregisterInstance(not_null<const Instance*> instance) {
 
 void VideoTrack::PrepareFrameByRequests(
 		not_null<Frame*> frame,
+		const AVRational &aspect,
 		int rotation) {
-	Expects(!frame->original.isNull());
+	Expects(frame->format != FrameFormat::ARGB32
+		|| !frame->original.isNull());
+
+	if (frame->format != FrameFormat::ARGB32) {
+		return;
+	}
 
 	const auto begin = frame->prepared.begin();
 	const auto end = frame->prepared.end();
 	for (auto i = begin; i != end; ++i) {
 		auto &prepared = i->second;
-		if (frame->alpha
-			|| !GoodForRequest(frame->original, rotation, prepared.request)) {
+		if (!GoodForRequest(
+				frame->original,
+				frame->alpha,
+				rotation,
+				prepared.request)) {
 			auto j = begin;
 			for (; j != i; ++j) {
 				if (j->second.request == prepared.request) {
@@ -1048,6 +1392,7 @@ void VideoTrack::PrepareFrameByRequests(
 				prepared.image = PrepareByRequest(
 					frame->original,
 					frame->alpha,
+					aspect,
 					rotation,
 					prepared.request,
 					std::move(prepared.image));
@@ -1063,7 +1408,10 @@ bool VideoTrack::IsDecoded(not_null<const Frame*> frame) {
 
 bool VideoTrack::IsRasterized(not_null<const Frame*> frame) {
 	return IsDecoded(frame)
-		&& !frame->original.isNull();
+		&& (!frame->original.isNull()
+			|| frame->format == FrameFormat::YUV420
+			|| frame->format == FrameFormat::NV12
+			|| frame->format == FrameFormat::NativeTexture);
 }
 
 bool VideoTrack::IsStale(not_null<const Frame*> frame, crl::time trackTime) {

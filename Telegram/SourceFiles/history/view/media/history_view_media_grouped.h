@@ -31,12 +31,14 @@ public:
 
 	void refreshParentId(not_null<HistoryItem*> realParent) override;
 
-	void drawHighlight(Painter &p, int top) const override;
-	void draw(
+	HistoryItem *itemForText() const override;
+	bool hideMessageText() const override;
+
+	void drawHighlight(
 		Painter &p,
-		const QRect &clip,
-		TextSelection selection,
-		crl::time ms) const override;
+		const PaintContext &context,
+		int top) const override;
+	void draw(Painter &p, const PaintContext &context) const override;
 	PointState pointState(QPoint point) const override;
 	TextState textState(
 		QPoint point,
@@ -56,8 +58,11 @@ public:
 	DocumentData *getDocument() const override;
 
 	TextForMimeData selectedText(TextSelection selection) const override;
+	SelectedQuote selectedQuote(TextSelection selection) const override;
+	TextSelection selectionFromQuote(
+		const SelectedQuote &quote) const override;
 
-	std::vector<BubbleSelectionInterval> getBubbleSelectionIntervals(
+	std::vector<Ui::BubbleSelectionInterval> getBubbleSelectionIntervals(
 		TextSelection selection) const override;
 
 	void clickHandlerActiveChanged(
@@ -67,7 +72,7 @@ public:
 		const ClickHandlerPtr &p,
 		bool pressed) override;
 
-	TextWithEntities getCaption() const override;
+	void hideSpoilers() override;
 	Storage::SharedMediaTypesMask sharedMediaTypes() const override;
 
 	bool overrideEditedDate() const override {
@@ -76,22 +81,25 @@ public:
 	HistoryMessageEdited *displayedEditBadge() const override;
 
 	bool skipBubbleTail() const override {
-		return (_mode == Mode::Grid)
-			&& isRoundedInBubbleBottom()
-			&& _caption.isEmpty();
+		return (_mode == Mode::Grid) && isRoundedInBubbleBottom();
 	}
 	void updateNeedBubbleState() override;
 	bool needsBubble() const override;
 	bool customInfoLayout() const override {
-		return _caption.isEmpty() && (_mode != Mode::Column);
+		return (_mode != Mode::Column);
 	}
+	QPoint resolveCustomInfoRightBottom() const override;
+
 	bool allowsFastShare() const override {
 		return true;
 	}
+	std::optional<PaidInformation> paidInformation() const override;
 	bool customHighlight() const override {
 		return true;
 	}
-	bool hideForwardedFrom() const override;
+	QRect groupItemRect(int index) const override;
+	bool enforceBubbleWidth() const override;
+	int contributedMaxMonospaceWidth() const override;
 
 	void stopAnimation() override;
 	void checkAnimation() override;
@@ -139,13 +147,19 @@ private:
 		QPoint point,
 		StateRequest request) const;
 
-	[[nodiscard]] RectParts cornersFromSides(RectParts sides) const;
+	[[nodiscard]] Ui::BubbleRounding applyRoundingSides(
+		Ui::BubbleRounding already,
+		RectParts sides) const;
 	[[nodiscard]] QMargins groupedPadding() const;
 
-	Ui::Text::String _caption;
+	[[nodiscard]] Media *lookupSpoilerTagMedia() const;
+	[[nodiscard]] QImage generateSpoilerTagBackground(QRect full) const;
+
+	mutable std::optional<HistoryItem*> _captionItem;
 	std::vector<Part> _parts;
 	Mode _mode = Mode::Grid;
-	bool _needBubble = false;
+	bool _needBubble : 1 = false;
+	bool _purchasedPriceTag : 1 = false;
 
 };
 

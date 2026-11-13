@@ -7,10 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "ui/rp_widget.h"
-#include "ui/round_rect.h"
+#include "ui/chat/attach/attach_abstract_single_media_preview.h"
 #include "media/clip/media_clip_reader.h"
-#include "base/object_ptr.h"
 
 namespace Lottie {
 class SinglePlayer;
@@ -19,51 +17,43 @@ class SinglePlayer;
 namespace Ui {
 
 struct PreparedFile;
-class IconButton;
 
-class SingleMediaPreview final : public RpWidget {
+class SingleMediaPreview final : public AbstractSingleMediaPreview {
 public:
 	static SingleMediaPreview *Create(
 		QWidget *parent,
+		const style::ComposeControls &st,
 		Fn<bool()> gifPaused,
-		const PreparedFile &file);
+		const PreparedFile &file,
+		AttachControls::Type type = AttachControls::Type::Full);
 
 	SingleMediaPreview(
 		QWidget *parent,
+		const style::ComposeControls &st,
 		Fn<bool()> gifPaused,
 		QImage preview,
 		bool animated,
 		bool sticker,
-		const QString &animatedPreviewPath);
-	~SingleMediaPreview();
+		bool spoiler,
+		const QString &animatedPreviewPath,
+		AttachControls::Type type);
 
-	[[nodiscard]] rpl::producer<> deleteRequests() const;
-	[[nodiscard]] rpl::producer<> editRequests() const;
+protected:
+	bool supportsSpoilers() const override;
+	bool drawBackground() const override;
+	bool tryPaintAnimation(QPainter &p) override;
+	bool isAnimatedPreviewReady() const override;
 
 private:
-	void paintEvent(QPaintEvent *e) override;
-	void resizeEvent(QResizeEvent *e) override;
-
-	void preparePreview(
-		QImage preview,
-		const QString &animatedPreviewPath);
-	void prepareAnimatedPreview(const QString &animatedPreviewPath);
-	void paintButtonsBackground(QPainter &p);
+	void prepareAnimatedPreview(
+		const QString &animatedPreviewPath,
+		bool animated);
 	void clipCallback(Media::Clip::Notification notification);
 
-	Fn<bool()> _gifPaused;
-	bool _animated = false;
-	bool _sticker = false;
-	QPixmap _preview;
-	int _previewLeft = 0;
-	int _previewWidth = 0;
-	int _previewHeight = 0;
+	const Fn<bool()> _gifPaused;
+	const bool _sticker = false;
 	Media::Clip::ReaderPointer _gifPreview;
 	std::unique_ptr<Lottie::SinglePlayer> _lottiePreview;
-
-	object_ptr<IconButton> _editMedia = { nullptr };
-	object_ptr<IconButton> _deleteMedia = { nullptr };
-	RoundRect _buttonsRect;
 
 };
 

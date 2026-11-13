@@ -18,7 +18,7 @@ namespace Ui {
 struct GroupCallUser {
 	QImage userpic;
 	std::pair<uint64, uint64> userpicKey = {};
-	int32 id = 0;
+	uint64 id = 0;
 	bool speaking = false;
 };
 
@@ -33,7 +33,8 @@ public:
 	void update(
 		const std::vector<GroupCallUser> &users,
 		bool visible);
-	void paint(Painter &p, int x, int y, int size);
+	void paint(QPainter &p, int x, int y, int size);
+	void finishAnimating();
 
 	[[nodiscard]] int maxWidth() const;
 	[[nodiscard]] rpl::producer<int> widthValue() const;

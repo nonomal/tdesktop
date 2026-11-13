@@ -11,11 +11,16 @@ class HistoryItem;
 
 namespace Api {
 
-MTPInputMedia PrepareUploadedPhoto(const MTPInputFile &file);
+struct RemoteFileInfo;
+
+MTPInputMedia PrepareUploadedPhoto(
+	not_null<HistoryItem*> item,
+	RemoteFileInfo info);
 
 MTPInputMedia PrepareUploadedDocument(
 	not_null<HistoryItem*> item,
-	const MTPInputFile &file,
-	const std::optional<MTPInputFile> &thumb);
+	RemoteFileInfo info);
+
+bool HasAttachedStickers(MTPInputMedia media);
 
 } // namespace Api
